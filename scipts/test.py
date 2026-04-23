@@ -186,12 +186,15 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	_, _, test_loader, _, meta = create_spad_classification_dataloaders(
 		data_root=str(data_root),
 		batch_size=args.batch_size,
-		num_points=args.num_points,
+		num_points=(None if args.num_points <= 0 else args.num_points),
 		train_ratio=args.train_ratio,
 		val_ratio=args.val_ratio,
 		test_ratio=args.test_ratio,
 		num_workers=args.num_workers,
 		seed=args.seed,
+		augment_train=False,
+		augment_eval=args.augment_eval,
+		label_mode=args.label_mode,
 	)
 
 	model = build_model(args.model, num_classes=meta["num_classes"], project_root=project_root).to(device)
@@ -271,16 +274,20 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint")
 	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer"], help="Backbone model")
 	parser.add_argument("--batch-size", type=int, default=16)
-	parser.add_argument("--num-points", type=int, default=1024)
+	parser.add_argument("--num-points", type=int, default=0, help="Set >0 to enforce fixed N; 0 disables point-count check")
 	parser.add_argument("--train-ratio", type=float, default=0.7)
 	parser.add_argument("--val-ratio", type=float, default=0.15)
 	parser.add_argument("--test-ratio", type=float, default=0.15)
 	parser.add_argument("--num-workers", type=int, default=0)
 	parser.add_argument("--seed", type=int, default=42)
+	parser.add_argument("--label-mode", type=str, default="generated", choices=["generated", "raw"], help="Label source mode")
+	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in eval dataset")
+	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable eval dataset augmentation")
 	parser.add_argument("--device", type=str, default="auto", help="auto/cpu/cuda")
 	parser.add_argument("--log-dir", type=str, default="logs")
 	parser.add_argument("--output-dir", type=str, default="logs")
 	parser.add_argument("--normalize-cm", action="store_true", help="Use normalized confusion matrix")
+	parser.set_defaults(augment_eval=True)
 	return parser
 
 

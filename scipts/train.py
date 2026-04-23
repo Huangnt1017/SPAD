@@ -15,7 +15,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from utils.data import create_spad_classification_dataloaders
-from utils.data_augment import augment_pytorch_batch
 
 
 def set_seed(seed: int) -> None:
@@ -23,6 +22,8 @@ def set_seed(seed: int) -> None:
 	np.random.seed(seed)
 	torch.manual_seed(seed)
 	torch.cuda.manual_seed_all(seed)
+	torch.backends.cudnn.deterministic = True
+	torch.backends.cudnn.benchmark = False
 
 
 def resolve_path(path_str: str, base_dir: Path) -> Path:
@@ -78,15 +79,14 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 
 	if name == "pointnet2":
 		module = load_module_from_file(baseline_dir / "pointnet++.py", "baseline_pointnet2")
-		return module.PointNet2ClassificationSSG(num_class=num_classes, normal_channel=False)
+		return module.PointNet2ClassificationSSG(num_class=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
 
 def prepare_model_inputs(points_xyzi: torch.Tensor) -> torch.Tensor:
-	"""Convert (B, N, 4) -> (B, 3, N), using xyz only for baseline classifiers."""
-	xyz = points_xyzi[:, :, :3]
-	return xyz.transpose(1, 2).contiguous()
+	"""Models now consume (B, N, 4) directly."""
+	return points_xyzi
 
 
 def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable[int] = (1, 3)) -> Dict[int, int]:
@@ -110,7 +110,6 @@ def run_epoch(
 	device: torch.device,
 	epoch: int,
 	phase: str,
-	use_augment: bool = False,
 	optimizer: Optional[optim.Optimizer] = None,
 ) -> Dict[str, float]:
 	is_train = optimizer is not None
@@ -135,9 +134,6 @@ def run_epoch(
 
 			points = points[valid_mask]
 			labels = labels[valid_mask]
-
-			if is_train and use_augment:
-				points, _ = augment_pytorch_batch(points, label_class=None)
 
 			inputs = prepare_model_inputs(points)
 			logits = model(inputs)
@@ -216,12 +212,15 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	train_loader, val_loader, test_loader, unlabeled_loader, meta = create_spad_classification_dataloaders(
 		data_root=str(data_root),
 		batch_size=args.batch_size,
-		num_points=args.num_points,
+		num_points=(None if args.num_points <= 0 else args.num_points),
 		train_ratio=args.train_ratio,
 		val_ratio=args.val_ratio,
 		test_ratio=args.test_ratio,
 		num_workers=args.num_workers,
 		seed=args.seed,
+		augment_train=args.augment_train,
+		augment_eval=args.augment_eval,
+		label_mode=args.label_mode,
 	)
 
 	model = build_model(args.model, num_classes=meta["num_classes"], project_root=project_root).to(device)
@@ -269,7 +268,6 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			device=device,
 			epoch=epoch,
 			phase="Train",
-			use_augment=args.use_augment,
 			optimizer=optimizer,
 		)
 
@@ -280,7 +278,6 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			device=device,
 			epoch=epoch,
 			phase="Val",
-			use_augment=False,
 			optimizer=None,
 		)
 
@@ -339,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer"], help="Backbone model")
 	parser.add_argument("--epochs", type=int, default=80)
 	parser.add_argument("--batch-size", type=int, default=16)
-	parser.add_argument("--num-points", type=int, default=1024)
+	parser.add_argument("--num-points", type=int, default=0, help="Set >0 to enforce fixed N; 0 disables point-count check")
 	parser.add_argument("--lr", type=float, default=1e-3)
 	parser.add_argument("--min-lr", type=float, default=1e-5)
 	parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -352,10 +349,12 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--log-dir", type=str, default="logs")
 	parser.add_argument("--save-dir", type=str, default="checkpoints")
 	parser.add_argument("--resume", type=str, default="", help="checkpoint path to resume")
-
-	parser.add_argument("--use-augment", dest="use_augment", action="store_true", help="Enable batch augmentation")
-	parser.add_argument("--no-augment", dest="use_augment", action="store_false", help="Disable batch augmentation")
-	parser.set_defaults(use_augment=True)
+	parser.add_argument("--label-mode", type=str, default="generated", choices=["generated", "raw"], help="Label source mode")
+	parser.add_argument("--augment-train", dest="augment_train", action="store_true", help="Apply augmentation in train dataset")
+	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="Disable train dataset augmentation")
+	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in val/test dataset")
+	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable val/test dataset augmentation")
+	parser.set_defaults(augment_train=True, augment_eval=True)
 	return parser
 
 

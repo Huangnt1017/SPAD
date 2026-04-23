@@ -102,47 +102,6 @@ class TransitionDown(nn.Module):
         return new_xyz, new_feat
 
 
-class TransitionUp(nn.Module):
-    """
-    Feature interpolation + skip fusion.
-    """
-    def __init__(self, in_channels, skip_channels, out_channels):
-        super().__init__()
-        self.mlp1 = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.mlp2 = nn.Sequential(
-            nn.Conv1d(skip_channels, out_channels, 1, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, xyz1, feat1, xyz2, feat2):
-        """
-        Upsample feat1 (sparser xyz1) to xyz2 (denser), then fuse with feat2.
-        xyz1: [B, N1, 3], feat1: [B, N1, C1]
-        xyz2: [B, N2, 3], feat2: [B, N2, C2]
-        return: [B, N2, C_out]
-        """
-        B, N2, _ = xyz2.shape
-        feat1_t = self.mlp1(feat1.transpose(1, 2)).transpose(1, 2)  # [B, N1, Co]
-        feat2_t = self.mlp2(feat2.transpose(1, 2)).transpose(1, 2)  # [B, N2, Co]
-
-        if xyz1.shape[1] == 1:
-            interp = feat1_t.repeat(1, N2, 1)
-        else:
-            dist = square_distance(xyz2, xyz1)             # [B, N2, N1]
-            dists, idx = dist.topk(k=3, dim=-1, largest=False)
-            weight = 1.0 / (dists + 1e-8)
-            weight = weight / torch.sum(weight, dim=-1, keepdim=True)
-            neighbor = index_points(feat1_t, idx)          # [B, N2, 3, Co]
-            interp = torch.sum(neighbor * weight.unsqueeze(-1), dim=2)
-
-        return interp + feat2_t
-
-
 class PointTransformerLayer(nn.Module):
     """
     Point Transformer layer (ICCV 2021):
@@ -229,12 +188,12 @@ class PTBlock(nn.Module):
 
 
 class PointTransformerClassification(nn.Module):
-    def __init__(self, num_classes=40, k=16):
+    def __init__(self, num_classes=26, k=16):
         super().__init__()
         self.k = k
 
         self.stem = nn.Sequential(
-            nn.Linear(3, 32, bias=False),
+            nn.Linear(4, 32, bias=False),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
         )
@@ -257,15 +216,18 @@ class PointTransformerClassification(nn.Module):
 
     def forward(self, x):
         """
-        x: [B, 3, N]
+        x: [B, N, 4]
         """
-        x = x.transpose(1, 2).contiguous()                 # [B, N, 3]
+        if x.ndim != 3 or x.shape[-1] != 4:
+            raise ValueError(f"PointTransformerClassification expects input shape (B, N, 4), got {tuple(x.shape)}")
+
+        xyz = x[:, :, :3].contiguous()                     # [B, N, 3]
         B, N, _ = x.shape
 
-        feat = self.stem(x.reshape(B * N, 3)).reshape(B, N, 32)
-        feat = self.block1(x, feat)
+        feat = self.stem(x.reshape(B * N, 4)).reshape(B, N, 32)
+        feat = self.block1(xyz, feat)
 
-        x1, f1 = self.td1(x, feat)
+        x1, f1 = self.td1(xyz, feat)
         f1 = self.block2(x1, f1)
 
         x2, f2 = self.td2(x1, f1)
@@ -279,85 +241,16 @@ class PointTransformerClassification(nn.Module):
         return out
 
 
-class PointTransformerSegmentation(nn.Module):
-    def __init__(self, num_classes=50, k=16):
-        super().__init__()
-        self.k = k
-
-        self.stem = nn.Sequential(
-            nn.Linear(3, 32, bias=False),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-        )
-
-        self.block1 = PTBlock(32, k)
-        self.td1 = TransitionDown(32, 64, npoint=512, k=k)
-        self.block2 = PTBlock(64, k)
-        self.td2 = TransitionDown(64, 128, npoint=128, k=k)
-        self.block3 = PTBlock(128, k)
-        self.td3 = TransitionDown(128, 256, npoint=32, k=k)
-        self.block4 = PTBlock(256, k)
-
-        self.tu3 = TransitionUp(256, 128, 128)
-        self.dec3 = PTBlock(128, k)
-        self.tu2 = TransitionUp(128, 64, 64)
-        self.dec2 = PTBlock(64, k)
-        self.tu1 = TransitionUp(64, 32, 32)
-        self.dec1 = PTBlock(32, k)
-
-        self.seg_head = nn.Sequential(
-            nn.Linear(32, 64, bias=False),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):
-        """
-        x: [B, 3, N]
-        return: [B, num_classes, N]
-        """
-        x0 = x.transpose(1, 2).contiguous()               # [B, N, 3]
-        B, N, _ = x0.shape
-
-        f0 = self.stem(x0.reshape(B * N, 3)).reshape(B, N, 32)
-        f0 = self.block1(x0, f0)
-
-        x1, f1 = self.td1(x0, f0)
-        f1 = self.block2(x1, f1)
-
-        x2, f2 = self.td2(x1, f1)
-        f2 = self.block3(x2, f2)
-
-        x3, f3 = self.td3(x2, f2)
-        f3 = self.block4(x3, f3)
-
-        u2 = self.tu3(x3, f3, x2, f2)
-        u2 = self.dec3(x2, u2)
-
-        u1 = self.tu2(x2, u2, x1, f1)
-        u1 = self.dec2(x1, u1)
-
-        u0 = self.tu1(x1, u1, x0, f0)
-        u0 = self.dec1(x0, u0)
-
-        out = self.seg_head(u0.reshape(B * N, 32)).reshape(B, N, -1)
-        return out.transpose(1, 2).contiguous()
-
-
 def _quick_test():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    cls_model = PointTransformerClassification(num_classes=40, k=16).to(device)
-    seg_model = PointTransformerSegmentation(num_classes=50, k=16).to(device)
+    cls_model = PointTransformerClassification(num_classes=26, k=16).to(device)
 
-    pts = torch.randn(2, 3, 1024, device=device)
+    pts = torch.randn(2, 1024, 4, device=device)
 
     cls_out = cls_model(pts)
-    seg_out = seg_model(pts)
 
-    print("cls:", cls_out.shape)  # [2, 40]
-    print("seg:", seg_out.shape)  # [2, 50, 1024]
+    print("cls:", cls_out.shape)  # [2, 26]
 
 
 if __name__ == "__main__":

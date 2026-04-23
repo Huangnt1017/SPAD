@@ -42,10 +42,10 @@ def get_graph_feature(x, k=20, idx=None):
 class DGCNNCls(nn.Module):
     """
     DGCNN for point cloud classification.
-    Input:  x [B, 3, N]
+    Input:  x [B, N, 4]
     Output: logits [B, num_classes]
     """
-    def __init__(self, num_classes=40, k=20, emb_dims=1024, dropout=0.5):
+    def __init__(self, num_classes=26, k=20, emb_dims=1024, dropout=0.5):
         super().__init__()
         self.k = k
         self.emb_dims = emb_dims
@@ -59,7 +59,7 @@ class DGCNNCls(nn.Module):
         self.bn7 = nn.BatchNorm1d(256)
 
         self.conv1 = nn.Sequential(
-            nn.Conv2d(6, 64, kernel_size=1, bias=False),
+            nn.Conv2d(8, 64, kernel_size=1, bias=False),
             self.bn1,
             nn.LeakyReLU(negative_slope=0.2)
         )
@@ -92,9 +92,13 @@ class DGCNNCls(nn.Module):
         self.linear3 = nn.Linear(256, num_classes)
 
     def forward(self, x):
+        if x.ndim != 3 or x.shape[-1] != 4:
+            raise ValueError(f"DGCNNCls expects input shape (B, N, 4), got {tuple(x.shape)}")
+
+        x = x.transpose(1, 2).contiguous()  # [B, 4, N]
         B = x.size(0)
 
-        x = get_graph_feature(x, k=self.k)   # [B, 6, N, k]
+        x = get_graph_feature(x, k=self.k)   # [B, 8, N, k]
         x = self.conv1(x)
         x1 = x.max(dim=-1)[0]                # [B, 64, N]
 
@@ -125,142 +129,16 @@ class DGCNNCls(nn.Module):
         return x
 
 
-class DGCNNPartSeg(nn.Module):
-    """
-    DGCNN for part segmentation.
-    Input:
-      x         [B, 3, N]
-      cls_label [B, num_categories] one-hot (e.g., 16 for ShapeNetPart)
-    Output:
-      seg_logits [B, num_parts, N]
-    """
-    def __init__(self, num_parts=50, num_categories=16, k=40, emb_dims=1024, dropout=0.5):
-        super().__init__()
-        self.k = k
-        self.emb_dims = emb_dims
-        self.num_categories = num_categories
-
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm2d(64)
-        self.bn4 = nn.BatchNorm2d(64)
-        self.bn5 = nn.BatchNorm2d(64)
-        self.bn6 = nn.BatchNorm1d(emb_dims)
-        self.bn7 = nn.BatchNorm1d(256)
-        self.bn8 = nn.BatchNorm1d(256)
-        self.bn9 = nn.BatchNorm1d(128)
-
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(6, 64, kernel_size=1, bias=False),
-            self.bn1,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=1, bias=False),
-            self.bn2,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
-            self.bn3,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=1, bias=False),
-            self.bn4,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-
-        self.conv5 = nn.Sequential(
-            nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
-            self.bn5,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-
-        self.conv6 = nn.Sequential(
-            nn.Conv1d(64 * 3, emb_dims, kernel_size=1, bias=False),
-            self.bn6,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-
-        self.conv7 = nn.Sequential(
-            nn.Conv1d(emb_dims + 64 * 3 + 64, 256, kernel_size=1, bias=False),
-            self.bn7,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        self.conv8 = nn.Sequential(
-            nn.Conv1d(256, 256, kernel_size=1, bias=False),
-            self.bn8,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        self.dp1 = nn.Dropout(p=dropout)
-        self.conv9 = nn.Sequential(
-            nn.Conv1d(256, 128, kernel_size=1, bias=False),
-            self.bn9,
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        self.conv10 = nn.Conv1d(128, num_parts, kernel_size=1, bias=True)
-
-        self.cls_embed = nn.Sequential(
-            nn.Conv1d(num_categories, 64, kernel_size=1, bias=False),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-
-    def forward(self, x, cls_label):
-        B, _, N = x.size()
-
-        x = get_graph_feature(x, k=self.k)    # [B, 6, N, k]
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x1 = x.max(dim=-1)[0]                 # [B, 64, N]
-
-        x = get_graph_feature(x1, k=self.k)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        x2 = x.max(dim=-1)[0]                 # [B, 64, N]
-
-        x = get_graph_feature(x2, k=self.k)
-        x = self.conv5(x)
-        x3 = x.max(dim=-1)[0]                 # [B, 64, N]
-
-        x = torch.cat((x1, x2, x3), dim=1)    # [B, 192, N]
-        x = self.conv6(x)                     # [B, emb_dims, N]
-        x_global = F.adaptive_max_pool1d(x, 1)  # [B, emb_dims, 1]
-
-        if cls_label.dim() == 2:
-            cls_label = cls_label.unsqueeze(-1)  # [B, num_categories, 1]
-        cls_feat = self.cls_embed(cls_label)     # [B, 64, 1]
-
-        x_global = x_global.repeat(1, 1, N)      # [B, emb_dims, N]
-        cls_feat = cls_feat.repeat(1, 1, N)      # [B, 64, N]
-
-        x = torch.cat((x_global, x1, x2, x3, cls_feat), dim=1)  # [B, emb_dims+192+64, N]
-        x = self.conv7(x)
-        x = self.conv8(x)
-        x = self.dp1(x)
-        x = self.conv9(x)
-        x = self.conv10(x)                       # [B, num_parts, N]
-        return x
-
-
 def _quick_shape_test():
     """
     Minimal runtime sanity check.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    cls_model = DGCNNCls(num_classes=40).to(device)
-    pts = torch.randn(4, 3, 1024, device=device)
+    cls_model = DGCNNCls(num_classes=26).to(device)
+    pts = torch.randn(4, 1024, 4, device=device)
     cls_logits = cls_model(pts)
-    print("DGCNNCls output:", cls_logits.shape)  # [4, 40]
-
-    seg_model = DGCNNPartSeg(num_parts=50, num_categories=16).to(device)
-    cls_onehot = torch.zeros(4, 16, device=device)
-    cls_onehot[:, 0] = 1.0
-    seg_logits = seg_model(pts, cls_onehot)
-    print("DGCNNPartSeg output:", seg_logits.shape)  # [4, 50, 1024]
+    print("DGCNNCls output:", cls_logits.shape)  # [4, 26]
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from sklearn.model_selection import train_test_split
 from typing import List, Dict, Tuple, Optional
 import random
 from pathlib import Path
+from utils.data_augment import augment_pytorch_batch
 
 """
 数据处理相关工具函数和数据集类
@@ -284,19 +285,16 @@ class PointCloudDataset(Dataset):
 
     def _points_to_downsampled(self, points: np.ndarray) -> torch.Tensor:
         """
-        将点云降采样并转换为标准格式
+        将点云转换为标准格式（不再做降采样）
 
         Args:
             points: 点云数据，形状为 (N, 4)，列顺序为 [x, y, z, i]
 
         Returns:
-            降采样后的点云，形状为 (4, num_points)
+            点云，形状为 (4, N)
         """
-        # 使用降采样函数
-        downsampled = downsample(points, self.num_points)
-
-        # 转置为 (4, num_points)
-        downsampled = downsampled.T  # 形状从 (num_points, 4) 变为 (4, num_points)
+        # 数据已在上游完成下采样，这里只做转置，不再重采样。
+        downsampled = points.T  # 形状从 (N, 4) 变为 (4, N)
 
         # 转换为torch张量
         return torch.from_numpy(downsampled.astype(np.float32))
@@ -478,6 +476,10 @@ def get_data_shape(mode: str) -> Tuple[int, ...]:
 # ============================================
 # Classification Data Pipeline (for train/test scripts)
 # ============================================
+ALPHABET_CLASSES: List[str] = [chr(ord("A") + i) for i in range(26)]
+ALPHABET_CLASS_TO_IDX: Dict[str, int] = {name: idx for idx, name in enumerate(ALPHABET_CLASSES)}
+
+
 def _is_point_file(file_name: str) -> bool:
     return file_name.lower().endswith((".txt", ".npy"))
 
@@ -492,18 +494,25 @@ def _collect_point_files(folder: str) -> List[str]:
     return files
 
 
+def _infer_symbol_from_text(text: str) -> Optional[str]:
+    for ch in str(text).upper():
+        if "A" <= ch <= "Z":
+            return ch
+    return None
+
+
 def load_point_cloud_auto(file_path: str) -> np.ndarray:
     """
     加载单个点云文件，支持 txt/npy。
     返回形状统一为 (N, 4)，列顺序为 (x, y, z, i)。
     """
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == '.txt':
+    if ext == ".txt":
         try:
-            data = np.loadtxt(file_path, delimiter=',')
+            data = np.loadtxt(file_path, delimiter=",")
         except Exception:
             data = np.loadtxt(file_path)
-    elif ext == '.npy':
+    elif ext == ".npy":
         data = np.load(file_path)
     else:
         raise ValueError(f"Unsupported point cloud file format: {ext}")
@@ -529,40 +538,13 @@ def load_point_cloud_auto(file_path: str) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
-def fix_point_count(points: np.ndarray, num_points: int, seed: Optional[int] = None) -> np.ndarray:
-    """将点云统一到固定点数 (num_points, 4)。"""
-    if points.ndim != 2 or points.shape[1] != 4:
-        raise ValueError(f"points shape must be (N,4), got {points.shape}")
-
-    n = points.shape[0]
-    if n == num_points:
-        return points
-
-    rng = np.random.default_rng(seed)
-    if n > num_points:
-        indices = rng.choice(n, size=num_points, replace=False)
-        return points[indices]
-
-    if n == 0:
-        return np.zeros((num_points, 4), dtype=np.float32)
-
-    pad_indices = rng.choice(n, size=(num_points - n), replace=True)
-    out = np.concatenate([points, points[pad_indices]], axis=0)
-    rng.shuffle(out)
-    return out
-
-
 def discover_spad_classification_samples(data_root: str) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, Optional[str]]]]:
     """
     自动扫描 SPAD 数据目录。
 
-    规则:
-    1) 若顶层数据集目录下存在子目录，则子目录名视为类别名（例如 2025-04-30-dpc）。
-    2) 若顶层数据集目录下只有点云文件（无子目录），则视为无标签数据（例如 0917-pc）。
-
     Returns:
         labeled_samples, unlabeled_samples
-        每个样本结构: {"path": str, "label": Optional[str], "dataset": str}
+        样本结构: {"path": str, "label": Optional[str], "dataset": str}
     """
     root = Path(data_root)
     if not root.exists() or not root.is_dir():
@@ -575,57 +557,60 @@ def discover_spad_classification_samples(data_root: str) -> Tuple[List[Dict[str,
         child_dirs = sorted([p for p in dataset_dir.iterdir() if p.is_dir()])
 
         if child_dirs:
-            # 子目录名即类别
             for class_dir in child_dirs:
-                point_files = _collect_point_files(str(class_dir))
-                for path in point_files:
-                    labeled_samples.append({
+                inferred_label = _infer_symbol_from_text(class_dir.name)
+                for path in _collect_point_files(str(class_dir)):
+                    sample = {
                         "path": path,
-                        "label": class_dir.name,
+                        "label": inferred_label,
                         "dataset": dataset_dir.name,
-                    })
+                    }
+                    if inferred_label is None:
+                        unlabeled_samples.append(sample)
+                    else:
+                        labeled_samples.append(sample)
         else:
-            # 无子目录，视为无标签数据
-            point_files = _collect_point_files(str(dataset_dir))
-            for path in point_files:
-                unlabeled_samples.append({
+            for path in _collect_point_files(str(dataset_dir)):
+                inferred_label = _infer_symbol_from_text(Path(path).stem)
+                sample = {
                     "path": path,
-                    "label": None,
+                    "label": inferred_label,
                     "dataset": dataset_dir.name,
-                })
+                }
+                if inferred_label is None:
+                    unlabeled_samples.append(sample)
+                else:
+                    labeled_samples.append(sample)
+
+    root_files = [p for p in root.iterdir() if p.is_file() and _is_point_file(p.name)]
+    for file_path in sorted(root_files):
+        inferred_label = _infer_symbol_from_text(file_path.stem)
+        sample = {
+            "path": str(file_path),
+            "label": inferred_label,
+            "dataset": root.name,
+        }
+        if inferred_label is None:
+            unlabeled_samples.append(sample)
+        else:
+            labeled_samples.append(sample)
 
     return labeled_samples, unlabeled_samples
 
 
-def build_class_mapping(samples: List[Dict[str, Optional[str]]]) -> Dict[str, int]:
-    labels = sorted({sample["label"] for sample in samples if sample["label"] is not None})
-    return {label: idx for idx, label in enumerate(labels)}
+def build_class_mapping(_: List[Dict[str, Optional[str]]]) -> Dict[str, int]:
+    return dict(ALPHABET_CLASS_TO_IDX)
 
 
-def _stratify_or_none(labels: List[str]) -> Optional[List[str]]:
-    unique_labels = sorted(set(labels))
-    if len(unique_labels) <= 1:
-        return None
-
-    counts = {}
-    for label in labels:
-        counts[label] = counts.get(label, 0) + 1
-
-    if min(counts.values()) < 2:
-        return None
-    return labels
-
-
-def split_labeled_samples(
-    labeled_samples: List[Dict[str, Optional[str]]],
+def split_samples_deterministic(
+    samples: List[Dict[str, Optional[str]]],
     train_ratio: float,
     val_ratio: float,
     test_ratio: float,
     seed: int,
 ) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, Optional[str]]], List[Dict[str, Optional[str]]]]:
-    """将有标签样本划分为 train/val/test。"""
-    if not labeled_samples:
-        raise ValueError("No labeled samples found for splitting.")
+    if len(samples) < 3:
+        raise ValueError("Need at least 3 samples to create train/val/test splits.")
 
     ratio_sum = train_ratio + val_ratio + test_ratio
     if ratio_sum <= 0:
@@ -635,127 +620,198 @@ def split_labeled_samples(
     val_ratio /= ratio_sum
     test_ratio /= ratio_sum
 
-    if len(labeled_samples) < 3:
-        raise ValueError("Need at least 3 labeled samples to create train/val/test splits.")
+    n_total = len(samples)
+    n_train = max(1, int(round(n_total * train_ratio)))
+    n_val = max(1, int(round(n_total * val_ratio)))
+    n_test = n_total - n_train - n_val
 
-    labels = [str(sample["label"]) for sample in labeled_samples]
-    indices = np.arange(len(labeled_samples))
+    if n_test <= 0:
+        n_test = 1
+        if n_train > n_val and n_train > 1:
+            n_train -= 1
+        elif n_val > 1:
+            n_val -= 1
+        else:
+            raise ValueError("Not enough samples to split into train/val/test.")
 
-    try:
-        stratify_1 = _stratify_or_none(labels)
-        train_val_idx, test_idx = train_test_split(
-            indices,
-            test_size=test_ratio,
-            random_state=seed,
-            shuffle=True,
-            stratify=stratify_1,
-        )
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(n_total)
 
-        val_in_train_val = val_ratio / (train_ratio + val_ratio)
-        train_val_labels = [labels[i] for i in train_val_idx]
-        stratify_2 = _stratify_or_none(train_val_labels)
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
 
-        train_idx, val_idx = train_test_split(
-            train_val_idx,
-            test_size=val_in_train_val,
-            random_state=seed,
-            shuffle=True,
-            stratify=stratify_2,
-        )
-    except Exception:
-        # 小样本或分层失败时，使用随机回退
-        rng = np.random.default_rng(seed)
-        shuffled = indices.copy()
-        rng.shuffle(shuffled)
-
-        n_total = len(shuffled)
-        n_train = max(1, int(round(n_total * train_ratio)))
-        n_val = max(1, int(round(n_total * val_ratio)))
-        n_test = n_total - n_train - n_val
-
-        if n_test <= 0:
-            n_test = 1
-            if n_train > n_val:
-                n_train -= 1
-            else:
-                n_val -= 1
-
-        train_idx = shuffled[:n_train]
-        val_idx = shuffled[n_train:n_train + n_val]
-        test_idx = shuffled[n_train + n_val:]
-
-    train_samples = [labeled_samples[int(i)] for i in train_idx]
-    val_samples = [labeled_samples[int(i)] for i in val_idx]
-    test_samples = [labeled_samples[int(i)] for i in test_idx]
-
+    train_samples = [samples[int(i)] for i in train_idx]
+    val_samples = [samples[int(i)] for i in val_idx]
+    test_samples = [samples[int(i)] for i in test_idx]
     return train_samples, val_samples, test_samples
 
 
+def _symbol_from_augmented_position(meta: Dict) -> str:
+    tx = int(meta.get("target_x_range", [20, 35])[0])
+    ty = int(meta.get("target_y_range", [5, 25])[0])
+    tz = int(meta.get("target_z_range", [80, 84])[0])
+
+    tx = int(np.clip(tx, 1, 50))
+    ty = int(np.clip(ty, 1, 45))
+    tz = int(np.clip(tz, 60, 110))
+
+    idx = ((tx - 1) * 7 + (ty - 1) * 3 + (tz - 60)) % 26
+    return ALPHABET_CLASSES[idx]
+
+
 class SPADClassificationDataset(Dataset):
-    """用于点云分类任务的数据集，返回固定形状点云 (N,4) 与分类标签。"""
+    """分类数据集：输入点云 (N,4)，标签固定为 A-Z 共 26 类。"""
 
     def __init__(
         self,
         samples: List[Dict[str, Optional[str]]],
         class_to_idx: Dict[str, int],
-        num_points: int = 1024,
+        num_points: Optional[int] = None,
         seed: int = SEED,
+        apply_augment: bool = True,
+        label_mode: str = "generated",
     ):
         self.samples = samples
         self.class_to_idx = class_to_idx
         self.num_points = num_points
-        self.seed = seed
+        self.seed = int(seed)
+        self.apply_augment = apply_augment
+        self.label_mode = label_mode
+
+        if self.label_mode not in {"generated", "raw"}:
+            raise ValueError(f"label_mode must be 'generated' or 'raw', got: {self.label_mode}")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         sample = self.samples[idx]
-        points = load_point_cloud_auto(sample["path"])
-        points = fix_point_count(points, self.num_points, seed=self.seed + idx)
+        points = load_point_cloud_auto(str(sample["path"]))
 
-        label = sample["label"]
-        label_idx = -1 if label is None else self.class_to_idx[str(label)]
+        if self.num_points is not None and self.num_points > 0 and points.shape[0] != self.num_points:
+            raise ValueError(
+                f"Point count mismatch for {sample['path']}: got N={points.shape[0]}, expected N={self.num_points}. "
+                "Downsampling is disabled by design. Please ensure preprocessed data has fixed N."
+            )
 
-        points_tensor = torch.from_numpy(points.astype(np.float32))  # (N,4)
+        points = points.astype(np.float32, copy=False)
+
+        if self.apply_augment:
+            sample_seed = self.seed + idx * 9973
+            points_tensor = torch.from_numpy(points).unsqueeze(0)
+            aug_points, aug_meta_list = augment_pytorch_batch(points_tensor, label_class=None, seed=sample_seed)
+            points = aug_points.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+            aug_meta = aug_meta_list[0] if aug_meta_list is not None else {}
+        else:
+            aug_meta = {
+                "target_shift": [0, 0, 0],
+                "fog_shift_z": 0,
+                "target_x_range": [20, 35],
+                "target_y_range": [5, 25],
+                "target_z_range": [80, 84],
+                "fog_z_range": [35, 64],
+                "fog_ahead_gap_bins": 16,
+            }
+
+        raw_label = sample.get("label")
+        raw_symbol = _infer_symbol_from_text(raw_label) if raw_label is not None else None
+        generated_symbol = _symbol_from_augmented_position(aug_meta)
+
+        if self.label_mode == "raw" and raw_symbol in self.class_to_idx:
+            symbol = str(raw_symbol)
+        else:
+            symbol = generated_symbol
+
+        label_idx = self.class_to_idx[symbol]
+
+        points_tensor = torch.from_numpy(points)
         label_tensor = torch.tensor(label_idx, dtype=torch.long)
-        return points_tensor, label_tensor, str(sample["path"])
+
+        sample_meta = {
+            "path": str(sample["path"]),
+            "dataset": str(sample.get("dataset", "")),
+            "sym": symbol,
+            "target_x_new": list(aug_meta.get("target_x_range", [20, 35])),
+            "target_y_new": list(aug_meta.get("target_y_range", [5, 25])),
+            "target_z_new": list(aug_meta.get("target_z_range", [80, 84])),
+            "target_shift": list(aug_meta.get("target_shift", [0, 0, 0])),
+        }
+        return points_tensor, label_tensor, sample_meta
 
 
 def create_spad_classification_dataloaders(
     data_root: str,
     batch_size: int = 16,
-    num_points: int = 1024,
+    num_points: Optional[int] = None,
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     num_workers: int = 0,
     seed: int = SEED,
+    augment_train: bool = True,
+    augment_eval: bool = True,
+    label_mode: str = "generated",
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Optional[DataLoader], Dict]:
     """
-    创建 SPAD 分类任务的 DataLoader。
+    创建 SPAD 分类任务 DataLoader。
 
-    Returns:
-        train_loader, val_loader, test_loader, unlabeled_loader, meta
+    标签规则：
+    - 默认 label_mode='generated'，根据增强后的 target_x_new/target_y_new/target_z_new 生成 A-Z 类别。
+    - label_mode='raw' 时，优先使用样本可解析的原始字母标签，否则回退到 generated。
     """
     labeled_samples, unlabeled_samples = discover_spad_classification_samples(data_root)
-    if not labeled_samples:
-        raise ValueError(f"No labeled samples found in data root: {data_root}")
+    all_samples = labeled_samples + unlabeled_samples
 
-    class_to_idx = build_class_mapping(labeled_samples)
+    if len(all_samples) < 3:
+        raise ValueError(f"Need at least 3 samples, got {len(all_samples)} from: {data_root}")
+
+    class_to_idx = build_class_mapping(all_samples)
     idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
 
-    train_samples, val_samples, test_samples = split_labeled_samples(
-        labeled_samples=labeled_samples,
+    train_samples, val_samples, test_samples = split_samples_deterministic(
+        samples=all_samples,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
         seed=seed,
     )
 
-    train_dataset = SPADClassificationDataset(train_samples, class_to_idx, num_points=num_points, seed=seed)
-    val_dataset = SPADClassificationDataset(val_samples, class_to_idx, num_points=num_points, seed=seed)
-    test_dataset = SPADClassificationDataset(test_samples, class_to_idx, num_points=num_points, seed=seed)
+    train_dataset = SPADClassificationDataset(
+        train_samples,
+        class_to_idx,
+        num_points=num_points,
+        seed=seed + 11,
+        apply_augment=augment_train,
+        label_mode=label_mode,
+    )
+    val_dataset = SPADClassificationDataset(
+        val_samples,
+        class_to_idx,
+        num_points=num_points,
+        seed=seed + 29,
+        apply_augment=augment_eval,
+        label_mode=label_mode,
+    )
+    test_dataset = SPADClassificationDataset(
+        test_samples,
+        class_to_idx,
+        num_points=num_points,
+        seed=seed + 47,
+        apply_augment=augment_eval,
+        label_mode=label_mode,
+    )
+
+    def _seed_worker(worker_id: int) -> None:
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+    train_generator = torch.Generator()
+    train_generator.manual_seed(seed + 101)
+    eval_generator = torch.Generator()
+    eval_generator.manual_seed(seed + 202)
 
     pin_memory = torch.cuda.is_available()
 
@@ -765,6 +821,8 @@ def create_spad_classification_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        generator=train_generator,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -772,6 +830,8 @@ def create_spad_classification_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        generator=eval_generator,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -779,18 +839,9 @@ def create_spad_classification_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        generator=eval_generator,
     )
-
-    unlabeled_loader: Optional[DataLoader] = None
-    if unlabeled_samples:
-        unlabeled_dataset = SPADClassificationDataset(unlabeled_samples, class_to_idx, num_points=num_points, seed=seed)
-        unlabeled_loader = DataLoader(
-            unlabeled_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
 
     meta = {
         "class_to_idx": class_to_idx,
@@ -798,94 +849,15 @@ def create_spad_classification_dataloaders(
         "num_classes": len(class_to_idx),
         "num_labeled_samples": len(labeled_samples),
         "num_unlabeled_samples": len(unlabeled_samples),
+        "num_total_samples": len(all_samples),
         "num_train_samples": len(train_samples),
         "num_val_samples": len(val_samples),
         "num_test_samples": len(test_samples),
+        "seed": seed,
+        "label_mode": label_mode,
+        "augmentation_location": "dataset",
+        "seed_controls_dataloader_and_augmentation": True,
     }
 
-    return train_loader, val_loader, test_loader, unlabeled_loader, meta
-
-
-# ============================================
-# 使用示例
-# ============================================
-if __name__ == "__main__":
-    # 数据目录路径
-    data_dir = r"E:\essay\硕士\研一\SPAD数据\20250430dataset\2025-04-30-dpc"
-
-    # 测试grid模式
-    print("=" * 60)
-    print("测试grid模式:")
-    print("=" * 60)
-
-    try:
-        train_loader_grid, val_loader_grid, test_loader_grid, class_to_idx_grid = create_dataloaders(
-            data_dir=data_dir,
-            mode='grid',
-            batch_size=4,
-            test_size=0.2,
-            val_size=0.2,
-            seed=SEED
-        )
-
-        # 打印类别映射
-        print("\n类别映射:")
-        for cls, idx in class_to_idx_grid.items():
-            print(f"  {cls} -> {idx}")
-
-        # 检查数据集大小
-        print(f"\n数据集大小:")
-        print(f"  训练集: {len(train_loader_grid.dataset)} 样本")
-        print(f"  验证集: {len(val_loader_grid.dataset)} 样本")
-        print(f"  测试集: {len(test_loader_grid.dataset)} 样本")
-
-        # 检查一个批次的数据
-        for batch_idx, (data_batch, targets_dict) in enumerate(train_loader_grid):
-            print(f"\nBatch {batch_idx + 1} (grid模式):")
-            print(f"  数据形状: {data_batch.shape}")  # 应为 (batch_size, 1, 64, 64, 200)
-            print(f"  边界框目标形状: {targets_dict['bbox_targets'].shape}")  # (batch_size, max_num_objects, 6)
-            print(f"  类别目标形状: {targets_dict['cls_targets'].shape}")  # (batch_size, max_num_objects)
-            print(f"  掩码形状: {targets_dict['mask'].shape}")  # (batch_size, max_num_objects)
-            print(f"  掩码数据类型: {targets_dict['mask'].dtype}")
-
-            # 显示掩码信息
-            mask = targets_dict['mask']
-            print(f"  掩码值示例（第一个样本）: {mask[0].numpy()}")
-
-            # 显示第一个样本的详细信息
-            bbox_targets = targets_dict['bbox_targets'][0]
-            cls_targets = targets_dict['cls_targets'][0]
-            mask_sample = targets_dict['mask'][0]
-
-            num_valid = int(mask_sample.sum().item())
-            print(f"\n  第一个样本 - 有效目标数: {num_valid}")
-            print(f"  总目标位置数: {len(mask_sample)}")
-
-            for i in range(min(5, mask_sample.shape[0])):
-                if mask_sample[i] > 0.5:  # 使用>0.5判断，因为mask是float
-                    bbox = bbox_targets[i]
-                    cls_idx = int(cls_targets[i].item())
-                    cls_name = class_to_idx_grid.get(cls_idx, "未知")
-                    print(f"    目标{i}: 类别={cls_name}({cls_idx}), "
-                          f"边界框=[{bbox[0]:.1f}, {bbox[1]:.1f}] x "
-                          f"[{bbox[2]:.1f}, {bbox[3]:.1f}] x "
-                          f"[{bbox[4]:.1f}, {bbox[5]:.1f}]")
-                else:
-                    print(f"    目标{i}: 填充位置")
-
-            # 检查填充值
-            print(f"\n  填充值检查:")
-            print(f"    bbox_targets填充值: {targets_dict['bbox_targets'][0, num_valid:, :] if num_valid < bbox_targets.shape[0] else '无填充'}")
-            print(f"    cls_targets填充值: {targets_dict['cls_targets'][0, num_valid:] if num_valid < cls_targets.shape[0] else '无填充'}")
-
-            # 只检查第一个批次
-            if batch_idx == 0:
-                break
-
-    except Exception as e:
-        print(f"创建grid模式DataLoader时出错: {e}")
-        import traceback
-        traceback.print_exc()
-
-    print("\n测试完成!")
+    return train_loader, val_loader, test_loader, None, meta
 

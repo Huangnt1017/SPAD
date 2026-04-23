@@ -19,13 +19,17 @@ def save_xyzi(data: np.ndarray, save_path: str):
     np.savetxt(save_path, data, fmt='%d', delimiter=' ')
 
 
-def _randint_inclusive(low: int, high: int, device: torch.device) -> int:
-    """Sample an integer from [low, high] on the given device."""
+def _randint_inclusive(low: int, high: int, generator: Optional[torch.Generator] = None) -> int:
+    """Sample an integer from [low, high] with an optional deterministic generator."""
     if low > high:
         raise ValueError(f"Invalid randint range: [{low}, {high}]")
-    return int(torch.randint(low, high + 1, (1,), device=device).item())
+    return int(torch.randint(low, high + 1, (1,), generator=generator).item())
 
-def augment_pytorch_batch(points: torch.Tensor, label_class: Optional[str] = None) -> Tuple[torch.Tensor, Optional[List[Dict]]]:
+def augment_pytorch_batch(
+    points: torch.Tensor,
+    label_class: Optional[str] = None,
+    seed: Optional[int] = None,
+) -> Tuple[torch.Tensor, Optional[List[Dict]]]:
     """
     Batch augmentation for SPAD point clouds.
 
@@ -42,6 +46,8 @@ def augment_pytorch_batch(points: torch.Tensor, label_class: Optional[str] = Non
     Args:
         points: Input point clouds (B, N, 4).
         label_class: Class name string. If None, metadata is not returned.
+        seed: Optional base seed. If provided, each sample i uses (seed + i),
+              which guarantees deterministic augmentation across runs.
 
     Returns:
         augmented_points: (B, N, 4) Tensor.
@@ -92,8 +98,13 @@ def augment_pytorch_batch(points: torch.Tensor, label_class: Optional[str] = Non
                    (xyz[:, 1] >= fog_y[0]) & (xyz[:, 1] < fog_y[1]) & \
                    (xyz[:, 2] >= fog_z[0]) & (xyz[:, 2] < fog_z[1])
 
-        dx = _randint_inclusive(dx_range[0], dx_range[1], device)
-        dy = _randint_inclusive(dy_range[0], dy_range[1], device)
+        sample_generator: Optional[torch.Generator] = None
+        if seed is not None:
+            sample_generator = torch.Generator(device="cpu")
+            sample_generator.manual_seed(int(seed) + i)
+
+        dx = _randint_inclusive(dx_range[0], dx_range[1], sample_generator)
+        dy = _randint_inclusive(dy_range[0], dy_range[1], sample_generator)
 
         # Sample target and fog z shifts with gap constraint:
         # target_z_min_new - fog_z_max_new >= min_gap_bins
@@ -101,13 +112,13 @@ def augment_pytorch_batch(points: torch.Tensor, label_class: Optional[str] = Non
         dz_target = 0
         dz_fog = 0
         for _ in range(20):
-            dz_target = _randint_inclusive(dz_target_range[0], dz_target_range[1], device)
+            dz_target = _randint_inclusive(dz_target_range[0], dz_target_range[1], sample_generator)
             dz_fog_max_by_gap = tgt_z[0] + dz_target - min_gap_bins - (fog_z[1] - 1)
             dz_fog_low = dz_fog_range[0]
             dz_fog_high = min(dz_fog_range[1], dz_fog_max_by_gap)
 
             if dz_fog_low <= dz_fog_high:
-                dz_fog = _randint_inclusive(dz_fog_low, dz_fog_high, device)
+                dz_fog = _randint_inclusive(dz_fog_low, dz_fog_high, sample_generator)
                 sampled = True
                 break
 

@@ -171,74 +171,14 @@ class PointNetSetAbstraction(nn.Module):
         return new_xyz, new_points
 
 
-class PointNetFeaturePropagation(nn.Module):
-    """
-    PointNet++ Feature Propagation
-    """
-    def __init__(self, in_channel, mlp):
-        super().__init__()
-        layers = []
-        last_channel = in_channel
-        for out_channel in mlp:
-            layers.append(nn.Conv1d(last_channel, out_channel, 1))
-            layers.append(nn.BatchNorm1d(out_channel))
-            layers.append(nn.ReLU(inplace=True))
-            last_channel = out_channel
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, xyz1, xyz2, points1, points2):
-        """
-        Interpolate features from xyz2 (sparser) to xyz1 (denser)
-
-        xyz1: [B, 3, N]
-        xyz2: [B, 3, S]
-        points1: [B, D1, N] or None
-        points2: [B, D2, S]
-        Return:
-            new_points: [B, D', N]
-        """
-        xyz1 = xyz1.transpose(1, 2).contiguous()  # [B, N, 3]
-        xyz2 = xyz2.transpose(1, 2).contiguous()  # [B, S, 3]
-        points2 = points2.transpose(1, 2).contiguous()  # [B, S, D2]
-
-        B, N, _ = xyz1.shape
-        S = xyz2.shape[1]
-
-        if S == 1:
-            interpolated_points = points2.repeat(1, N, 1)
-        else:
-            dists = square_distance(xyz1, xyz2)              # [B, N, S]
-            dists, idx = dists.sort(dim=-1)
-            dists, idx = dists[:, :, :3], idx[:, :, :3]     # 3-NN
-
-            dist_recip = 1.0 / (dists + 1e-8)
-            norm = torch.sum(dist_recip, dim=2, keepdim=True)
-            weight = dist_recip / norm
-
-            interpolated_points = torch.sum(
-                index_points(points2, idx) * weight[:, :, :, None], dim=2
-            )  # [B, N, D2]
-
-        if points1 is not None:
-            points1 = points1.transpose(1, 2).contiguous()  # [B, N, D1]
-            new_points = torch.cat([points1, interpolated_points], dim=-1)
-        else:
-            new_points = interpolated_points
-
-        new_points = new_points.transpose(1, 2).contiguous()  # [B, D, N]
-        new_points = self.mlp(new_points)
-        return new_points
-
-
 class PointNet2ClassificationSSG(nn.Module):
     """
     PointNet++ classification network (SSG), aligned to original paper style.
     """
-    def __init__(self, num_class, normal_channel=False):
+    def __init__(self, num_class=26):
         super().__init__()
-        in_channel = 3 if normal_channel else 0
+        in_channel = 1
 
-        self.normal_channel = normal_channel
         self.sa1 = PointNetSetAbstraction(
             npoint=512, radius=0.2, nsample=32,
             in_channel=in_channel, mlp=[64, 64, 128], group_all=False
@@ -262,14 +202,15 @@ class PointNet2ClassificationSSG(nn.Module):
 
     def forward(self, x):
         """
-        x:
-          - if normal_channel=False: [B, 3, N]
-          - if normal_channel=True:  [B, 6, N] (xyz + normal)
+        x: [B, N, 4] (xyz + intensity)
         return:
           logits: [B, num_class]
         """
-        xyz = x[:, :3, :]
-        points = x[:, 3:, :] if self.normal_channel else None
+        if x.ndim != 3 or x.shape[-1] != 4:
+            raise ValueError(f"PointNet2ClassificationSSG expects input shape (B, N, 4), got {tuple(x.shape)}")
+
+        xyz = x[:, :, :3].transpose(1, 2).contiguous()
+        points = x[:, :, 3:].transpose(1, 2).contiguous()
 
         l1_xyz, l1_points = self.sa1(xyz, points)
         l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
@@ -282,82 +223,13 @@ class PointNet2ClassificationSSG(nn.Module):
         return x
 
 
-class PointNet2PartSegmentationSSG(nn.Module):
-    """
-    PointNet++ part segmentation network (SSG), aligned to original paper style.
-    Supports optional class one-hot vector as in ShapeNet part setup.
-    """
-    def __init__(self, num_part, num_class=16, normal_channel=False, use_cls_label=True):
-        super().__init__()
-        self.normal_channel = normal_channel
-        self.use_cls_label = use_cls_label
+def _quick_shape_test():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = PointNet2ClassificationSSG(num_class=26).to(device)
+    pts = torch.randn(4, 1024, 4, device=device)
+    logits = model(pts)
+    print("PointNet2ClassificationSSG output:", logits.shape)  # [4, 26]
 
-        in_channel = 3 if normal_channel else 0
 
-        self.sa1 = PointNetSetAbstraction(
-            npoint=512, radius=0.2, nsample=32,
-            in_channel=in_channel, mlp=[64, 64, 128], group_all=False
-        )
-        self.sa2 = PointNetSetAbstraction(
-            npoint=128, radius=0.4, nsample=64,
-            in_channel=128, mlp=[128, 128, 256], group_all=False
-        )
-        self.sa3 = PointNetSetAbstraction(
-            npoint=None, radius=None, nsample=None,
-            in_channel=256, mlp=[256, 512, 1024], group_all=True
-        )
-
-        self.fp3 = PointNetFeaturePropagation(in_channel=1024 + 256, mlp=[256, 256])
-        self.fp2 = PointNetFeaturePropagation(in_channel=256 + 128, mlp=[256, 128])
-
-        # L0 concatenation: xyz(3) + optional normal(3) + optional cls_onehot(num_class) + fp feature(128)
-        fp1_in = 128 + 3
-        if normal_channel:
-            fp1_in += 3
-        if use_cls_label:
-            fp1_in += num_class
-
-        self.fp1 = PointNetFeaturePropagation(in_channel=fp1_in, mlp=[128, 128, 128])
-
-        self.conv1 = nn.Conv1d(128, 128, 1)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.drop1 = nn.Dropout(0.5)
-        self.conv2 = nn.Conv1d(128, num_part, 1)
-
-    def forward(self, x, cls_label=None):
-        """
-        x:
-          - if normal_channel=False: [B, 3, N]
-          - if normal_channel=True:  [B, 6, N]
-        cls_label: [B, num_class] one-hot or None
-        return:
-          seg_logits: [B, num_part, N]
-        """
-        B, _, N = x.shape
-        l0_xyz = x[:, :3, :]
-        l0_points = x[:, 3:, :] if self.normal_channel else None
-
-        l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
-        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
-        l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)
-
-        l2_points = self.fp3(l2_xyz, l3_xyz, l2_points, l3_points)
-        l1_points = self.fp2(l1_xyz, l2_xyz, l1_points, l2_points)
-
-        l0_cat = [l0_xyz]
-        if self.normal_channel:
-            l0_cat.append(x[:, 3:, :])
-
-        if self.use_cls_label:
-            if cls_label is None:
-                raise ValueError("cls_label is required when use_cls_label=True")
-            cls_label_feat = cls_label.view(B, -1, 1).repeat(1, 1, N)
-            l0_cat.append(cls_label_feat)
-
-        l0_cat.append(l1_points)
-        l0_points = torch.cat(l0_cat, dim=1)
-
-        feat = self.fp1(l0_xyz, l1_xyz, l0_points, l1_points)
-        feat = self.drop1(F.relu(self.bn1(self.conv1(feat))))
-        seg_logits = self.conv2(feat)
-        return seg_logits
+if __name__ == "__main__":
+    _quick_shape_test()
