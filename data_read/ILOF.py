@@ -278,3 +278,6 @@ def parse_args() -> LCLOFConfig:
 if __name__ == "__main__":
 	cfg = parse_args()
 	run_batch(cfg)
+
+	# 在未指定范围时，结果不受i控制，导致倾向于密集区域，即雾区为主要保留对象
+	

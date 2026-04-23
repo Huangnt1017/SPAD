@@ -445,7 +445,6 @@ if __name__ == '__main__':
     # pc_rd = pc[indices, :]
     # plot_pc(pc_rd,'all')
     pc = read_pc(r'D:\\PYproject\\SPADdata\\20250430\\lclof_results\\4_completed\\A_completed.txt')
-
     # pc_d = pc_down_sample_intensity_topk(pc,1024)
     # plot_pc2d(pc)
     mask1 = pc[:, 3] >= 50
