@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,6 +18,12 @@ from sklearn.metrics import (
 from tqdm import tqdm
 
 from utils.data import create_spad_classification_dataloaders
+from utils.loss import (
+	box_iou_3d_aligned,
+	build_spad_boxes_from_meta,
+	canonicalize_boxes_3d,
+	split_cls_and_box_predictions,
+)
 from scipts.train import build_model, compute_topk_hits, prepare_model_inputs, resolve_path, set_seed
 
 
@@ -107,6 +113,115 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], save_path: Pat
 	plt.close(fig)
 
 
+def slice_batch_meta(meta: Mapping[str, Any], valid_mask: torch.Tensor) -> Dict[str, Any]:
+	"""Slice collated metadata using a batch-level validity mask."""
+	mask_cpu = valid_mask.detach().cpu()
+	mask_list = mask_cpu.tolist()
+	sliced: Dict[str, Any] = {}
+
+	for key, value in meta.items():
+		if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == len(mask_list):
+			sliced[key] = value[mask_cpu]
+		elif isinstance(value, list) and len(value) == len(mask_list):
+			sliced[key] = [item for item, keep in zip(value, mask_list) if keep]
+		elif isinstance(value, tuple) and len(value) == len(mask_list):
+			sliced[key] = tuple(item for item, keep in zip(value, mask_list) if keep)
+		else:
+			sliced[key] = value
+
+	return sliced
+
+
+def compute_ap_from_pr(recall: np.ndarray, precision: np.ndarray) -> float:
+	"""Compute area under the precision-recall curve using interpolation envelope."""
+	mrec = np.concatenate(([0.0], recall, [1.0]))
+	mpre = np.concatenate(([0.0], precision, [0.0]))
+
+	for i in range(mpre.size - 1, 0, -1):
+		mpre[i - 1] = max(mpre[i - 1], mpre[i])
+
+	change_idx = np.where(mrec[1:] != mrec[:-1])[0]
+	return float(np.sum((mrec[change_idx + 1] - mrec[change_idx]) * mpre[change_idx + 1]))
+
+
+def compute_box_ap_metrics(
+	pred_classes: np.ndarray,
+	pred_scores: np.ndarray,
+	gt_classes: np.ndarray,
+	ious: np.ndarray,
+	num_classes: int,
+	iou_thresholds: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+	"""
+	Compute AP50 and AP@50:5:95 for single-box-per-sample detection.
+
+	Each sample contributes one prediction (class + score + box IoU against its GT box).
+	"""
+	if pred_classes.size == 0 or gt_classes.size == 0 or ious.size == 0:
+		return {
+			"AP50": float("nan"),
+			"AP@50:5:95": float("nan"),
+			"mean_iou_matched_cls": float("nan"),
+			"thresholds": [],
+			"ap_per_threshold": {},
+		}
+
+	if iou_thresholds is None:
+		iou_thresholds = np.arange(0.50, 0.96, 0.05, dtype=np.float64)
+
+	def _map_at_threshold(threshold: float) -> float:
+		per_class_ap: List[float] = []
+		for cls_idx in range(num_classes):
+			gt_count = int((gt_classes == cls_idx).sum())
+			if gt_count <= 0:
+				continue
+
+			pred_mask = pred_classes == cls_idx
+			if not np.any(pred_mask):
+				per_class_ap.append(0.0)
+				continue
+
+			cls_scores = pred_scores[pred_mask]
+			cls_pred_classes = pred_classes[pred_mask]
+			cls_gt_classes = gt_classes[pred_mask]
+			cls_ious = ious[pred_mask]
+
+			tp = ((cls_pred_classes == cls_gt_classes) & (cls_ious >= threshold)).astype(np.float64)
+			fp = 1.0 - tp
+
+			order = np.argsort(-cls_scores)
+			tp = tp[order]
+			fp = fp[order]
+
+			tp_cum = np.cumsum(tp)
+			fp_cum = np.cumsum(fp)
+			recall = tp_cum / max(gt_count, 1)
+			precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-12)
+			per_class_ap.append(compute_ap_from_pr(recall, precision))
+
+		if not per_class_ap:
+			return float("nan")
+		return float(np.mean(per_class_ap))
+
+	ap_values: List[float] = []
+	ap_per_threshold: Dict[str, float] = {}
+	for thr in iou_thresholds:
+		ap_thr = _map_at_threshold(float(thr))
+		ap_values.append(ap_thr)
+		ap_per_threshold[f"{thr:.2f}"] = ap_thr
+
+	matched_cls_mask = pred_classes == gt_classes
+	mean_iou_matched = float(np.mean(ious[matched_cls_mask])) if np.any(matched_cls_mask) else 0.0
+
+	return {
+		"AP50": float(ap_per_threshold.get("0.50", float("nan"))),
+		"AP@50:5:95": float(np.mean(ap_values)) if ap_values else float("nan"),
+		"mean_iou_matched_cls": mean_iou_matched,
+		"thresholds": [float(t) for t in iou_thresholds],
+		"ap_per_threshold": ap_per_threshold,
+	}
+
+
 def evaluate(
 	model: nn.Module,
 	loader,
@@ -121,10 +236,17 @@ def evaluate(
 
 	all_preds: List[int] = []
 	all_labels: List[int] = []
+	all_pred_scores: List[float] = []
+	all_box_ious: List[float] = []
+	all_box_scores: List[float] = []
+	all_box_pred_classes: List[int] = []
+	all_box_gt_classes: List[int] = []
+	box_eval_samples = 0
+	box_eval_skipped = False
 
 	with torch.no_grad():
 		pbar = tqdm(loader, desc="Testing", leave=False)
-		for points, labels, _ in pbar:
+		for points, labels, batch_meta in pbar:
 			points = points.to(device, non_blocking=True)
 			labels = labels.to(device, non_blocking=True)
 
@@ -135,7 +257,8 @@ def evaluate(
 			points = points[valid_mask]
 			labels = labels[valid_mask]
 
-			logits = model(prepare_model_inputs(points))
+			model_outputs = model(prepare_model_inputs(points))
+			logits, box_preds = split_cls_and_box_predictions(model_outputs)
 			loss = criterion(logits, labels)
 
 			batch_size = labels.size(0)
@@ -146,9 +269,33 @@ def evaluate(
 			top1_hits += hits[1]
 			top3_hits += hits[3]
 
-			preds = logits.argmax(dim=1)
+			probs = torch.softmax(logits, dim=1)
+			pred_scores, preds = probs.max(dim=1)
 			all_preds.extend(preds.detach().cpu().tolist())
 			all_labels.extend(labels.detach().cpu().tolist())
+			all_pred_scores.extend(pred_scores.detach().cpu().tolist())
+
+			if box_preds is not None and isinstance(batch_meta, Mapping):
+				try:
+					meta_valid = slice_batch_meta(batch_meta, valid_mask)
+					gt_boxes = build_spad_boxes_from_meta(meta_valid, device=device)
+					pred_boxes = canonicalize_boxes_3d(box_preds, device=device, dtype=gt_boxes.dtype)
+
+					if pred_boxes.shape != gt_boxes.shape:
+						raise ValueError(
+							f"Box shape mismatch: pred={tuple(pred_boxes.shape)} vs gt={tuple(gt_boxes.shape)}"
+						)
+
+					ious = box_iou_3d_aligned(pred_boxes, gt_boxes)
+					all_box_ious.extend(ious.detach().cpu().tolist())
+					all_box_scores.extend(pred_scores.detach().cpu().tolist())
+					all_box_pred_classes.extend(preds.detach().cpu().tolist())
+					all_box_gt_classes.extend(labels.detach().cpu().tolist())
+					box_eval_samples += int(labels.size(0))
+				except Exception:
+					box_eval_skipped = True
+			elif box_preds is not None:
+				box_eval_skipped = True
 
 			avg_loss = total_loss / max(total_samples, 1)
 			top1 = top1_hits / max(total_samples, 1)
@@ -161,6 +308,13 @@ def evaluate(
 		"top3": top3_hits / max(total_samples, 1),
 		"y_true": np.array(all_labels, dtype=np.int64),
 		"y_pred": np.array(all_preds, dtype=np.int64),
+		"pred_scores": np.array(all_pred_scores, dtype=np.float64),
+		"box_ious": np.array(all_box_ious, dtype=np.float64),
+		"box_scores": np.array(all_box_scores, dtype=np.float64),
+		"box_pred_classes": np.array(all_box_pred_classes, dtype=np.int64),
+		"box_gt_classes": np.array(all_box_gt_classes, dtype=np.int64),
+		"box_eval_samples": int(box_eval_samples),
+		"box_eval_skipped": bool(box_eval_skipped),
 	}
 
 
@@ -213,6 +367,19 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	y_true = eval_out["y_true"]
 	y_pred = eval_out["y_pred"]
 	metrics = compute_metrics(y_true, y_pred, num_classes=meta["num_classes"])
+	box_metrics: Optional[Dict[str, Any]] = None
+	if eval_out["box_eval_samples"] > 0:
+		box_metrics = compute_box_ap_metrics(
+			pred_classes=eval_out["box_pred_classes"],
+			pred_scores=eval_out["box_scores"],
+			gt_classes=eval_out["box_gt_classes"],
+			ious=eval_out["box_ious"],
+			num_classes=meta["num_classes"],
+		)
+	elif eval_out["box_eval_skipped"]:
+		logger.warning(
+			"Box AP metrics skipped. Ensure model outputs boxes with shape [B,6] or [B,3,2] and metadata provides target ranges."
+		)
 
 	idx_to_class = meta["idx_to_class"]
 	class_names = [idx_to_class[i] for i in range(meta["num_classes"])]
@@ -239,6 +406,10 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("precision_macro=%.4f", metrics["precision_macro"])
 	logger.info("recall_macro=%.4f", metrics["recall_macro"])
 	logger.info("f1_macro=%.4f", metrics["f1_macro"])
+	if box_metrics is not None:
+		logger.info("mean_iou_matched_cls=%.4f", box_metrics["mean_iou_matched_cls"])
+		logger.info("AP50=%.4f", box_metrics["AP50"])
+		logger.info("AP@50:5:95=%.4f", box_metrics["AP@50:5:95"])
 	logger.info("confusion_matrix_path=%s", cm_path)
 	logger.info("\n%s", report_text)
 
@@ -254,6 +425,12 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 		"recall_macro": metrics["recall_macro"],
 		"f1_macro": metrics["f1_macro"],
 		"per_class_accuracy": {class_names[k]: v for k, v in metrics["per_class_accuracy"].items()},
+		"mean_iou_matched_cls": (None if box_metrics is None else box_metrics["mean_iou_matched_cls"]),
+		"AP50": (None if box_metrics is None else box_metrics["AP50"]),
+		"AP@50:5:95": (None if box_metrics is None else box_metrics["AP@50:5:95"]),
+		"box_ap_thresholds": (None if box_metrics is None else box_metrics["thresholds"]),
+		"box_ap_per_threshold": (None if box_metrics is None else box_metrics["ap_per_threshold"]),
+		"num_box_eval_samples": eval_out["box_eval_samples"],
 		"class_names": class_names,
 		"checkpoint": str(checkpoint_path),
 		"confusion_matrix_path": str(cm_path),
