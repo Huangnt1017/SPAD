@@ -61,7 +61,7 @@ def augment_pytorch_batch(
 
     # Source regions (upper bounds are exclusive)
     tgt_x = (20, 35)
-    tgt_y = (5, 25)
+    tgt_y = (5, 20)
     tgt_z = (80, 85)
 
     fog_x = (1, 65)
@@ -83,7 +83,7 @@ def augment_pytorch_batch(
     dz_fog_range = (fog_z_limit[0] - fog_z[0], fog_z_limit[1] - (fog_z[1] - 1))
 
     aug_points = points.clone()
-    meta_list = [] if label_class is not None else None
+    meta_list: List[Dict] = []
 
     # Process batch
     for i in range(B):
@@ -145,17 +145,16 @@ def augment_pytorch_batch(
         target_z_new_inclusive = (tgt_z[0] + dz_target, (tgt_z[1] - 1) + dz_target)
         fog_z_new_inclusive = (fog_z[0] + dz_fog, (fog_z[1] - 1) + dz_fog)
 
-        if meta_list is not None:
-            meta_list.append({
-                "label": label_class,
-                "target_shift": [int(dx), int(dy), int(dz_target)],
-                "fog_shift_z": int(dz_fog),
-                "target_x_range": [int(target_x_new[0]), int(target_x_new[1])],
-                "target_y_range": [int(target_y_new[0]), int(target_y_new[1])],
-                "target_z_range": [int(target_z_new_inclusive[0]), int(target_z_new_inclusive[1])],
-                "fog_z_range": [int(fog_z_new_inclusive[0]), int(fog_z_new_inclusive[1])],
-                "fog_ahead_gap_bins": int(target_z_new_inclusive[0] - fog_z_new_inclusive[1])
-            })
+        meta_list.append({
+            "label": label_class,
+            "target_shift": [int(dx), int(dy), int(dz_target)],
+            "fog_shift_z": int(dz_fog),
+            "target_x_range": [int(target_x_new[0]), int(target_x_new[1])],
+            "target_y_range": [int(target_y_new[0]), int(target_y_new[1])],
+            "target_z_range": [int(target_z_new_inclusive[0]), int(target_z_new_inclusive[1])],
+            "fog_z_range": [int(fog_z_new_inclusive[0]), int(fog_z_new_inclusive[1])],
+            "fog_ahead_gap_bins": int(target_z_new_inclusive[0] - fog_z_new_inclusive[1])
+        })
 
     return aug_points, meta_list
 

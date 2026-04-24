@@ -1,0 +1,28 @@
+2026-04-24 17:24:43,114 | INFO | === Training Configuration ===
+2026-04-24 17:24:43,114 | INFO | run_timestamp=20260424_172441_822714
+2026-04-24 17:24:43,114 | INFO | data_root=D:\PYproject\SPADdata\2025-04-30-dpc
+2026-04-24 17:24:43,114 | INFO | device=cpu
+2026-04-24 17:24:43,115 | INFO | model=pointnet2
+2026-04-24 17:24:43,115 | INFO | num_classes=26
+2026-04-24 17:24:43,115 | INFO | num_labeled_samples=8528
+2026-04-24 17:24:43,115 | INFO | num_unlabeled_samples=0
+2026-04-24 17:24:43,115 | INFO | split train/val/test = 171 / 85 / 8272
+2026-04-24 17:24:43,116 | INFO | unlabeled_loader_exists=no
+2026-04-24 17:24:43,116 | INFO | args={"data_root": "D:\\PYproject\\SPADdata\\2025-04-30-dpc", "model": "pointnet2", "epochs": 10, "batch_size": 128, "num_points": 512, "lr": 0.001, "min_lr": 1e-05, "weight_decay": 0.0001, "train_ratio": 0.02, "val_ratio": 0.01, "test_ratio": 0.97, "num_workers": 0, "seed": 42, "device": "cpu", "log_dir": "logs", "save_dir": "checkpoints", "resume": "", "label_mode": "raw", "cls_loss_weight": 1.0, "box_l1_weight": 1.0, "box_iou_weight": 1.0, "label_smoothing": 0.0, "augment_train": true, "augment_eval": false}
+2026-04-24 17:24:53,701 | INFO | Epoch [1/10] | train_loss=3.3601 train_top1=0.0526 train_top3=0.1696 | val_loss=3.2583 val_top1=0.0353 val_top3=0.0941
+2026-04-24 17:24:53,720 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointnet2_20260424_172441_822714_best.pth
+2026-04-24 17:25:04,130 | INFO | Epoch [2/10] | train_loss=3.0855 train_top1=0.1520 train_top3=0.3216 | val_loss=3.2484 val_top1=0.0353 val_top3=0.1412
+2026-04-24 17:25:04,147 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointnet2_20260424_172441_822714_best.pth
+2026-04-24 17:25:14,659 | INFO | Epoch [3/10] | train_loss=3.0717 train_top1=0.1462 train_top3=0.2924 | val_loss=3.2341 val_top1=0.0706 val_top3=0.1412
+2026-04-24 17:25:14,678 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointnet2_20260424_172441_822714_best.pth
+2026-04-24 17:25:25,035 | INFO | Epoch [4/10] | train_loss=2.8615 train_top1=0.2632 train_top3=0.4327 | val_loss=3.2234 val_top1=0.0706 val_top3=0.1765
+2026-04-24 17:25:25,051 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointnet2_20260424_172441_822714_best.pth
+2026-04-24 17:25:35,440 | INFO | Epoch [5/10] | train_loss=2.8132 train_top1=0.2339 train_top3=0.4620 | val_loss=3.2136 val_top1=0.0941 val_top3=0.1882
+2026-04-24 17:25:35,460 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointnet2_20260424_172441_822714_best.pth
+2026-04-24 17:25:45,942 | INFO | Epoch [6/10] | train_loss=2.7231 train_top1=0.1930 train_top3=0.5029 | val_loss=3.2098 val_top1=0.0706 val_top3=0.2000
+2026-04-24 17:25:56,274 | INFO | Epoch [7/10] | train_loss=2.6550 train_top1=0.2573 train_top3=0.5556 | val_loss=3.2015 val_top1=0.0706 val_top3=0.2353
+2026-04-24 17:26:06,774 | INFO | Epoch [8/10] | train_loss=2.6490 train_top1=0.2924 train_top3=0.5556 | val_loss=3.1951 val_top1=0.0706 val_top3=0.2588
+2026-04-24 17:26:17,270 | INFO | Epoch [9/10] | train_loss=2.5240 train_top1=0.3158 train_top3=0.5906 | val_loss=3.1898 val_top1=0.0824 val_top3=0.2824
+2026-04-24 17:26:27,828 | INFO | Epoch [10/10] | train_loss=2.5104 train_top1=0.3158 train_top3=0.6140 | val_loss=3.1900 val_top1=0.0824 val_top3=0.2824
+2026-04-24 17:26:27,844 | INFO | Saved last checkpoint to D:\PYproject\SPAD\checkpoints\pointnet2_20260424_172441_822714_last.pth
+2026-04-24 17:26:27,844 | INFO | Training finished. Best val top1=0.0941

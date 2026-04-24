@@ -553,43 +553,34 @@ def discover_spad_classification_samples(data_root: str) -> Tuple[List[Dict[str,
     labeled_samples: List[Dict[str, Optional[str]]] = []
     unlabeled_samples: List[Dict[str, Optional[str]]] = []
 
-    for dataset_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
-        child_dirs = sorted([p for p in dataset_dir.iterdir() if p.is_dir()])
+    all_point_files = _collect_point_files(str(root))
+    root_resolved = root.resolve()
 
-        if child_dirs:
-            for class_dir in child_dirs:
-                inferred_label = _infer_symbol_from_text(class_dir.name)
-                for path in _collect_point_files(str(class_dir)):
-                    sample = {
-                        "path": path,
-                        "label": inferred_label,
-                        "dataset": dataset_dir.name,
-                    }
-                    if inferred_label is None:
-                        unlabeled_samples.append(sample)
-                    else:
-                        labeled_samples.append(sample)
-        else:
-            for path in _collect_point_files(str(dataset_dir)):
-                inferred_label = _infer_symbol_from_text(Path(path).stem)
-                sample = {
-                    "path": path,
-                    "label": inferred_label,
-                    "dataset": dataset_dir.name,
-                }
-                if inferred_label is None:
-                    unlabeled_samples.append(sample)
-                else:
-                    labeled_samples.append(sample)
+    for path in all_point_files:
+        file_path = Path(path)
+        try:
+            rel_parts = file_path.resolve().relative_to(root_resolved).parts
+        except ValueError:
+            rel_parts = file_path.parts
 
-    root_files = [p for p in root.iterdir() if p.is_file() and _is_point_file(p.name)]
-    for file_path in sorted(root_files):
-        inferred_label = _infer_symbol_from_text(file_path.stem)
+        # Prefer parent folder as class label for layouts like: data_root/<class_name>/<sample>.txt
+        parent_label: Optional[str] = None
+        if len(rel_parts) >= 2:
+            parent_label = str(rel_parts[-2]).strip()
+            if parent_label == "":
+                parent_label = None
+
+        inferred_label = parent_label
+        if inferred_label is None:
+            inferred_label = _infer_symbol_from_text(file_path.stem)
+
+        dataset_name = str(rel_parts[0]) if len(rel_parts) > 1 else root.name
         sample = {
             "path": str(file_path),
             "label": inferred_label,
-            "dataset": root.name,
+            "dataset": dataset_name,
         }
+
         if inferred_label is None:
             unlabeled_samples.append(sample)
         else:
@@ -598,8 +589,11 @@ def discover_spad_classification_samples(data_root: str) -> Tuple[List[Dict[str,
     return labeled_samples, unlabeled_samples
 
 
-def build_class_mapping(_: List[Dict[str, Optional[str]]]) -> Dict[str, int]:
-    return dict(ALPHABET_CLASS_TO_IDX)
+def build_class_mapping(samples: List[Dict[str, Optional[str]]]) -> Dict[str, int]:
+    labels = sorted({str(sample["label"]).strip() for sample in samples if sample.get("label")})
+    if not labels:
+        raise ValueError("No class labels discovered from dataset folders/files.")
+    return {name: idx for idx, name in enumerate(labels)}
 
 
 def split_samples_deterministic(
@@ -649,7 +643,7 @@ def split_samples_deterministic(
 
 def _symbol_from_augmented_position(meta: Dict) -> str:
     tx = int(meta.get("target_x_range", [20, 35])[0])
-    ty = int(meta.get("target_y_range", [5, 25])[0])
+    ty = int(meta.get("target_y_range", [5, 20])[0])
     tz = int(meta.get("target_z_range", [80, 84])[0])
 
     tx = int(np.clip(tx, 1, 50))
@@ -661,7 +655,7 @@ def _symbol_from_augmented_position(meta: Dict) -> str:
 
 
 class SPADClassificationDataset(Dataset):
-    """分类数据集：输入点云 (N,4)，标签固定为 A-Z 共 26 类。"""
+    """分类数据集：输入点云 (N,4)，标签来自目录类别名或增强位置映射。"""
 
     def __init__(
         self,
@@ -689,18 +683,35 @@ class SPADClassificationDataset(Dataset):
         sample = self.samples[idx]
         points = load_point_cloud_auto(str(sample["path"]))
 
-        if self.num_points is not None and self.num_points > 0 and points.shape[0] != self.num_points:
-            raise ValueError(
-                f"Point count mismatch for {sample['path']}: got N={points.shape[0]}, expected N={self.num_points}. "
-                "Downsampling is disabled by design. Please ensure preprocessed data has fixed N."
-            )
+        sample_seed = self.seed + idx * 9973
+
+        if self.num_points is not None and self.num_points > 0:
+            target_n = int(self.num_points)
+            if target_n <= 0:
+                raise ValueError(f"num_points must be positive, got: {self.num_points}")
+
+            curr_n = int(points.shape[0])
+            rng = np.random.default_rng(sample_seed)
+
+            if curr_n <= 0:
+                points = np.zeros((target_n, 4), dtype=np.float32)
+            elif curr_n > target_n:
+                select_idx = rng.choice(curr_n, size=target_n, replace=False)
+                points = points[select_idx]
+            elif curr_n < target_n:
+                pad_idx = rng.choice(curr_n, size=target_n - curr_n, replace=True)
+                points = np.concatenate([points, points[pad_idx]], axis=0)
 
         points = points.astype(np.float32, copy=False)
 
+        raw_label = sample.get("label")
+        raw_label_name = str(raw_label).strip() if raw_label is not None else None
+        if raw_label_name == "":
+            raw_label_name = None
+
         if self.apply_augment:
-            sample_seed = self.seed + idx * 9973
             points_tensor = torch.from_numpy(points).unsqueeze(0)
-            aug_points, aug_meta_list = augment_pytorch_batch(points_tensor, label_class=None, seed=sample_seed)
+            aug_points, aug_meta_list = augment_pytorch_batch(points_tensor, label_class=raw_label_name, seed=sample_seed)
             points = aug_points.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
             aug_meta = aug_meta_list[0] if aug_meta_list is not None else {}
         else:
@@ -714,14 +725,28 @@ class SPADClassificationDataset(Dataset):
                 "fog_ahead_gap_bins": 16,
             }
 
-        raw_label = sample.get("label")
-        raw_symbol = _infer_symbol_from_text(raw_label) if raw_label is not None else None
         generated_symbol = _symbol_from_augmented_position(aug_meta)
 
-        if self.label_mode == "raw" and raw_symbol in self.class_to_idx:
-            symbol = str(raw_symbol)
+        if self.label_mode == "raw":
+            if raw_label_name is None:
+                raise ValueError(
+                    f"label_mode='raw' requires folder/file label, but sample has no label: {sample['path']}"
+                )
+            if raw_label_name not in self.class_to_idx:
+                raise ValueError(
+                    f"Raw label '{raw_label_name}' not found in class mapping for sample: {sample['path']}"
+                )
+            symbol = raw_label_name
         else:
-            symbol = generated_symbol
+            if generated_symbol in self.class_to_idx:
+                symbol = generated_symbol
+            elif raw_label_name is not None and raw_label_name in self.class_to_idx:
+                symbol = raw_label_name
+            else:
+                raise ValueError(
+                    f"Neither generated label '{generated_symbol}' nor raw label '{raw_label_name}' "
+                    f"exists in class mapping for sample: {sample['path']}"
+                )
 
         label_idx = self.class_to_idx[symbol]
 
@@ -732,9 +757,15 @@ class SPADClassificationDataset(Dataset):
             "path": str(sample["path"]),
             "dataset": str(sample.get("dataset", "")),
             "sym": symbol,
+            "class_name": symbol,
             "target_x_new": list(aug_meta.get("target_x_range", [20, 35])),
             "target_y_new": list(aug_meta.get("target_y_range", [5, 25])),
             "target_z_new": list(aug_meta.get("target_z_range", [80, 84])),
+            "box_3d": [
+                list(aug_meta.get("target_x_range", [20, 35])),
+                list(aug_meta.get("target_y_range", [5, 25])),
+                list(aug_meta.get("target_z_range", [80, 84])),
+            ],
             "target_shift": list(aug_meta.get("target_shift", [0, 0, 0])),
         }
         return points_tensor, label_tensor, sample_meta
@@ -751,14 +782,14 @@ def create_spad_classification_dataloaders(
     seed: int = SEED,
     augment_train: bool = True,
     augment_eval: bool = True,
-    label_mode: str = "generated",
+    label_mode: str = "raw",
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Optional[DataLoader], Dict]:
     """
     创建 SPAD 分类任务 DataLoader。
 
     标签规则：
-    - 默认 label_mode='generated'，根据增强后的 target_x_new/target_y_new/target_z_new 生成 A-Z 类别。
-    - label_mode='raw' 时，优先使用样本可解析的原始字母标签，否则回退到 generated。
+    - 默认 label_mode='raw'，使用样本父目录名称作为类别标签。
+    - label_mode='generated' 时，使用增强后目标位置映射得到 A-Z 标签（仅当类映射包含该标签时有效）。
     """
     labeled_samples, unlabeled_samples = discover_spad_classification_samples(data_root)
     all_samples = labeled_samples + unlabeled_samples

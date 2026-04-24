@@ -26,8 +26,10 @@ from utils.loss import (
 )
 from scipts.train import build_model, compute_topk_hits, prepare_model_inputs, resolve_path, set_seed
 
+# 测试脚本只负责从 checkpoint 读取模型，再把分类与 box 相关指标统一算出来并落盘。
 
 def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, str]:
+	# 测试阶段也保留文件日志，便于记录最终指标、混淆矩阵路径和 AP 结果。
 	log_dir.mkdir(parents=True, exist_ok=True)
 	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 	log_file = log_dir / f"test_{model_name}_{timestamp}.log"
@@ -51,6 +53,7 @@ def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, 
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int) -> Dict:
+	# 分类指标都来自真实标签 y_true 与预测标签 y_pred 的对比，混淆矩阵是后续画图和分项统计的基础。
 	labels = np.arange(num_classes)
 	cm = confusion_matrix(y_true, y_pred, labels=labels)
 
@@ -80,6 +83,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int) ->
 
 
 def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], save_path: Path, normalize: bool = True) -> None:
+	# 混淆矩阵是把逐类预测结果汇总成二维表，归一化后更适合观察类别间的混淆模式。
 	matrix = cm.astype(np.float64)
 	if normalize:
 		row_sum = matrix.sum(axis=1, keepdims=True)
@@ -115,6 +119,7 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], save_path: Pat
 
 def slice_batch_meta(meta: Mapping[str, Any], valid_mask: torch.Tensor) -> Dict[str, Any]:
 	"""Slice collated metadata using a batch-level validity mask."""
+	# 测试时也要按有效标签过滤元信息，否则 box 目标框会和过滤后的点云 batch 对不上。
 	mask_cpu = valid_mask.detach().cpu()
 	mask_list = mask_cpu.tolist()
 	sliced: Dict[str, Any] = {}
@@ -134,6 +139,7 @@ def slice_batch_meta(meta: Mapping[str, Any], valid_mask: torch.Tensor) -> Dict[
 
 def compute_ap_from_pr(recall: np.ndarray, precision: np.ndarray) -> float:
 	"""Compute area under the precision-recall curve using interpolation envelope."""
+	# 这里采用插值包络线积分，和常见检测评估里的 AP 计算方式一致。
 	mrec = np.concatenate(([0.0], recall, [1.0]))
 	mpre = np.concatenate(([0.0], precision, [0.0]))
 
@@ -157,6 +163,7 @@ def compute_box_ap_metrics(
 
 	Each sample contributes one prediction (class + score + box IoU against its GT box).
 	"""
+	# 这里把“单样本单框”的问题转换成按类别统计的 AP；IoU 阈值从 0.50 到 0.95 逐步递增。
 	if pred_classes.size == 0 or gt_classes.size == 0 or ious.size == 0:
 		return {
 			"AP50": float("nan"),
@@ -170,6 +177,7 @@ def compute_box_ap_metrics(
 		iou_thresholds = np.arange(0.50, 0.96, 0.05, dtype=np.float64)
 
 	def _map_at_threshold(threshold: float) -> float:
+		# 对每个类别分别算 AP：先按该类别的预测分数排序，再累计 TP / FP，最后积分得到 AP。
 		per_class_ap: List[float] = []
 		for cls_idx in range(num_classes):
 			gt_count = int((gt_classes == cls_idx).sum())
@@ -211,6 +219,7 @@ def compute_box_ap_metrics(
 		ap_per_threshold[f"{thr:.2f}"] = ap_thr
 
 	matched_cls_mask = pred_classes == gt_classes
+	# mean_iou_matched_cls 只看“类别预测正确”的样本，用来分离分类错误和框回归误差。
 	mean_iou_matched = float(np.mean(ious[matched_cls_mask])) if np.any(matched_cls_mask) else 0.0
 
 	return {
@@ -228,6 +237,7 @@ def evaluate(
 	criterion: nn.Module,
 	device: torch.device,
 ) -> Dict:
+	# 测试阶段把分类分数、类别标签、box IoU 都逐样本收集起来，后面统一算总体指标。
 	model.eval()
 	total_loss = 0.0
 	total_samples = 0
@@ -247,6 +257,7 @@ def evaluate(
 	with torch.no_grad():
 		pbar = tqdm(loader, desc="Testing", leave=False)
 		for points, labels, batch_meta in pbar:
+			# 测试 batch 的结构与训练一致：点云、类别标签和元信息一起进入评估流程。
 			points = points.to(device, non_blocking=True)
 			labels = labels.to(device, non_blocking=True)
 
@@ -259,6 +270,7 @@ def evaluate(
 
 			model_outputs = model(prepare_model_inputs(points))
 			logits, box_preds = split_cls_and_box_predictions(model_outputs)
+			# 这里的 loss 只用于记录分类损失，不反向传播，也不更新参数。
 			loss = criterion(logits, labels)
 
 			batch_size = labels.size(0)
@@ -271,12 +283,14 @@ def evaluate(
 
 			probs = torch.softmax(logits, dim=1)
 			pred_scores, preds = probs.max(dim=1)
+			# 预测类别和置信度会同时用于分类报告和 box AP 的排序。
 			all_preds.extend(preds.detach().cpu().tolist())
 			all_labels.extend(labels.detach().cpu().tolist())
 			all_pred_scores.extend(pred_scores.detach().cpu().tolist())
 
 			if box_preds is not None and isinstance(batch_meta, Mapping):
 				try:
+					# box AP 的前提是模型和元信息都能构造出一一对应的预测框与真实框。
 					meta_valid = slice_batch_meta(batch_meta, valid_mask)
 					gt_boxes = build_spad_boxes_from_meta(meta_valid, device=device)
 					pred_boxes = canonicalize_boxes_3d(box_preds, device=device, dtype=gt_boxes.dtype)
@@ -287,6 +301,7 @@ def evaluate(
 						)
 
 					ious = box_iou_3d_aligned(pred_boxes, gt_boxes)
+					# iou / score / class 会一起保存，后续按阈值和类别计算 AP50、AP@50:5:95。
 					all_box_ious.extend(ious.detach().cpu().tolist())
 					all_box_scores.extend(pred_scores.detach().cpu().tolist())
 					all_box_pred_classes.extend(preds.detach().cpu().tolist())
@@ -303,6 +318,7 @@ def evaluate(
 			pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}")
 
 	return {
+		# 这里返回的是整体验证/测试过程中逐样本拼接后的原始数据，后面的 compute_metrics 和 compute_box_ap_metrics 再做汇总。
 		"loss": total_loss / max(total_samples, 1),
 		"top1": top1_hits / max(total_samples, 1),
 		"top3": top3_hits / max(total_samples, 1),
@@ -319,6 +335,7 @@ def evaluate(
 
 
 def run_test(args: argparse.Namespace) -> Dict[str, str]:
+	# 测试入口：加载 checkpoint、跑完整测试集、输出分类指标和 box AP 指标，并保存图表与 JSON。
 	project_root = Path(__file__).resolve().parents[1]
 	data_root = resolve_path(args.data_root, project_root)
 	checkpoint_path = resolve_path(args.checkpoint, project_root)
@@ -352,6 +369,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	)
 
 	model = build_model(args.model, num_classes=meta["num_classes"], project_root=project_root).to(device)
+	# 测试时只需要模型参数，不需要优化器状态。
 	checkpoint = torch.load(checkpoint_path, map_location=device)
 	state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
 	model.load_state_dict(state_dict)
@@ -366,9 +384,11 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 
 	y_true = eval_out["y_true"]
 	y_pred = eval_out["y_pred"]
+	# 分类部分的总体指标来自 y_true/y_pred；box 部分需要额外用 IoU 和类别匹配情况来算 AP。
 	metrics = compute_metrics(y_true, y_pred, num_classes=meta["num_classes"])
 	box_metrics: Optional[Dict[str, Any]] = None
 	if eval_out["box_eval_samples"] > 0:
+		# 只有模型真的输出了 box 且元信息能构造目标框时，才会计算 box AP。
 		box_metrics = compute_box_ap_metrics(
 			pred_classes=eval_out["box_pred_classes"],
 			pred_scores=eval_out["box_scores"],
@@ -396,6 +416,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	)
 
 	logger.info("=== Test Summary ===")
+	# 下面这些日志把分类指标、box 指标和输出文件路径一次性写全，方便定位结果。
 	logger.info("checkpoint=%s", checkpoint_path)
 	logger.info("data_root=%s", data_root)
 	logger.info("num_test_samples=%d", meta["num_test_samples"])
@@ -407,6 +428,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("recall_macro=%.4f", metrics["recall_macro"])
 	logger.info("f1_macro=%.4f", metrics["f1_macro"])
 	if box_metrics is not None:
+		# AP50 和 AP@50:5:95 是 box 质量的核心指标，来自不同 IoU 阈值下的平均精度。
 		logger.info("mean_iou_matched_cls=%.4f", box_metrics["mean_iou_matched_cls"])
 		logger.info("AP50=%.4f", box_metrics["AP50"])
 		logger.info("AP@50:5:95=%.4f", box_metrics["AP@50:5:95"])
@@ -416,6 +438,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	output_dir.mkdir(parents=True, exist_ok=True)
 	metrics_json_path = output_dir / f"metrics_{args.model}_{timestamp}.json"
 	metrics_payload = {
+		# JSON 里同时保存分类、box AP 和路径信息，便于后续画图或对比实验直接读取。
 		"loss": eval_out["loss"],
 		"top1": eval_out["top1"],
 		"top3": eval_out["top3"],
@@ -446,18 +469,19 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+	# 测试参数主要控制 checkpoint、数据源、batch 大小以及是否对 eval 集做增强。
 	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification evaluation")
 	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata", help="SPAD data root directory")
 	parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint")
 	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer"], help="Backbone model")
 	parser.add_argument("--batch-size", type=int, default=16)
-	parser.add_argument("--num-points", type=int, default=0, help="Set >0 to enforce fixed N; 0 disables point-count check")
+	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
 	parser.add_argument("--train-ratio", type=float, default=0.7)
 	parser.add_argument("--val-ratio", type=float, default=0.15)
 	parser.add_argument("--test-ratio", type=float, default=0.15)
 	parser.add_argument("--num-workers", type=int, default=0)
 	parser.add_argument("--seed", type=int, default=42)
-	parser.add_argument("--label-mode", type=str, default="generated", choices=["generated", "raw"], help="Label source mode")
+	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="Label source mode")
 	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in eval dataset")
 	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable eval dataset augmentation")
 	parser.add_argument("--device", type=str, default="auto", help="auto/cpu/cuda")

@@ -200,11 +200,20 @@ class PointNet2ClassificationSSG(nn.Module):
         self.drop2 = nn.Dropout(0.4)
         self.fc3 = nn.Linear(256, num_class)
 
+        self.box_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 6),
+        )
+
     def forward(self, x):
         """
         x: [B, N, 4] (xyz + intensity)
         return:
-          logits: [B, num_class]
+                    logits: [B, num_class]
+                    box_pred: [B, 6] -> [xmin, xmax, ymin, ymax, zmin, zmax]
         """
         if x.ndim != 3 or x.shape[-1] != 4:
             raise ValueError(f"PointNet2ClassificationSSG expects input shape (B, N, 4), got {tuple(x.shape)}")
@@ -218,17 +227,20 @@ class PointNet2ClassificationSSG(nn.Module):
 
         x = l3_points.view(x.shape[0], 1024)
         x = self.drop1(F.relu(self.bn1(self.fc1(x))))
-        x = self.drop2(F.relu(self.bn2(self.fc2(x))))
-        x = self.fc3(x)
-        return x
+        feat = self.drop2(F.relu(self.bn2(self.fc2(x))))
+
+        logits = self.fc3(feat)
+        box_pred = self.box_head(feat)
+        return logits, box_pred
 
 
 def _quick_shape_test():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = PointNet2ClassificationSSG(num_class=26).to(device)
     pts = torch.randn(4, 1024, 4, device=device)
-    logits = model(pts)
-    print("PointNet2ClassificationSSG output:", logits.shape)  # [4, 26]
+    logits, box_pred = model(pts)
+    print("PointNet2ClassificationSSG logits:", logits.shape)   # [4, 26]
+    print("PointNet2ClassificationSSG box_pred:", box_pred.shape)  # [4, 6]
 
 
 if __name__ == "__main__":
