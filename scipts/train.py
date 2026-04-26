@@ -14,12 +14,31 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
+"""
+SPAD 训练入口模块。
+
+模块目的：
+- 组织数据加载、模型构建、损失计算、训练循环、验证与 checkpoint 保存。
+
+主要导出内容：
+- run_training: 执行完整训练流程。
+- build_parser/main: 命令行入口。
+"""
+
 # 训练脚本只负责把数据、模型、损失和日志串起来，核心计算都保留在各自模块中。
 from utils.data import create_spad_classification_dataloaders
 from utils.loss import PointCloudMultiTaskLoss, build_spad_boxes_from_meta, split_cls_and_box_predictions
 
 
 def set_seed(seed: int) -> None:
+	"""设置随机种子。
+
+	Args:
+		seed: 随机种子值。
+
+	Returns:
+		None。
+	"""
 	# 固定随机源，保证数据划分、增强采样和模型初始化都尽量可复现。
 	random.seed(seed)
 	np.random.seed(seed)
@@ -30,6 +49,15 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_path(path_str: str, base_dir: Path) -> Path:
+	"""解析路径为绝对路径。
+
+	Args:
+		path_str: 命令行传入路径。
+		base_dir: 相对路径的参照目录。
+
+	Returns:
+		解析后的绝对路径。
+	"""
 	# 允许命令行传相对路径，同时统一转成项目根目录下的绝对路径。
 	path = Path(path_str)
 	if path.is_absolute():
@@ -38,6 +66,15 @@ def resolve_path(path_str: str, base_dir: Path) -> Path:
 
 
 def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, str]:
+	"""创建训练日志器。
+
+	Args:
+		log_dir: 日志目录。
+		model_name: 模型名称，用于日志文件命名。
+
+	Returns:
+		(logger, log_file, timestamp)。
+	"""
 	# 同时写文件和控制台，便于训练过程中实时观察，也方便回看完整日志。
 	log_dir.mkdir(parents=True, exist_ok=True)
 	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -72,6 +109,19 @@ def load_module_from_file(file_path: Path, module_name: str):
 
 
 def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Module:
+	"""按名称构建分类+框回归模型。
+
+	Args:
+		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer。
+		num_classes: 分类类别数。
+		project_root: 项目根目录。
+
+	Returns:
+		构建完成的 nn.Module。
+
+	Raises:
+		ValueError: 模型名不在支持列表中。
+	"""
 	# 这里决定训练主干网络；分类头输出的类别数由数据集实际类别数决定。
 	baseline_dir = project_root / "baseline"
 	name = model_name.lower()
@@ -92,12 +142,29 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 
 
 def prepare_model_inputs(points_xyzi: torch.Tensor) -> torch.Tensor:
-	"""Models now consume (B, N, 4) directly."""
+	"""准备模型输入。
+
+	Args:
+		points_xyzi: 形状为 (B, N, 4) 的点云张量。
+
+	Returns:
+		直接返回 (B, N, 4)，保持与模型前向契约一致。
+	"""
 	# 点云样本已经在数据集里整理成 (B, N, 4)，这里保持原样传入模型即可。
 	return points_xyzi
 
 
 def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable[int] = (1, 3)) -> Dict[int, int]:
+	"""统计 top-k 命中数。
+
+	Args:
+		logits: 分类输出，形状 [B, C]。
+		labels: 真实标签，形状 [B]。
+		topk: 需要统计的 k 列表。
+
+	Returns:
+		{K: 命中数} 字典。
+	"""
 	# top-k 命中数是从模型 logits 里直接统计的，不依赖 box 分支。
 	num_classes = logits.size(1)
 	max_k = min(max(topk), num_classes)
@@ -120,6 +187,8 @@ def slice_batch_meta(meta: Mapping[str, Any], valid_mask: torch.Tensor) -> Dict[
 	sliced: Dict[str, Any] = {}
 
 	for key, value in meta.items():
+		# 复杂条件说明：仅当该字段具备 batch 第一维且长度与掩码一致时才切片，
+		# 否则保持原值，避免把全局配置/标量字段误当成逐样本字段处理。
 		if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == len(mask_list):
 			sliced[key] = value[mask_cpu]
 		elif isinstance(value, list) and len(value) == len(mask_list):
@@ -141,6 +210,20 @@ def run_epoch(
 	phase: str,
 	optimizer: Optional[optim.Optimizer] = None,
 ) -> Dict[str, float]:
+	"""执行单个 epoch 的训练或验证。
+
+	Args:
+		loader: 数据加载器，输出 (points, labels, meta)。
+		model: 模型。
+		criterion: 多任务损失对象。
+		device: 运行设备。
+		epoch: 当前 epoch 序号。
+		phase: 阶段名（Train/Val）。
+		optimizer: 训练时提供；验证时为 None。
+
+	Returns:
+		包含 loss/top1/top3 与 box 指标的聚合字典。
+	"""
 	is_train = optimizer is not None
 	model.train(is_train)
 
@@ -183,6 +266,7 @@ def run_epoch(
 				try:
 					box_targets = build_spad_boxes_from_meta(meta_valid, device=device)
 				except Exception:
+					# // TODO(copilot) 2026-04-26: 改为细粒度异常分类并记录样本路径，便于定位脏元信息来源。
 					box_targets = None
 
 			# 多任务损失内部会分别计算分类损失、box L1 损失和 IoU 损失，并汇总成 total_loss。
@@ -249,6 +333,21 @@ def save_checkpoint(
 	class_to_idx: Dict[str, int],
 	args: argparse.Namespace,
 ) -> None:
+	"""保存训练状态到 checkpoint。
+
+	Args:
+		path: checkpoint 输出路径。
+		model: 当前模型。
+		optimizer: 当前优化器。
+		scheduler: 学习率调度器。
+		epoch: 当前 epoch。
+		best_val_top1: 历史最佳验证 top1。
+		class_to_idx: 类别映射。
+		args: 训练参数。
+
+	Returns:
+		None。
+	"""
 	# checkpoint 里同时保存模型、优化器、学习率调度器和运行参数，方便后续恢复训练或做测试复现。
 	payload = {
 		"epoch": epoch,
@@ -263,6 +362,17 @@ def save_checkpoint(
 
 
 def run_training(args: argparse.Namespace) -> Dict[str, str]:
+	"""执行完整训练流程。
+
+	Args:
+		args: 命令行参数命名空间。
+
+	Returns:
+		包含日志文件与 checkpoint 路径的字典。
+
+	Raises:
+		FileNotFoundError: 数据根目录不存在。
+	"""
 	# 训练入口：负责把路径解析、随机种子、数据加载、模型、损失和保存逻辑组装成完整流程。
 	project_root = Path(__file__).resolve().parents[1]
 	data_root = resolve_path(args.data_root, project_root)
@@ -431,9 +541,10 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+	"""构建训练命令行参数解析器。"""
 	# 命令行参数覆盖数据路径、训练超参、损失权重和增强开关，便于不同实验复用同一脚本。
 	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification training")
-	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata", help="SPAD data root directory")
+	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
 	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer"], help="Backbone model")
 	parser.add_argument("--epochs", type=int, default=80)
 	parser.add_argument("--batch-size", type=int, default=16)
@@ -441,12 +552,12 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--lr", type=float, default=1e-3)
 	parser.add_argument("--min-lr", type=float, default=1e-5)
 	parser.add_argument("--weight-decay", type=float, default=1e-4)
-	parser.add_argument("--train-ratio", type=float, default=0.7)
-	parser.add_argument("--val-ratio", type=float, default=0.15)
-	parser.add_argument("--test-ratio", type=float, default=0.15)
+	parser.add_argument("--train-ratio", type=float, default=0.6)
+	parser.add_argument("--val-ratio", type=float, default=0.2)
+	parser.add_argument("--test-ratio", type=float, default=0.2)
 	parser.add_argument("--num-workers", type=int, default=0)
 	parser.add_argument("--seed", type=int, default=42)
-	parser.add_argument("--device", type=str, default="auto", help="auto/cpu/cuda")
+	parser.add_argument("--device", type=str, default="cuda", help="auto/cpu/cuda")
 	parser.add_argument("--log-dir", type=str, default="logs")
 	parser.add_argument("--save-dir", type=str, default="checkpoints")
 	parser.add_argument("--resume", type=str, default="", help="checkpoint path to resume")
@@ -464,6 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> None:
+	"""训练脚本入口函数。"""
 	parser = build_parser()
 	args = parser.parse_args(argv)
 	run_training(args)

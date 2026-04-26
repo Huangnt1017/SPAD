@@ -43,7 +43,9 @@ class DGCNNCls(nn.Module):
     """
     DGCNN for point cloud classification.
     Input:  x [B, N, 4]
-    Output: logits [B, num_classes]
+    Output:
+        logits [B, num_classes]
+        box_pred [B, 6] -> [xmin, xmax, ymin, ymax, zmin, zmax]
     """
     def __init__(self, num_classes=26, k=20, emb_dims=1024, dropout=0.5):
         super().__init__()
@@ -91,6 +93,14 @@ class DGCNNCls(nn.Module):
         self.dp2 = nn.Dropout(p=dropout)
         self.linear3 = nn.Linear(256, num_classes)
 
+        self.box_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(negative_slope=0.2),
+            nn.Dropout(p=0.2),
+            nn.Linear(128, 6),
+        )
+
     def forward(self, x):
         if x.ndim != 3 or x.shape[-1] != 4:
             raise ValueError(f"DGCNNCls expects input shape (B, N, 4), got {tuple(x.shape)}")
@@ -124,9 +134,11 @@ class DGCNNCls(nn.Module):
         x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
         x = self.dp1(x)
         x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
-        x = self.dp2(x)
-        x = self.linear3(x)
-        return x
+        feat = self.dp2(x)
+
+        logits = self.linear3(feat)
+        box_pred = self.box_head(feat)
+        return logits, box_pred
 
 
 def _quick_shape_test():
@@ -137,8 +149,9 @@ def _quick_shape_test():
 
     cls_model = DGCNNCls(num_classes=26).to(device)
     pts = torch.randn(4, 1024, 4, device=device)
-    cls_logits = cls_model(pts)
-    print("DGCNNCls output:", cls_logits.shape)  # [4, 26]
+    cls_logits, box_pred = cls_model(pts)
+    print("DGCNNCls logits:", cls_logits.shape)  # [4, 26]
+    print("DGCNNCls box_pred:", box_pred.shape)  # [4, 6]
 
 
 if __name__ == "__main__":
