@@ -74,6 +74,44 @@ Use this skill for repeatable 3D point cloud work across the SPAD project, espec
 7. Logging/reporting exposes enough context to debug failed samples or skipped evaluations.
 8. A short sanity run completes without shape, dtype, or device errors.
 
+## Rapid Defect Identification Protocol (for files >200 lines)
+Use this protocol when you need to **quickly locate defects** in a long pipeline script without reading it line by line. It is especially effective for debugging data loaders, augmentation chains, training loops, or evaluation code.
+
+### Step 1: Structural Scan (token cost ≤ 10% of file length)
+Scan the file **only** for these structures – do not read the full code:
+- Imported libraries (note suspicious third‑party package versions)
+- Class/function definition names and parameter lists (do not inspect function bodies)
+- Global variables, configuration constants
+- Decorators, inheritance relationships
+- Any `TODO`, `FIXME`, `print` or `log` statements
+
+Output a list of **up to 3 candidate problem areas**. Examples for point‑cloud code:
+- “`learning_rate` initialized to `0` on line 45”
+- “Possible point‑cloud shape mismatch in preprocessing lines 120–150”
+- “`try‑except` on line 380 swallows the exception”
+- “Incorrect normalization factor in `PointCloudAugment` line 210”
+- “Label index off‑by‑one in segmentation mask creation line 95”
+
+### Step 2: Read Key Code Snippets
+For each candidate area, read **only the 10–20 lines** around that location. For example:
+“Read the code from lines 120 to 150, and focus on point tensor shape changes inside the loop.”
+
+### Step 3: In‑Depth Analysis
+After reading the short snippet, provide a concise analysis:
+- Identify the root cause of the error directly.
+- Suggest a concrete modification (total output ≤ 15 lines).
+- Do not explain basic syntax; do not repeat code unless highlighting a specific change.
+
+### Step 4 (Optional)
+If the issue is still unresolved, ask whether you should scan another candidate area.
+
+### Prohibited Actions
+- Do not output meaningless phrases like “Let’s analyze this step by step”
+- Do not output duplicate content from the entire file
+- Do not ask the user to provide additional information from “the entire file” (for example, printing all variables)
+
+**User cooperation:** You must provide the file, allow only a structural scan, and follow the instruction to paste the short code snippets for the candidate areas.
+
 ## Definition of Done
 - The modified pipeline passes a short end-to-end run.
 - Comments are concise, accurate, and focused on intent/data flow.
@@ -96,4 +134,3 @@ Use this skill for repeatable 3D point cloud work across the SPAD project, espec
 
 ## References
 - See the repo utilities and data readers for existing point cloud conversion and training patterns.
-
