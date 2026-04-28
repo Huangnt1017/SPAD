@@ -1,0 +1,43 @@
+2026-04-29 00:15:02,193 | INFO | === Training Configuration ===
+2026-04-29 00:15:02,194 | INFO | run_timestamp=20260429_001500_498494
+2026-04-29 00:15:02,194 | INFO | data_root=D:\PYproject\SPADdata\2025-04-30-dpc
+2026-04-29 00:15:02,194 | INFO | device=cuda
+2026-04-29 00:15:02,194 | INFO | model=pointtransformer
+2026-04-29 00:15:02,194 | INFO | num_classes=26
+2026-04-29 00:15:02,194 | INFO | num_labeled_samples=8528
+2026-04-29 00:15:02,194 | INFO | num_unlabeled_samples=0
+2026-04-29 00:15:02,194 | INFO | split train/val/test = 5117 / 1706 / 1705
+2026-04-29 00:15:02,194 | INFO | unlabeled_loader_exists=no
+2026-04-29 00:15:02,194 | INFO | args={"data_root": "D:\\PYproject\\SPADdata\\2025-04-30-dpc", "model": "pointtransformer", "epochs": 10, "batch_size": 16, "num_points": 1024, "lr": 0.001, "min_lr": 1e-05, "weight_decay": 0.0001, "train_ratio": 0.6, "val_ratio": 0.2, "test_ratio": 0.2, "num_workers": 0, "seed": 42, "device": "auto", "log_dir": "logs", "save_dir": "checkpoints", "resume": "", "label_mode": "raw", "cls_loss_weight": 1.0, "box_l1_weight": 1.0, "box_iou_weight": 1.0, "label_smoothing": 0.0, "augment_train": true, "augment_eval": true}
+2026-04-29 00:16:56,967 | INFO | Epoch [1/10] | train_loss=40.9186 train_top1=0.1745 train_top3=0.4049 | val_loss=26.3426 val_top1=0.2145 val_top3=0.4683
+2026-04-29 00:16:56,967 | INFO | Epoch [1/10] | train_box_iou=0.0000 train_box_l1=37.3440 train_box_iou_loss=1.0000 | val_box_iou=0.0007 val_box_l1=22.9781 val_box_iou_loss=0.9993
+2026-04-29 00:16:56,999 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:18:48,465 | INFO | Epoch [2/10] | train_loss=16.5384 train_top1=0.2267 train_top3=0.5071 | val_loss=10.3552 val_top1=0.2304 val_top3=0.5668
+2026-04-29 00:18:48,465 | INFO | Epoch [2/10] | train_box_iou=0.0067 train_box_l1=13.2457 train_box_iou_loss=0.9933 | val_box_iou=0.0261 val_box_l1=7.1783 val_box_iou_loss=0.9739
+2026-04-29 00:18:48,498 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:20:40,586 | INFO | Epoch [3/10] | train_loss=9.4885 train_top1=0.3166 train_top3=0.6418 | val_loss=7.0955 val_top1=0.4250 val_top3=0.7562
+2026-04-29 00:20:40,586 | INFO | Epoch [3/10] | train_box_iou=0.0331 train_box_l1=6.5525 train_box_iou_loss=0.9669 | val_box_iou=0.0451 val_box_l1=4.5016 val_box_iou_loss=0.9549
+2026-04-29 00:20:40,618 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:22:31,307 | INFO | Epoch [4/10] | train_loss=8.2322 train_top1=0.3885 train_top3=0.7403 | val_loss=6.5848 val_top1=0.4443 val_top3=0.7825
+2026-04-29 00:22:31,307 | INFO | Epoch [4/10] | train_box_iou=0.0481 train_box_l1=5.5765 train_box_iou_loss=0.9519 | val_box_iou=0.0848 val_box_l1=4.0892 val_box_iou_loss=0.9152
+2026-04-29 00:22:31,338 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:24:19,534 | INFO | Epoch [5/10] | train_loss=7.6093 train_top1=0.4534 train_top3=0.7889 | val_loss=4.9861 val_top1=0.5369 val_top3=0.8441
+2026-04-29 00:24:19,534 | INFO | Epoch [5/10] | train_box_iou=0.0618 train_box_l1=5.1238 train_box_iou_loss=0.9382 | val_box_iou=0.1589 val_box_l1=2.7805 val_box_iou_loss=0.8411
+2026-04-29 00:24:19,568 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:26:07,978 | INFO | Epoch [6/10] | train_loss=7.1932 train_top1=0.5171 train_top3=0.8376 | val_loss=5.5557 val_top1=0.6026 val_top3=0.9086
+2026-04-29 00:26:07,978 | INFO | Epoch [6/10] | train_box_iou=0.0653 train_box_l1=4.8889 train_box_iou_loss=0.9347 | val_box_iou=0.0670 val_box_l1=3.4475 val_box_iou_loss=0.9330
+2026-04-29 00:26:08,013 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:27:57,466 | INFO | Epoch [7/10] | train_loss=6.8006 train_top1=0.5800 train_top3=0.8804 | val_loss=4.5592 val_top1=0.6518 val_top3=0.9156
+2026-04-29 00:27:57,466 | INFO | Epoch [7/10] | train_box_iou=0.0691 train_box_l1=4.6539 train_box_iou_loss=0.9309 | val_box_iou=0.1358 val_box_l1=2.6387 val_box_iou_loss=0.8642
+2026-04-29 00:27:57,497 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:29:46,553 | INFO | Epoch [8/10] | train_loss=6.5600 train_top1=0.6281 train_top3=0.9015 | val_loss=3.9371 val_top1=0.7016 val_top3=0.9426
+2026-04-29 00:29:46,553 | INFO | Epoch [8/10] | train_box_iou=0.0724 train_box_l1=4.5444 train_box_iou_loss=0.9276 | val_box_iou=0.2033 val_box_l1=2.2167 val_box_iou_loss=0.7967
+2026-04-29 00:29:46,584 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:31:35,856 | INFO | Epoch [9/10] | train_loss=6.3713 train_top1=0.6568 train_top3=0.9132 | val_loss=3.6178 val_top1=0.7280 val_top3=0.9502
+2026-04-29 00:31:35,858 | INFO | Epoch [9/10] | train_box_iou=0.0783 train_box_l1=4.4427 train_box_iou_loss=0.9217 | val_box_iou=0.2316 val_box_l1=2.0012 val_box_iou_loss=0.7684
+2026-04-29 00:31:35,890 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:33:24,587 | INFO | Epoch [10/10] | train_loss=6.2535 train_top1=0.6897 train_top3=0.9306 | val_loss=3.2725 val_top1=0.7356 val_top3=0.9513
+2026-04-29 00:33:24,587 | INFO | Epoch [10/10] | train_box_iou=0.0776 train_box_l1=4.3952 train_box_iou_loss=0.9224 | val_box_iou=0.2692 val_box_l1=1.7082 val_box_iou_loss=0.7308
+2026-04-29 00:33:24,619 | INFO | Saved new best checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_best.pth
+2026-04-29 00:33:24,654 | INFO | Saved last checkpoint to D:\PYproject\SPAD\checkpoints\pointtransformer_20260429_001500_498494_last.pth
+2026-04-29 00:33:24,654 | INFO | Training finished. Best val top1=0.7356

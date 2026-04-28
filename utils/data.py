@@ -641,6 +641,11 @@ def split_samples_deterministic(
     return train_samples, val_samples, test_samples
 
 
+def _canonical_sample_path(sample: Dict[str, Optional[str]]) -> str:
+    """返回稳定排序使用的样本路径键（统一为小写 POSIX 形式）。"""
+    return Path(str(sample.get("path", ""))).as_posix().lower()
+
+
 def _symbol_from_augmented_position(meta: Dict) -> str:
     tx = int(meta.get("target_x_range", [20, 35])[0])
     ty = int(meta.get("target_y_range", [5, 20])[0])
@@ -792,16 +797,31 @@ def create_spad_classification_dataloaders(
     - label_mode='generated' 时，使用增强后目标位置映射得到 A-Z 标签（仅当类映射包含该标签时有效）。
     """
     labeled_samples, unlabeled_samples = discover_spad_classification_samples(data_root)
+
+    labeled_samples = sorted(labeled_samples, key=_canonical_sample_path)
+    unlabeled_samples = sorted(unlabeled_samples, key=_canonical_sample_path)
+
     all_samples = labeled_samples + unlabeled_samples
 
     if len(all_samples) < 3:
         raise ValueError(f"Need at least 3 samples, got {len(all_samples)} from: {data_root}")
 
-    class_to_idx = build_class_mapping(all_samples)
+    class_to_idx = build_class_mapping(labeled_samples)
     idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
 
+    # raw 模式只对有标签样本切分；这样即便数据目录里临时出现无标签文件，也不会扰动切分结果。
+    if label_mode == "raw":
+        split_source_samples = labeled_samples
+    else:
+        split_source_samples = all_samples
+
+    if len(split_source_samples) < 3:
+        raise ValueError(
+            f"Need at least 3 split-source samples, got {len(split_source_samples)} with label_mode={label_mode}"
+        )
+
     train_samples, val_samples, test_samples = split_samples_deterministic(
-        samples=all_samples,
+        samples=split_source_samples,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
@@ -881,6 +901,7 @@ def create_spad_classification_dataloaders(
         "num_labeled_samples": len(labeled_samples),
         "num_unlabeled_samples": len(unlabeled_samples),
         "num_total_samples": len(all_samples),
+        "num_split_source_samples": len(split_source_samples),
         "num_train_samples": len(train_samples),
         "num_val_samples": len(val_samples),
         "num_test_samples": len(test_samples),

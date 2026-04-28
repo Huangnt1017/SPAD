@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 import random
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
@@ -24,6 +25,10 @@ SPAD 训练入口模块。
 - run_training: 执行完整训练流程。
 - build_parser/main: 命令行入口。
 """
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+	sys.path.insert(0, str(PROJECT_ROOT))
 
 # 训练脚本只负责把数据、模型、损失和日志串起来，核心计算都保留在各自模块中。
 from utils.data import create_spad_classification_dataloaders

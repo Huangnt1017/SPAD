@@ -173,10 +173,16 @@ class PointNetSetAbstraction(nn.Module):
 
 class PointNet2ClassificationSSG(nn.Module):
     """
-    PointNet++ classification network (SSG), aligned to original paper style.
+    PointNet++ 分类网络 (SSG)，对齐原始论文设计。
+
+    输入为 (B, N, 4) 的 xyzi 点云：
+    - xyz（前3维）用于 FPS 采样和 ball query 分组（几何操作）
+    - intensity（第4维）作为额外特征，在各 SA 模块中与归一化 xyz 拼接后送入 MLP
+    强度信息不会丢失，它通过 points 特征流贯穿整个网络。
     """
     def __init__(self, num_class=26):
         super().__init__()
+        # 额外特征通道数: 1 = 强度(intensity)
         in_channel = 1
 
         self.sa1 = PointNetSetAbstraction(
@@ -208,22 +214,50 @@ class PointNet2ClassificationSSG(nn.Module):
             nn.Linear(128, 6),
         )
 
+    @staticmethod
+    def _normalize_input_points(x):
+        """
+        统一输入为 (B, N, 4) 的 xyzi 格式:
+        - 支持 (B, N, 4)、(B, N, 3) 及其转置形式 (B, 4, N)、(B, 3, N)
+        - 仅 xyz 输入时自动补零强度通道
+        """
+        if x.ndim != 3:
+            raise ValueError(f"PointNet2ClassificationSSG expects 3D input, got shape {tuple(x.shape)}")
+
+        if x.shape[-1] in (3, 4):
+            points = x
+        elif x.shape[1] in (3, 4):
+            points = x.transpose(1, 2).contiguous()
+        else:
+            raise ValueError(
+                "PointNet2ClassificationSSG expects input layout (B,N,4)/(B,4,N) or xyz-only "
+                f"(B,N,3)/(B,3,N), got {tuple(x.shape)}"
+            )
+
+        if points.shape[-1] == 3:
+            pad_i = torch.zeros(points.shape[0], points.shape[1], 1, dtype=points.dtype, device=points.device)
+            points = torch.cat([points, pad_i], dim=-1)
+
+        return points
+
     def forward(self, x):
         """
-        x: [B, N, 4] (xyz + intensity)
-        return:
-                    logits: [B, num_class]
-                    box_pred: [B, 6] -> [xmin, xmax, ymin, ymax, zmin, zmax]
+        Args:
+            x: [B, N, 4] 完整 xyzi 点云（也支持 (B, 4, N)、(B, N, 3)、(B, 3, N)）
+        Returns:
+            logits:   [B, num_class] — 类别 logits
+            box_pred: [B, 6] — 包围盒预测 [xmin, xmax, ymin, ymax, zmin, zmax]
         """
-        if x.ndim != 3 or x.shape[-1] != 4:
-            raise ValueError(f"PointNet2ClassificationSSG expects input shape (B, N, 4), got {tuple(x.shape)}")
+        x = self._normalize_input_points(x)              # 统一为 (B, N, 4)
 
-        xyz = x[:, :, :3].transpose(1, 2).contiguous()
-        points = x[:, :, 3:].transpose(1, 2).contiguous()
+        # PointNet++ 的标准数据流: xyz(3D) 用于几何采样/分组, points(特征) 在 MLP 中与归一化 xyz 拼接
+        # 强度(intensity)作为 points 的第 1 维特征，在 SA 模块中与相对坐标(dxyz)拼接 → 共 4 维输入 MLP
+        xyz = x[:, :, :3].transpose(1, 2).contiguous()   # [B, 3, N] — 仅用于 FPS / ball query
+        points = x[:, :, 3:].transpose(1, 2).contiguous() # [B, 1, N] — 强度特征流
 
-        l1_xyz, l1_points = self.sa1(xyz, points)
-        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
-        _, l3_points = self.sa3(l2_xyz, l2_points)
+        l1_xyz, l1_points = self.sa1(xyz, points)        # SA1: 强度参与 MLP(4→64→64→128)
+        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)  # SA2: 特征流继续
+        _, l3_points = self.sa3(l2_xyz, l2_points)       # SA3: 全局池化 → 1024 维
 
         x = l3_points.view(x.shape[0], 1024)
         x = self.drop1(F.relu(self.bn1(self.fc1(x))))
