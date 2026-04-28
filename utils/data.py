@@ -495,9 +495,22 @@ def _collect_point_files(folder: str) -> List[str]:
 
 
 def _infer_symbol_from_text(text: str) -> Optional[str]:
-    for ch in str(text).upper():
-        if "A" <= ch <= "Z":
-            return ch
+    """从文本中推断类别符号。
+
+    仅在文本恰好为一个 A-Z 字母（可能带前后缀）时返回该字母，
+    避免从 "Delay-0"、"Width-200" 等非类别文本中误匹配。
+    """
+    s = str(text).strip().upper()
+    # 提取所有连续大写字母段
+    import re
+    candidates = re.findall(r'[A-Z]+', s)
+    for cand in candidates:
+        if len(cand) == 1:
+            return cand
+    # 回退：整个文本去掉常见前缀后正好是单字母
+    stripped = s.lstrip('_- ')
+    if len(stripped) == 1 and 'A' <= stripped <= 'Z':
+        return stripped
     return None
 
 
@@ -639,6 +652,86 @@ def split_samples_deterministic(
     val_samples = [samples[int(i)] for i in val_idx]
     test_samples = [samples[int(i)] for i in test_idx]
     return train_samples, val_samples, test_samples
+
+
+def _split_cache_path(data_root: str) -> Path:
+    """返回划分缓存文件路径。"""
+    return Path(data_root) / ".split_cache.json"
+
+
+def _compute_split_fingerprint(samples: List[Dict[str, Optional[str]]], label_mode: str) -> str:
+    """计算样本集合的指纹，用于判断数据集是否发生变化。
+
+    指纹基于所有样本路径的排序列表，确保相同数据集产生相同指纹。
+    """
+    import hashlib
+    paths = sorted(_canonical_sample_path(s) for s in samples)
+    payload = "\n".join(paths) + f"\nlabel_mode={label_mode}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_split_cache(
+    data_root: str,
+    samples: List[Dict[str, Optional[str]]],
+    label_mode: str,
+) -> Optional[Tuple[List[str], List[str], List[str]]]:
+    """尝试从缓存加载划分结果。
+
+    Returns:
+        (train_paths, val_paths, test_paths) 或 None（缓存不存在或不匹配）。
+    """
+    cache_path = _split_cache_path(data_root)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    current_fp = _compute_split_fingerprint(samples, label_mode)
+    cached_fp = cache.get("fingerprint", "")
+    if current_fp != cached_fp:
+        return None
+
+    train_paths = cache.get("train_paths", [])
+    val_paths = cache.get("val_paths", [])
+    test_paths = cache.get("test_paths", [])
+    if not train_paths or not val_paths or not test_paths:
+        return None
+    return train_paths, val_paths, test_paths
+
+
+def _save_split_cache(
+    data_root: str,
+    samples: List[Dict[str, Optional[str]]],
+    label_mode: str,
+    train_paths: List[str],
+    val_paths: List[str],
+    test_paths: List[str],
+    seed: int,
+) -> None:
+    """保存划分结果到缓存文件。"""
+    cache_path = _split_cache_path(data_root)
+    fingerprint = _compute_split_fingerprint(samples, label_mode)
+    cache = {
+        "fingerprint": fingerprint,
+        "label_mode": label_mode,
+        "seed": seed,
+        "train_paths": train_paths,
+        "val_paths": val_paths,
+        "test_paths": test_paths,
+        "num_samples": len(samples),
+        "num_train": len(train_paths),
+        "num_val": len(val_paths),
+        "num_test": len(test_paths),
+    }
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass  # 缓存写入失败不应中断训练
 
 
 def _canonical_sample_path(sample: Dict[str, Optional[str]]) -> str:
@@ -820,13 +913,48 @@ def create_spad_classification_dataloaders(
             f"Need at least 3 split-source samples, got {len(split_source_samples)} with label_mode={label_mode}"
         )
 
-    train_samples, val_samples, test_samples = split_samples_deterministic(
-        samples=split_source_samples,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
-        seed=seed,
-    )
+    # ---- 划分缓存：同一个数据集 + 同一种 label_mode 复用同一份划分 ----
+    cached = _load_split_cache(str(data_root), split_source_samples, label_mode)
+    if cached is not None:
+        # 缓存命中：按文件路径匹配回样本字典，保持缓存中的顺序
+        train_paths, val_paths, test_paths = cached
+        path_to_sample = {_canonical_sample_path(s): s for s in split_source_samples}
+
+        def _resolve_samples(path_list: List[str]) -> List[Dict[str, Optional[str]]]:
+            resolved: List[Dict[str, Optional[str]]] = []
+            for p in path_list:
+                canon = Path(p).as_posix().lower()
+                if canon in path_to_sample:
+                    resolved.append(path_to_sample[canon])
+            return resolved
+
+        train_samples = _resolve_samples(train_paths)
+        val_samples = _resolve_samples(val_paths)
+        test_samples = _resolve_samples(test_paths)
+
+        # 校验：确保所有样本都被分配
+        if len(train_samples) + len(val_samples) + len(test_samples) != len(split_source_samples):
+            # 数据有变化（增删文件），缓存失效，回退到重新划分
+            cached = None
+
+    if cached is None:
+        train_samples, val_samples, test_samples = split_samples_deterministic(
+            samples=split_source_samples,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+        )
+        # 保存划分结果到缓存
+        _save_split_cache(
+            data_root=str(data_root),
+            samples=split_source_samples,
+            label_mode=label_mode,
+            train_paths=[_canonical_sample_path(s) for s in train_samples],
+            val_paths=[_canonical_sample_path(s) for s in val_samples],
+            test_paths=[_canonical_sample_path(s) for s in test_samples],
+            seed=seed,
+        )
 
     train_dataset = SPADClassificationDataset(
         train_samples,
