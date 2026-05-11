@@ -265,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="SPAD single-sample DGCNN test")
 	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc")
 	parser.add_argument("--checkpoint", type=str, default=r"D:\PYproject\SPAD\checkpoints\dgcnn_20260426_183404_669391_best.pth")
-	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer"])
+	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer", "pointmlp", "3detr", "dct"])
 	parser.add_argument("--sample-path", type=str, default="", help="Optional point cloud file path relative to data-root or absolute path")
 	parser.add_argument("--sample-index", type=int, default=0, help="Fallback sample index if sample-path is empty")
 	parser.add_argument("--seed", type=int, default=42)

@@ -56,13 +56,19 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		fallback: Model name used when no keyword can be inferred.
 
 	Returns:
-		Model name in {dgcnn, pointnet2, pointtransformer}.
+https://github.com/facebookresearch/3detr		Model name in {dgcnn, pointnet2, pointtransformer, pointmlp, 3detr, dct}.
 	"""
 	name = checkpoint_path.stem.lower()
 	if "pointtransformer" in name or "point_transformer" in name:
 		return "pointtransformer"
 	if "pointnet2" in name or "pointnet++" in name or "pointnetpp" in name:
 		return "pointnet2"
+	if "pointmlp" in name:
+		return "pointmlp"
+	if "3detr" in name:
+		return "3detr"
+	if "dct" in name:
+		return "dct"
 	if "dgcnn" in name:
 		return "dgcnn"
 	return fallback

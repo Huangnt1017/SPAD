@@ -104,7 +104,7 @@ def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, 
 
 
 def load_module_from_file(file_path: Path, module_name: str):
-	# 通过文件路径动态加载 baseline 模型，避免文件名里出现 pointnet++.py 这类不方便直接 import 的情况。
+	# 通过文件路径动态加载 baseline 模型，避免文件名里出现 PointNet++.py 这类不方便直接 import 的情况。
 	spec = importlib.util.spec_from_file_location(module_name, file_path)
 	if spec is None or spec.loader is None:
 		raise ImportError(f"Failed to load module from: {file_path}")
@@ -117,7 +117,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer。
+		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointmlp/3detr/dct。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -136,12 +136,24 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 		return module.DGCNNCls(num_classes=num_classes)
 
 	if name == "pointtransformer":
-		module = load_module_from_file(baseline_dir / "pointTransformer.py", "baseline_point_transformer")
+		module = load_module_from_file(baseline_dir / "PointTransformer.py", "baseline_point_transformer")
 		return module.PointTransformerClassification(num_classes=num_classes)
 
 	if name == "pointnet2":
-		module = load_module_from_file(baseline_dir / "pointnet++.py", "baseline_pointnet2")
+		module = load_module_from_file(baseline_dir / "PointNet++.py", "baseline_pointnet2")
 		return module.PointNet2ClassificationSSG(num_class=num_classes)
+
+	if name == "pointmlp":
+		module = load_module_from_file(baseline_dir / "PointMLP.py", "baseline_pointmlp")
+		return module.PointMLPClassification(num_classes=num_classes)
+
+	if name == "3detr":
+		module = load_module_from_file(baseline_dir / "3DETR.py", "baseline_3detr")
+		return module.ThreeDETRClassification(num_classes=num_classes)
+
+	if name == "dct":
+		module = load_module_from_file(baseline_dir / "DCT.py", "baseline_dct")
+		return module.DCTClassification(num_classes=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -550,7 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
 	# 命令行参数覆盖数据路径、训练超参、损失权重和增强开关，便于不同实验复用同一脚本。
 	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification training")
 	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
-	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer"], help="Backbone model")
+	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer", "pointmlp", "3detr", "dct"], help="Backbone model")
 	parser.add_argument("--epochs", type=int, default=80)
 	parser.add_argument("--batch-size", type=int, default=16)
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
