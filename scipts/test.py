@@ -22,11 +22,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.data import create_spad_classification_dataloaders
+from utils.data import create_dataloaders
 from utils.loss import (
 	DEFAULT_SPAD_BOX_BOUNDS,
 	box_iou_3d_aligned,
-	build_spad_boxes_from_meta,
 	canonicalize_boxes_3d,
 	decode_normalized_boxes_3d,
 	split_cls_and_box_predictions,
@@ -56,7 +55,7 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		fallback: Model name used when no keyword can be inferred.
 
 	Returns:
-https://github.com/facebookresearch/3detr		Model name in {dgcnn, pointnet2, pointtransformer, pointmlp, 3detr, dct}.
+		Model name in {dgcnn, pointnet2, pointtransformer, pointmlp, 3detr, dct}.
 	"""
 	name = checkpoint_path.stem.lower()
 	if "pointtransformer" in name or "point_transformer" in name:
@@ -366,17 +365,49 @@ def evaluate(
 
 	with torch.no_grad():
 		pbar = tqdm(loader, desc="Testing", leave=False)
-		for points, labels, batch_meta in pbar:
+		for batch in pbar:
+			if len(batch) == 2:
+				points, targets = batch
+				batch_meta = None
+			else:
+				points, targets, batch_meta = batch
 			# 测试 batch 的结构与训练一致：点云、类别标签和元信息一起进入评估流程。
 			points = points.to(device, non_blocking=True)
-			labels = labels.to(device, non_blocking=True)
 
-			valid_mask = labels >= 0
-			if not valid_mask.any():
-				continue
+			labels = None
+			box_targets = None
 
-			points = points[valid_mask]
-			labels = labels[valid_mask]
+			if isinstance(targets, Mapping) and "bbox_targets" in targets:
+				cls_targets = targets.get("cls_targets")
+				bbox_targets = targets.get("bbox_targets")
+				mask = targets.get("mask")
+				if cls_targets is None or bbox_targets is None or mask is None:
+					raise ValueError("targets must include cls_targets, bbox_targets, and mask")
+
+				cls_targets = cls_targets.to(device, non_blocking=True)
+				bbox_targets = bbox_targets.to(device, non_blocking=True)
+				mask = mask.to(device, non_blocking=True).bool()
+
+				valid_obj = mask
+				has_obj = valid_obj.any(dim=1)
+				if not has_obj.any():
+					continue
+
+				first_idx = valid_obj.float().argmax(dim=1)
+				batch_idx = torch.arange(points.size(0), device=points.device)
+				labels = cls_targets[batch_idx, first_idx].long()
+				box_targets = bbox_targets[batch_idx, first_idx]
+
+				points = points[has_obj]
+				labels = labels[has_obj]
+				box_targets = box_targets[has_obj]
+			else:
+				labels = targets.to(device, non_blocking=True)
+				valid_mask = labels >= 0
+				if not valid_mask.any():
+					continue
+				points = points[valid_mask]
+				labels = labels[valid_mask]
 
 			model_outputs = model(prepare_model_inputs(points))
 			logits, box_preds = split_cls_and_box_predictions(model_outputs)
@@ -398,12 +429,10 @@ def evaluate(
 			all_labels.extend(labels.detach().cpu().tolist())
 			all_pred_scores.extend(pred_scores.detach().cpu().tolist())
 
-			if box_preds is not None and isinstance(batch_meta, Mapping):
+			if box_preds is not None and box_targets is not None:
 				try:
-					# box AP 的前提是模型和元信息都能构造出一一对应的预测框与真实框。
-					meta_valid = slice_batch_meta(batch_meta, valid_mask)
-					gt_boxes = build_spad_boxes_from_meta(meta_valid, device=device)
-					pred_boxes = canonicalize_boxes_3d(box_preds, device=device, dtype=gt_boxes.dtype)
+					pred_boxes = canonicalize_boxes_3d(box_preds, device=device, dtype=box_targets.dtype)
+					gt_boxes = canonicalize_boxes_3d(box_targets, device=device, dtype=box_targets.dtype)
 					if box_space == "normalized":
 						pred_boxes = decode_normalized_boxes_3d(pred_boxes, bounds=box_bounds, device=device, dtype=gt_boxes.dtype)
 
@@ -413,7 +442,6 @@ def evaluate(
 						)
 
 					ious = box_iou_3d_aligned(pred_boxes, gt_boxes)
-					# iou / score / class 会一起保存，后续按阈值和类别计算 AP50、AP@50:5:95。
 					all_box_ious.extend(ious.detach().cpu().tolist())
 					all_box_scores.extend(pred_scores.detach().cpu().tolist())
 					all_box_pred_classes.extend(preds.detach().cpu().tolist())
@@ -480,21 +508,23 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 
 	logger, log_file, timestamp = setup_logger(log_dir, resolved_model)
 
-	_, _, test_loader, _, meta = create_spad_classification_dataloaders(
+	if args.train_ratio + args.val_ratio + args.test_ratio <= 0:
+		raise ValueError("train/val/test ratios must be positive.")
+	_, _, test_loader, class_to_idx = create_dataloaders(
 		data_root=str(data_root),
 		batch_size=args.batch_size,
-		num_points=(None if args.num_points <= 0 else args.num_points),
+		num_points=args.num_points,
 		train_ratio=args.train_ratio,
 		val_ratio=args.val_ratio,
 		test_ratio=args.test_ratio,
 		num_workers=args.num_workers,
 		seed=args.seed,
-		augment_train=False,
+		augment_train=True,
 		augment_eval=args.augment_eval,
 		label_mode=args.label_mode,
 	)
 
-	model = build_model(resolved_model, num_classes=meta["num_classes"], project_root=project_root).to(device)
+	model = build_model(resolved_model, num_classes=len(class_to_idx), project_root=project_root).to(device)
 	# 测试时只需要模型参数，不需要优化器状态。
 	checkpoint = torch.load(checkpoint_path, map_location=device)
 	state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
@@ -502,7 +532,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 
 	if "class_to_idx" in checkpoint:
 		ckpt_class_to_idx = checkpoint["class_to_idx"]
-		if ckpt_class_to_idx != meta["class_to_idx"]:
+		if ckpt_class_to_idx != class_to_idx:
 			logger.warning("class_to_idx in checkpoint differs from current dataset split mapping.")
 
 	criterion = nn.CrossEntropyLoss()
@@ -511,7 +541,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	y_true = eval_out["y_true"]
 	y_pred = eval_out["y_pred"]
 	# 分类部分的总体指标来自 y_true/y_pred；box 部分需要额外用 IoU 和类别匹配情况来算 AP。
-	metrics = compute_metrics(y_true, y_pred, num_classes=meta["num_classes"])
+	metrics = compute_metrics(y_true, y_pred, num_classes=len(class_to_idx))
 	box_metrics: Optional[Dict[str, Any]] = None
 	if eval_out["box_eval_samples"] > 0:
 		# 只有模型真的输出了 box 且元信息能构造目标框时，才会计算 box AP。
@@ -520,7 +550,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 			pred_scores=eval_out["box_scores"],
 			gt_classes=eval_out["box_gt_classes"],
 			ious=eval_out["box_ious"],
-			num_classes=meta["num_classes"],
+			num_classes=len(class_to_idx),
 		)
 	elif eval_out["box_eval_skipped"]:
 		if eval_out.get("box_eval_error"):
@@ -529,8 +559,8 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 			"Box AP metrics skipped. Ensure model outputs boxes with shape [B,6] or [B,3,2] and metadata provides target ranges."
 		)
 
-	idx_to_class = meta["idx_to_class"]
-	class_names = [idx_to_class[i] for i in range(meta["num_classes"])]
+	idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
+	class_names = [idx_to_class[i] for i in range(len(class_to_idx))]
 
 	cm_path = output_dir / f"cm_{resolved_model}_{timestamp}.png"
 	plot_confusion_matrix(metrics["confusion_matrix"], class_names, cm_path, normalize=args.normalize_cm)
@@ -539,7 +569,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 		y_true,
 		y_pred,
 		target_names=class_names,
-		labels=np.arange(meta["num_classes"]),
+		labels=np.arange(len(class_to_idx)),
 		zero_division=0,
 	)
 
@@ -548,7 +578,7 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("resolved_model=%s", resolved_model)
 	logger.info("checkpoint=%s", checkpoint_path)
 	logger.info("data_root=%s", data_root)
-	logger.info("num_test_samples=%d", meta["num_test_samples"])
+	logger.info("num_test_samples=%d", len(test_loader.dataset))
 	logger.info("loss=%.4f", eval_out["loss"])
 	logger.info("top1=%.4f", eval_out["top1"])
 	logger.info("top3=%.4f", eval_out["top3"])
@@ -604,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification evaluation")
 	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
 	parser.add_argument("--checkpoint", type=str, default=r"D:\PYproject\SPAD\checkpoints\dgcnn_20260426_183404_669391_best.pth", help="Path to trained checkpoint")
-	parser.add_argument("--model", type=str, default="auto", choices=["auto", "dgcnn", "pointnet2", "pointtransformer"], help="Backbone model")
+	parser.add_argument("--model", type=str, default="auto", choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "3detr", "dct"], help="Backbone model")
 	parser.add_argument("--batch-size", type=int, default=16)
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
 	parser.add_argument("--train-ratio", type=float, default=0.6)

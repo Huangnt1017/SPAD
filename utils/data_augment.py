@@ -158,34 +158,135 @@ def augment_pytorch_batch(
 
     return aug_points, meta_list
 
+def _draw_3d_box_wireframe(ax, x_range, y_range, z_range, color='r', linewidth=1.5, alpha=0.8):
+    """在3D Axes上绘制线框box，用于可视化目标/烟雾3D区域"""
+    x0, x1 = x_range
+    y0, y1 = y_range
+    z0, z1 = z_range
+
+    # 8个顶点
+    verts = [
+        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],  # 底面
+        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],  # 顶面
+    ]
+    # 12条边
+    edges = [
+        (0,1),(1,2),(2,3),(3,0),   # 底面
+        (4,5),(5,6),(6,7),(7,4),   # 顶面
+        (0,4),(1,5),(2,6),(3,7),   # 竖边
+    ]
+    for i, j in edges:
+        ax.plot3D([verts[i][0], verts[j][0]],
+                  [verts[i][1], verts[j][1]],
+                  [verts[i][2], verts[j][2]],
+                  color=color, linewidth=linewidth, alpha=alpha)
+
+
 if __name__ == "__main__":
-    print("=== PyTorch Batch Augmentation Test ===")
-    
-    # Simulate (B=8, N=1024, C=4) Data
-    B, N, C = 8, 1024, 4
-    dummy_points = torch.randint(0, 100, (B, N, C)).float()
-    dummy_points[:, :, 3] = torch.randint(0, 10, (B, N)).float() # Intensity
-    
-    # Inject target-layer points
-    dummy_points[:, :100, 0] = torch.randint(20, 35, (B, 100)).float()
-    dummy_points[:, :100, 1] = torch.randint(5, 25, (B, 100)).float()
-    dummy_points[:, :100, 2] = torch.randint(80, 85, (B, 100)).float()
+    import os
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # 解决 OpenMP 多副本冲突
 
-    # Inject fog-layer points
-    dummy_points[:, 100:400, 0] = torch.randint(1, 65, (B, 300)).float()
-    dummy_points[:, 100:400, 1] = torch.randint(1, 65, (B, 300)).float()
-    dummy_points[:, 100:400, 2] = torch.randint(35, 65, (B, 300)).float()
+    import matplotlib
+    matplotlib.use('TkAgg')  # 使用TkAgg后端以支持交互显示
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
 
-    print(f"Input Shape: {dummy_points.shape}")
-    
-    # Test augmentation
-    out_points, meta = augment_pytorch_batch(dummy_points, label_class="A")
-    
-    print(f"Output Shape: {out_points.shape}")
-    if meta:
-        print("\nSample Metadata (Batch 0):")
-        print(json.dumps(meta[0], indent=2))
-        print("\nSample Metadata (Batch 1):")
-        print(json.dumps(meta[1], indent=2))
-        
-    print("\nTest Finished.")
+    print("=== PyTorch Batch Augmentation Test (Real Data) ===\n")
+
+    # ── 1. 加载真实数据 ──────────────────────────────────────────
+    data_path = r"D:\PYproject\SPADdata\2025-04-30-dpc\G\2025-04-30_18-53-59_Delay-0_Width-200-1-3.txt"
+    raw_data = np.loadtxt(data_path, dtype=int, delimiter=',')
+    if raw_data.ndim == 1:
+        raw_data = raw_data.reshape(1, -1)
+    print(f"原始数据: {raw_data.shape[0]} 个点, 维度={raw_data.shape[1]} (xyzi)")
+
+    # ── 2. 构建 batch=1 的输入张量 ──────────────────────────────
+    B = 1
+    points = torch.from_numpy(raw_data).float().unsqueeze(0)  # (1, N, 4)
+    N = points.shape[1]
+    print(f"输入张量形状: {points.shape}  (B={B}, N={N})")
+
+    # ── 3. 执行增强 ─────────────────────────────────────────────
+    label_class = "A"
+    aug_points, meta = augment_pytorch_batch(points, label_class=label_class, seed=42)
+
+    # ── 4. 输出增强后的 label：3D box 位置及类别 ──────────────────
+    print("\n" + "=" * 62)
+    print("  增强后标签 — 3D Box 位置及类别")
+    print("=" * 62)
+    m = meta[0]
+    print(f"  类别 (label)        : {m['label']}")
+    print(f"  目标位移 dx/dy/dz   : {m['target_shift']}")
+    print(f"  目标 3D Box X 范围  : [{m['target_x_range'][0]}, {m['target_x_range'][1]})")
+    print(f"  目标 3D Box Y 范围  : [{m['target_y_range'][0]}, {m['target_y_range'][1]})")
+    print(f"  目标 3D Box Z 范围  : [{m['target_z_range'][0]}, {m['target_z_range'][1]}] (含)")
+    print(f"  烟雾位移 dz          : {m['fog_shift_z']}")
+    print(f"  烟雾 3D Box Z 范围  : [{m['fog_z_range'][0]}, {m['fog_z_range'][1]}] (含)")
+    print(f"  烟雾在目标前方 bins  : {m['fog_ahead_gap_bins']}")
+
+    # ── 5. 准备可视化数据 ────────────────────────────────────────
+    orig = points[0].cpu().numpy()      # (N, 4) 原始数据
+    aug  = aug_points[0].cpu().numpy()  # (N, 4) 增强后数据
+
+    # 源区域（固定，用于原始数据 box 标注）
+    src_tgt_x, src_tgt_y, src_tgt_z = (20, 35), (5, 20), (80, 85)
+    src_fog_x, src_fog_y, src_fog_z = (1, 65), (1, 65), (35, 65)
+
+    # 增强后区域（从 metadata 获取）
+    aug_tgt_x = (m['target_x_range'][0], m['target_x_range'][1])
+    aug_tgt_y = (m['target_y_range'][0], m['target_y_range'][1])
+    aug_tgt_z = (m['target_z_range'][0], m['target_z_range'][1] + 1)   # metadata 上界含
+    aug_fog_x = src_fog_x       # 烟雾 x/y 不变
+    aug_fog_y = src_fog_y
+    aug_fog_z = (m['fog_z_range'][0], m['fog_z_range'][1] + 1)         # metadata 上界含
+
+    # ── 6. 参照 plot_pc 风格绘制原始 vs 增强对比图 ──────────────
+    # 自定义 colormap：浅蓝 → 深红 (与 plot_pc 一致)
+    light_blue = (113/255, 178/255, 255/255)
+    dark_red   = (255/255, 0/255, 0/255)
+    cmap_custom = LinearSegmentedColormap.from_list('lightblue_to_darkred', [light_blue, dark_red])
+    norm = Normalize(vmin=1, vmax=750)
+
+    # 强度驱动的逐点透明度 (与 plot_pc 一致)
+    int_orig = orig[:, 3].astype(np.float32)
+    int_aug = aug[:, 3].astype(np.float32)
+
+    fig = plt.figure(figsize=(18, 8))
+    fig.suptitle(f"SPAD Point Cloud Augmentation  |  label={label_class}  |  {N} points",
+                 fontsize=13, fontweight='bold')
+
+    # ---- 子图1: 原始数据 ----
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    ax1.set_title("Original", fontsize=12, color='navy')
+
+    ax1.scatter(orig[:, 0], orig[:, 1], orig[:, 2],
+                c=int_orig, s=2, cmap=cmap_custom, alpha=0.5)
+
+    # 叠加 3D Box 线框
+    _draw_3d_box_wireframe(ax1, src_tgt_x, src_tgt_y, src_tgt_z, color='red', linewidth=1.5)
+    _draw_3d_box_wireframe(ax1, src_fog_x, src_fog_y, src_fog_z, color='cyan', linewidth=1.0)
+
+    ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+    ax1.set_xlim(1, 64); ax1.set_ylim(1, 64); ax1.set_zlim(1, 110)
+    ax1.view_init(elev=10, azim=-7)
+
+    # ---- 子图2: 增强后数据 ----
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+    ax2.set_title("Augmented", fontsize=12, color='darkgreen')
+
+    ax2.scatter(aug[:, 0], aug[:, 1], aug[:, 2],
+                c=int_aug, s=2, cmap=cmap_custom, alpha=0.5)
+
+    # 叠加增强后 3D Box 线框
+    _draw_3d_box_wireframe(ax2, aug_tgt_x, aug_tgt_y, aug_tgt_z, color='red', linewidth=1.5)
+    _draw_3d_box_wireframe(ax2, aug_fog_x, aug_fog_y, aug_fog_z, color='cyan', linewidth=1.0)
+
+    ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
+    ax2.set_xlim(1, 64); ax2.set_ylim(1, 64); ax2.set_zlim(1, 110)
+    ax2.view_init(elev=10, azim=-7)
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\nDone.")

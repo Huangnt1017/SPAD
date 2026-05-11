@@ -31,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
 # 训练脚本只负责把数据、模型、损失和日志串起来，核心计算都保留在各自模块中。
-from utils.data import create_spad_classification_dataloaders
+from utils.data import create_dataloaders
 from utils.loss import PointCloudMultiTaskLoss, build_spad_boxes_from_meta, split_cls_and_box_predictions
 
 
@@ -167,8 +167,15 @@ def prepare_model_inputs(points_xyzi: torch.Tensor) -> torch.Tensor:
 	Returns:
 		直接返回 (B, N, 4)，保持与模型前向契约一致。
 	"""
-	# 点云样本已经在数据集里整理成 (B, N, 4)，这里保持原样传入模型即可。
-	return points_xyzi
+	# 兼容 (B, N, 4) 与 (B, 4, N)，统一成 (B, N, 4) 给模型。
+	if points_xyzi.ndim != 3:
+		raise ValueError(f"prepare_model_inputs expects 3D input, got shape {tuple(points_xyzi.shape)}")
+	if points_xyzi.shape[-1] == 4:
+		return points_xyzi
+	if points_xyzi.shape[1] == 4:
+		return points_xyzi.transpose(1, 2).contiguous()
+	
+	raise ValueError(f"prepare_model_inputs expects shape (B,N,4) or (B,4,N), got {tuple(points_xyzi.shape)}")
 
 
 def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable[int] = (1, 3)) -> Dict[int, int]:
@@ -257,34 +264,65 @@ def run_epoch(
 	context = torch.enable_grad() if is_train else torch.no_grad()
 
 	with context:
-		for points, labels, batch_meta in pbar:
+		for batch in pbar:
+			if len(batch) == 2:
+				points, targets = batch
+				batch_meta = None
+			else:
+				points, targets, batch_meta = batch
 			# 输入 batch 来自数据集：points 是点云，labels 是类别索引，batch_meta 保存 box 监督所需的辅助信息。
 			points = points.to(device, non_blocking=True)
-			labels = labels.to(device, non_blocking=True)
 
-			# 有些样本可能带无效标签，先过滤掉，再让后面的分类和 box 监督都只看有效样本。
-			valid_mask = labels >= 0
-			if not valid_mask.any():
-				continue
+			labels = None
+			box_targets = None
 
-			# 过滤后，点云和标签的 batch 维度保持完全一致。
-			points = points[valid_mask]
-			labels = labels[valid_mask]
+			if isinstance(targets, Mapping) and "bbox_targets" in targets:
+				cls_targets = targets.get("cls_targets")
+				bbox_targets = targets.get("bbox_targets")
+				mask = targets.get("mask")
+				if cls_targets is None or bbox_targets is None or mask is None:
+					raise ValueError("targets must include cls_targets, bbox_targets, and mask")
+
+				cls_targets = cls_targets.to(device, non_blocking=True)
+				bbox_targets = bbox_targets.to(device, non_blocking=True)
+				mask = mask.to(device, non_blocking=True).bool()
+
+				# 假设单样本单目标：选择每个样本的第一个有效框作为监督。
+				valid_obj = mask
+				has_obj = valid_obj.any(dim=1)
+				if not has_obj.any():
+					continue
+
+				first_idx = valid_obj.float().argmax(dim=1)
+				batch_idx = torch.arange(points.size(0), device=points.device)
+				labels = cls_targets[batch_idx, first_idx].long()
+				box_targets = bbox_targets[batch_idx, first_idx]
+
+				points = points[has_obj]
+				labels = labels[has_obj]
+				box_targets = box_targets[has_obj]
+			else:
+				labels = targets.to(device, non_blocking=True)
+				# 有些样本可能带无效标签，先过滤掉，再让后面的分类和 box 监督都只看有效样本。
+				valid_mask = labels >= 0
+				if not valid_mask.any():
+					continue
+
+				points = points[valid_mask]
+				labels = labels[valid_mask]
+
+				if isinstance(batch_meta, Mapping):
+					meta_valid = slice_batch_meta(batch_meta, valid_mask)
+					try:
+						box_targets = build_spad_boxes_from_meta(meta_valid, device=device)
+					except Exception:
+						# // TODO(copilot) 2026-04-26: 改为细粒度异常分类并记录样本路径，便于定位脏元信息来源。
+						box_targets = None
 
 			# 模型前向只吃点云，输出里会同时包含分类 logits 和 3D box 预测。
 			inputs = prepare_model_inputs(points)
 			model_outputs = model(inputs)
 			logits, box_preds = split_cls_and_box_predictions(model_outputs)
-
-			box_targets = None
-			if isinstance(batch_meta, Mapping):
-				# box 监督来自样本元信息里的 target_x / target_y / target_z 范围，按有效样本同步裁剪后再构造目标框。
-				meta_valid = slice_batch_meta(batch_meta, valid_mask)
-				try:
-					box_targets = build_spad_boxes_from_meta(meta_valid, device=device)
-				except Exception:
-					# // TODO(copilot) 2026-04-26: 改为细粒度异常分类并记录样本路径，便于定位脏元信息来源。
-					box_targets = None
 
 			# 多任务损失内部会分别计算分类损失、box L1 损失和 IoU 损失，并汇总成 total_loss。
 			loss_dict = criterion(
@@ -411,11 +449,14 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
 	logger, log_file, run_timestamp = setup_logger(log_dir, args.model)
 
-	# 数据加载器返回 train/val/test 三个有监督集合，外加一份包含类别映射与样本数量的 meta。
-	train_loader, val_loader, test_loader, unlabeled_loader, meta = create_spad_classification_dataloaders(
+	# 使用统一的多任务数据管线，训练集强制开启增强。
+	if args.train_ratio + args.val_ratio + args.test_ratio <= 0:
+		raise ValueError("train/val/test ratios must be positive.")
+
+	train_loader, val_loader, test_loader, class_to_idx = create_dataloaders(
 		data_root=str(data_root),
 		batch_size=args.batch_size,
-		num_points=(None if args.num_points <= 0 else args.num_points),
+		num_points=args.num_points,
 		train_ratio=args.train_ratio,
 		val_ratio=args.val_ratio,
 		test_ratio=args.test_ratio,
@@ -426,7 +467,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		label_mode=args.label_mode,
 	)
 
-	model = build_model(args.model, num_classes=meta["num_classes"], project_root=project_root).to(device)
+	num_classes = len(class_to_idx)
+	model = build_model(args.model, num_classes=num_classes, project_root=project_root).to(device)
 	# 多任务损失的三个权重控制分类、box L1 和 box IoU 三部分对总损失的贡献。
 	criterion = PointCloudMultiTaskLoss(
 		cls_weight=args.cls_loss_weight,
@@ -444,11 +486,10 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("data_root=%s", data_root)
 	logger.info("device=%s", device)
 	logger.info("model=%s", args.model)
-	logger.info("num_classes=%d", meta["num_classes"])
-	logger.info("num_labeled_samples=%d", meta["num_labeled_samples"])
-	logger.info("num_unlabeled_samples=%d", meta["num_unlabeled_samples"])
-	logger.info("split train/val/test = %d / %d / %d", meta["num_train_samples"], meta["num_val_samples"], meta["num_test_samples"])
-	logger.info("unlabeled_loader_exists=%s", "yes" if unlabeled_loader is not None else "no")
+	logger.info("num_classes=%d", num_classes)
+	logger.info("split train/val/test = %d / %d / %d", len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset))
+	logger.info("label_mode=%s", args.label_mode)
+	logger.info("augment_train=%s augment_eval=%s", args.augment_train, args.augment_eval)
 	logger.info("args=%s", json.dumps(vars(args), ensure_ascii=False))
 
 	start_epoch = 1
@@ -531,7 +572,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 				scheduler=scheduler,
 				epoch=epoch,
 				best_val_top1=best_val_top1,
-				class_to_idx=meta["class_to_idx"],
+				class_to_idx=class_to_idx,
 				args=args,
 			)
 			logger.info("Saved new best checkpoint to %s", best_ckpt)
@@ -543,7 +584,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		scheduler=scheduler,
 		epoch=args.epochs,
 		best_val_top1=best_val_top1,
-		class_to_idx=meta["class_to_idx"],
+		class_to_idx=class_to_idx,
 		args=args,
 	)
 	# last checkpoint 记录的是最终 epoch 的完整状态，便于后续继续训练或直接测试。

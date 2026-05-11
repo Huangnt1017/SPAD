@@ -3,7 +3,6 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
 from typing import List, Dict, Tuple, Optional
 import random
 from pathlib import Path
@@ -12,11 +11,9 @@ from utils.data_augment import augment_pytorch_batch
 """
 数据处理相关工具函数和数据集类
 包括：
-1. 点云数据集类PointCloudDataset，支持grid和ds两种模式
-2. 自定义collate函数，处理变长标签
-3. 创建DataLoader的函数create_dataloaders
-
-
+1. 多任务点云数据集（分类 + 3D box）
+2. 自定义collate函数，处理变长目标
+3. 创建训练/验证/测试的DataLoader
 """
 
 # ============================================
@@ -30,34 +27,16 @@ random.seed(SEED)
 # ============================================
 # 辅助函数
 # ============================================
-def downsample(points: np.ndarray, num: int) -> np.ndarray:
-    """
-    降采样函数（占位符）
-
-    Args:
-        points: 原始点云，形状为 (N, 4)
-        num: 目标点数
-
-    Returns:
-        降采样后的点云，形状为 (num, 4)
-    """
-    # 这里只是简单的均匀采样，实际使用时需要替换为您的降采样算法
-    if len(points) <= num:
-        return points
-    indices = np.random.choice(len(points), num, replace=False)
-    return points[indices]
-
-
 def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    自定义collate函数，处理变长的标签
+    自定义 collate 函数，处理变长目标标签。
 
     Args:
-        batch: 批次数据列表，每个元素是(data, labels)元组
+        batch: 批次数据列表，每个元素是 (data, labels) 元组，labels 形状为 (M, 7)。
 
     Returns:
-        data_batch: 堆叠后的数据张量
-        targets_dict: 包含以下键的字典:
+        data_batch: 堆叠后的数据张量。
+        targets_dict: 包含以下键的字典：
             - bbox_targets: 3D边界框坐标，形状为 (batch_size, max_num_objects, 6)
             - cls_targets: 类别标签，形状为 (batch_size, max_num_objects)
             - mask: 有效目标掩码，形状为 (batch_size, max_num_objects)
@@ -106,375 +85,8 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Te
     return data_batch, targets_dict
 
 
-class PointCloudDataset(Dataset):
-    """
-    点云数据集类
-
-    支持两种模式：
-    1. grid模式：将点云体素化为64x64x200的网格
-    2. ds模式：使用降采样函数将点云降采样到固定点数
-
-    数据组织方式：
-    - 点云文件：单个文件夹中的所有.txt文件（xyzi格式）
-    - 标签文件：与点云文件同名的.json文件
-    """
-
-    def __init__(self,
-                 data_dir: str,
-                 mode: str = 'grid',
-                 num_points: int = 1024,
-                 grid_size: Tuple[int, int, int] = (64, 64, 200)):
-        """
-        初始化数据集
-
-        Args:
-            data_dir: 数据目录路径，包含点云文件(.txt)和对应的标签文件(.json)
-            mode: 数据处理模式，'grid'或'ds'
-            num_points: ds模式下目标点数
-            grid_size: grid模式下网格大小 (height, width, depth)
-        """
-        self.data_dir = data_dir
-        self.mode = mode
-        self.num_points = num_points
-        self.grid_size = grid_size
-
-        # 验证模式参数
-        assert mode in ['grid', 'ds'], f"模式必须是'grid'或'ds'，当前为: {mode}"
-
-        # 获取所有点云文件
-        self.pc_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.txt')])
-
-        # 检测标签文件与点云文件数量对应关系
-        json_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.json')])
-
-        # 检查点云文件和标签文件数量是否一致
-        if len(self.pc_files) != len(json_files):
-            # 找到缺失的标签文件或点云文件
-            pc_base_names = {f.replace('.txt', '') for f in self.pc_files}
-            json_base_names = {f.replace('.json', '') for f in json_files}
-
-            missing_json = pc_base_names - json_base_names
-            missing_pc = json_base_names - pc_base_names
-
-            error_msg = "点云文件与标签文件数量不匹配！\n"
-            if missing_json:
-                error_msg += f"缺少以下点云文件对应的标签文件: {sorted(missing_json)}\n"
-            if missing_pc:
-                error_msg += f"缺少以下标签文件对应的点云文件: {sorted(missing_pc)}\n"
-
-            print(error_msg)
-            raise ValueError("点云文件与标签文件数量不匹配")
-
-        # 获取所有标签并建立类别映射
-        self.labels = []  # 每个样本的标签列表，每个标签是一个(M, 7)的数组
-        self.all_annotations = []  # 存储原始注释信息
-        self.unique_classes = set()
-
-        # 处理每个点云文件的标签
-        for pc_file in self.pc_files:
-            # 对应的标签文件
-            json_file = pc_file.replace('.txt', '.json')
-            json_path = os.path.join(data_dir, json_file)
-
-            # 读取标签文件
-            with open(json_path, 'r') as f:
-                annotation_data = json.load(f)
-
-            # 存储原始注释
-            self.all_annotations.append(annotation_data)
-
-            # 提取所有目标的标签
-            sample_labels = []
-            annotations = annotation_data.get('annotations', [])
-
-            for ann in annotations:
-                # 提取边界框信息
-                x_range = ann['x_range']
-                y_range = ann['y_range']
-                z_range = ann['z_range']
-                label = ann['label']
-
-                # 收集唯一类别
-                self.unique_classes.add(label)
-
-                # 将边界框信息存储为[xmin, xmax, ymin, ymax, zmin, zmax, class]
-                # 注意：class暂时用字符串，后面会映射为数字
-                bbox_info = [
-                    float(x_range[0]), float(x_range[1]),
-                    float(y_range[0]), float(y_range[1]),
-                    float(z_range[0]), float(z_range[1]),
-                    label  # 字符串，后面会映射
-                ]
-                sample_labels.append(bbox_info)
-
-            self.labels.append(sample_labels)
-
-        # 对唯一类别进行排序并创建映射
-        self.unique_classes = sorted(list(self.unique_classes))
-        self.class_to_idx = {cls: idx for idx, cls in enumerate(self.unique_classes)}
-        self.idx_to_class = {idx: cls for cls, idx in self.class_to_idx.items()}
-
-        # 将标签中的类别字符串映射为数字
-        for i, sample_labels in enumerate(self.labels):
-            for j, bbox_info in enumerate(sample_labels):
-                class_str = bbox_info[6]
-                class_idx = self.class_to_idx[class_str]
-                sample_labels[j][6] = float(class_idx)
-
-        print(f"数据集初始化完成:")
-        print(f"  点云文件数量: {len(self.pc_files)}")
-        print(f"  标签文件数量: {len(json_files)}")
-        print(f"  类别数量: {len(self.unique_classes)}")
-        print(f"  类别映射: {self.class_to_idx}")
-        print(f"  处理模式: {mode}")
-        if mode == 'grid':
-            print(f"  网格大小: {grid_size}")
-        else:
-            print(f"  目标点数: {num_points}")
-
-    def __len__(self) -> int:
-        """返回数据集大小"""
-        return len(self.pc_files)
-
-    def _load_point_cloud(self, file_path: str) -> np.ndarray:
-        """
-        加载点云数据
-
-        Args:
-            file_path: 点云文件路径
-
-        Returns:
-            点云数据，形状为 (N, 4)，列顺序为 [x, y, z, intensity]
-        """
-        # 加载点云数据（假设格式为空格或逗号分隔）
-        try:
-            data = np.loadtxt(file_path, delimiter=',')
-        except:
-            # 如果逗号分隔失败，尝试空格分隔
-            data = np.loadtxt(file_path)
-
-        # 确保数据有4列（xyzi）
-        if data.shape[1] != 4:
-            raise ValueError(f"点云数据应该有4列(xyzi)，但只有{data.shape[1]}列")
-
-        return data
-
-    def _points_to_grid(self, points: np.ndarray) -> torch.Tensor:
-        """
-        将点云转换为网格表示
-
-        Args:
-            points: 点云数据，形状为 (N, 4)，列顺序为 [x, y, z, i]
-
-        Returns:
-            网格数据，形状为 (1, H, W, D)
-        """
-        # 创建零网格
-        H, W, D = self.grid_size
-        grid = np.zeros((H, W, D), dtype=np.float32)
-
-        # 将强度值放入网格
-        for point in points:
-            x, y, z, intensity = point
-            grid[int(x)-1, int(y)-1, int(z)-1] = intensity  # 转换为0-based索引
-        # 64*64*200的tensor
-        # 转换为torch张量并添加通道维度
-        grid_tensor = torch.from_numpy(grid).unsqueeze(0)
-        print('grid_tensor.shape', grid_tensor.shape)
-        return grid_tensor
-
-    def _points_to_downsampled(self, points: np.ndarray) -> torch.Tensor:
-        """
-        将点云转换为标准格式（不再做降采样）
-
-        Args:
-            points: 点云数据，形状为 (N, 4)，列顺序为 [x, y, z, i]
-
-        Returns:
-            点云，形状为 (4, N)
-        """
-        # 数据已在上游完成下采样，这里只做转置，不再重采样。
-        downsampled = points.T  # 形状从 (N, 4) 变为 (4, N)
-
-        # 转换为torch张量
-        return torch.from_numpy(downsampled.astype(np.float32))
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        获取单个数据样本
-
-        Args:
-            idx: 数据索引
-
-        Returns:
-            (data, label): 数据和标签的元组
-        """
-        # 获取点云文件路径
-        pc_file = self.pc_files[idx]
-        pc_path = os.path.join(self.data_dir, pc_file)
-
-        # 加载点云数据
-        points = self._load_point_cloud(pc_path)
-
-        # 根据模式处理点云数据
-        if self.mode == 'grid':
-            data = self._points_to_grid(points)
-        else:  # mode == 'ds'
-            data = self._points_to_downsampled(points)
-
-        # 获取标签并转换为张量
-        sample_labels = self.labels[idx]
-
-        if len(sample_labels) > 0:
-            # 将标签列表转换为numpy数组
-            labels_array = np.array(sample_labels, dtype=np.float32)
-        else:
-            # 如果没有目标，创建空的标签数组
-            labels_array = np.zeros((0, 7), dtype=np.float32)
-
-        # 转换为torch张量
-        label_tensor = torch.from_numpy(labels_array)
-
-        return data, label_tensor
-
-
-def create_dataloaders(data_dir: str,
-                       mode: str = 'grid',
-                       batch_size: int = 32,
-                       test_size: float = 0.2,
-                       val_size: float = 0.2,
-                       num_points: int = 1024,
-                       grid_size: Tuple[int, int, int] = (64, 64, 200),
-                       seed: int = SEED) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
-    """
-    创建训练、验证和测试集的DataLoader
-
-    Args:
-        data_dir: 数据目录路径
-        mode: 数据处理模式，'grid'或'ds'
-        batch_size: 批量大小
-        test_size: 测试集比例
-        val_size: 验证集比例（占训练集的比例）
-        num_points: ds模式下目标点数
-        grid_size: grid模式下网格大小
-        seed: 随机种子
-
-    Returns:
-        train_loader, val_loader, test_loader, class_to_idx
-    """
-
-    def worker_init_fn(worker_id: int) -> None:
-        """DataLoader worker初始化函数，设置随机种子"""
-        np.random.seed(seed + worker_id)
-        random.seed(seed + worker_id)
-
-    # 创建完整数据集
-    full_dataset = PointCloudDataset(
-        data_dir=data_dir,
-        mode=mode,
-        num_points=num_points,
-        grid_size=grid_size
-    )
-
-    # 获取所有样本的索引
-    indices = list(range(len(full_dataset)))
-
-    # 获取有标签的样本索引（所有样本都应该有标签，但可能有空标签）
-    labeled_indices = [i for i, labels in enumerate(full_dataset.labels) if labels]
-
-    # 检查是否有无标签的样本
-    if len(labeled_indices) != len(indices):
-        print(f"警告: 有 {len(indices) - len(labeled_indices)} 个样本没有标签或标签为空")
-
-    if not labeled_indices:
-        raise ValueError("数据集中没有找到有效的标签")
-
-    # 检查是否有足够的样本进行分割
-    if len(labeled_indices) < 10:
-        print(f"警告: 样本数量较少 ({len(labeled_indices)})，使用简单分割")
-        # 使用简单分割
-        train_indices = labeled_indices[:int(len(labeled_indices) * 0.6)]
-        val_indices = labeled_indices[int(len(labeled_indices) * 0.6):int(len(labeled_indices) * 0.8)]
-        test_indices = labeled_indices[int(len(labeled_indices) * 0.8):]
-    else:
-        # 第一次划分：分离测试集
-        train_val_indices, test_indices = train_test_split(
-            labeled_indices,
-            test_size=test_size,
-            random_state=seed,
-            shuffle=True
-        )
-
-        # 第二次划分：分离验证集
-        train_indices, val_indices = train_test_split(
-            train_val_indices,
-            test_size=val_size,
-            random_state=seed,
-            shuffle=True
-        )
-
-    print(f"\n数据集分割:")
-    print(f"  训练集样本数: {len(train_indices)}")
-    print(f"  验证集样本数: {len(val_indices)}")
-    print(f"  测试集样本数: {len(test_indices)}")
-
-    # 创建子数据集
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
-    test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
-
-    # 创建DataLoader，使用自定义的collate_fn函数
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-        collate_fn=collate_fn
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-        collate_fn=collate_fn
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-        collate_fn=collate_fn
-    )
-
-    return train_loader, val_loader, test_loader, full_dataset.class_to_idx
-
-
-def get_data_shape(mode: str) -> Tuple[int, ...]:
-    """
-    获取数据形状
-
-    Args:
-        mode: 数据处理模式
-
-    Returns:
-        数据形状元组
-    """
-    if mode == 'grid':
-        return (1, 64, 64, 200)  # (channel, height, width, depth)
-    else:  # mode == 'ds'
-        return (4, 1024)  # (features, num_points)
-
-
 # ============================================
-# Classification Data Pipeline (for train/test scripts)
+# Multi-task Data Pipeline (for train/test scripts)
 # ============================================
 ALPHABET_CLASSES: List[str] = [chr(ord("A") + i) for i in range(26)]
 ALPHABET_CLASS_TO_IDX: Dict[str, int] = {name: idx for idx, name in enumerate(ALPHABET_CLASSES)}
@@ -752,8 +364,8 @@ def _symbol_from_augmented_position(meta: Dict) -> str:
     return ALPHABET_CLASSES[idx]
 
 
-class SPADClassificationDataset(Dataset):
-    """分类数据集：输入点云 (N,4)，标签来自目录类别名或增强位置映射。"""
+class SPADMultiTaskDataset(Dataset):
+    """多任务数据集：输出点云 (N,4) 以及 [xmin, xmax, ymin, ymax, zmin, zmax, cls]。"""
 
     def __init__(
         self,
@@ -764,6 +376,18 @@ class SPADClassificationDataset(Dataset):
         apply_augment: bool = True,
         label_mode: str = "generated",
     ):
+        """
+        Args:
+            samples: 预扫描样本列表，每个元素包含 path/label/dataset 字段。
+            class_to_idx: 类别到索引的映射。
+            num_points: 固定点数（采样或补齐）。
+            seed: 数据增强与采样的随机种子。
+            apply_augment: 是否应用增强。
+            label_mode: "raw" 或 "generated"。
+
+        Raises:
+            ValueError: label_mode 非法。
+        """
         self.samples = samples
         self.class_to_idx = class_to_idx
         self.num_points = num_points
@@ -777,7 +401,15 @@ class SPADClassificationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            idx: 样本索引。
+
+        Returns:
+            points_tensor: 点云张量，形状为 (N, 4)。
+            label_tensor: 目标标签张量，形状为 (M, 7)。
+        """
         sample = self.samples[idx]
         points = load_point_cloud_auto(str(sample["path"]))
 
@@ -808,6 +440,7 @@ class SPADClassificationDataset(Dataset):
             raw_label_name = None
 
         if self.apply_augment:
+            # augment_pytorch_batch 需要输入形状 (B, N, 4)
             points_tensor = torch.from_numpy(points).unsqueeze(0)
             aug_points, aug_meta_list = augment_pytorch_batch(points_tensor, label_class=raw_label_name, seed=sample_seed)
             points = aug_points.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
@@ -848,28 +481,27 @@ class SPADClassificationDataset(Dataset):
 
         label_idx = self.class_to_idx[symbol]
 
+        x_range = aug_meta.get("target_x_range", [20, 35])
+        y_range = aug_meta.get("target_y_range", [5, 25])
+        z_range = aug_meta.get("target_z_range", [80, 84])
+
+        if len(x_range) != 2 or len(y_range) != 2 or len(z_range) != 2:
+            raise ValueError(f"Invalid target ranges in augmentation meta for sample: {sample['path']}")
+
+        label_row = [
+            float(x_range[0]), float(x_range[1]),
+            float(y_range[0]), float(y_range[1]),
+            float(z_range[0]), float(z_range[1]),
+            float(label_idx),
+        ]
+        labels_array = np.array([label_row], dtype=np.float32)
+
         points_tensor = torch.from_numpy(points)
-        label_tensor = torch.tensor(label_idx, dtype=torch.long)
-
-        sample_meta = {
-            "path": str(sample["path"]),
-            "dataset": str(sample.get("dataset", "")),
-            "sym": symbol,
-            "class_name": symbol,
-            "target_x_new": list(aug_meta.get("target_x_range", [20, 35])),
-            "target_y_new": list(aug_meta.get("target_y_range", [5, 25])),
-            "target_z_new": list(aug_meta.get("target_z_range", [80, 84])),
-            "box_3d": [
-                list(aug_meta.get("target_x_range", [20, 35])),
-                list(aug_meta.get("target_y_range", [5, 25])),
-                list(aug_meta.get("target_z_range", [80, 84])),
-            ],
-            "target_shift": list(aug_meta.get("target_shift", [0, 0, 0])),
-        }
-        return points_tensor, label_tensor, sample_meta
+        label_tensor = torch.from_numpy(labels_array)
+        return points_tensor, label_tensor
 
 
-def create_spad_classification_dataloaders(
+def create_dataloaders(
     data_root: str,
     batch_size: int = 16,
     num_points: Optional[int] = None,
@@ -881,13 +513,16 @@ def create_spad_classification_dataloaders(
     augment_train: bool = True,
     augment_eval: bool = True,
     label_mode: str = "raw",
-) -> Tuple[DataLoader, DataLoader, DataLoader, Optional[DataLoader], Dict]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
     """
-    创建 SPAD 分类任务 DataLoader。
+    创建 SPAD 多任务 DataLoader（分类 + 3D box）。
 
     标签规则：
     - 默认 label_mode='raw'，使用样本父目录名称作为类别标签。
     - label_mode='generated' 时，使用增强后目标位置映射得到 A-Z 标签（仅当类映射包含该标签时有效）。
+
+    Raises:
+        ValueError: 训练集禁用增强或样本数量不足。
     """
     labeled_samples, unlabeled_samples = discover_spad_classification_samples(data_root)
 
@@ -900,7 +535,6 @@ def create_spad_classification_dataloaders(
         raise ValueError(f"Need at least 3 samples, got {len(all_samples)} from: {data_root}")
 
     class_to_idx = build_class_mapping(labeled_samples)
-    idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
 
     # raw 模式只对有标签样本切分；这样即便数据目录里临时出现无标签文件，也不会扰动切分结果。
     if label_mode == "raw":
@@ -956,15 +590,18 @@ def create_spad_classification_dataloaders(
             seed=seed,
         )
 
-    train_dataset = SPADClassificationDataset(
+    if not augment_train:
+        raise ValueError("Training data must use augmentation; set augment_train=True.")
+
+    train_dataset = SPADMultiTaskDataset(
         train_samples,
         class_to_idx,
         num_points=num_points,
         seed=seed + 11,
-        apply_augment=augment_train,
+        apply_augment=True,
         label_mode=label_mode,
     )
-    val_dataset = SPADClassificationDataset(
+    val_dataset = SPADMultiTaskDataset(
         val_samples,
         class_to_idx,
         num_points=num_points,
@@ -972,7 +609,7 @@ def create_spad_classification_dataloaders(
         apply_augment=augment_eval,
         label_mode=label_mode,
     )
-    test_dataset = SPADClassificationDataset(
+    test_dataset = SPADMultiTaskDataset(
         test_samples,
         class_to_idx,
         num_points=num_points,
@@ -1002,6 +639,7 @@ def create_spad_classification_dataloaders(
         pin_memory=pin_memory,
         worker_init_fn=_seed_worker,
         generator=train_generator,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -1011,6 +649,7 @@ def create_spad_classification_dataloaders(
         pin_memory=pin_memory,
         worker_init_fn=_seed_worker,
         generator=eval_generator,
+        collate_fn=collate_fn,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -1020,24 +659,8 @@ def create_spad_classification_dataloaders(
         pin_memory=pin_memory,
         worker_init_fn=_seed_worker,
         generator=eval_generator,
+        collate_fn=collate_fn,
     )
 
-    meta = {
-        "class_to_idx": class_to_idx,
-        "idx_to_class": idx_to_class,
-        "num_classes": len(class_to_idx),
-        "num_labeled_samples": len(labeled_samples),
-        "num_unlabeled_samples": len(unlabeled_samples),
-        "num_total_samples": len(all_samples),
-        "num_split_source_samples": len(split_source_samples),
-        "num_train_samples": len(train_samples),
-        "num_val_samples": len(val_samples),
-        "num_test_samples": len(test_samples),
-        "seed": seed,
-        "label_mode": label_mode,
-        "augmentation_location": "dataset",
-        "seed_controls_dataloader_and_augmentation": True,
-    }
-
-    return train_loader, val_loader, test_loader, None, meta
+    return train_loader, val_loader, test_loader, class_to_idx
 
