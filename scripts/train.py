@@ -33,6 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # 训练脚本只负责把数据、模型、损失和日志串起来，核心计算都保留在各自模块中。
 from utils.data import create_dataloaders
 from utils.loss import PointCloudMultiTaskLoss, build_spad_boxes_from_meta, split_cls_and_box_predictions
+from utils.checkpoint import save_checkpoint
 
 
 def set_seed(seed: int) -> None:
@@ -384,45 +385,6 @@ def run_epoch(
 		"samples": float(total_samples),
 	}
 	return metrics
-
-
-def save_checkpoint(
-	path: Path,
-	model: nn.Module,
-	optimizer: optim.Optimizer,
-	scheduler: CosineAnnealingLR,
-	epoch: int,
-	best_val_top1: float,
-	class_to_idx: Dict[str, int],
-	args: argparse.Namespace,
-) -> None:
-	"""保存训练状态到 checkpoint。
-
-	Args:
-		path: checkpoint 输出路径。
-		model: 当前模型。
-		optimizer: 当前优化器。
-		scheduler: 学习率调度器。
-		epoch: 当前 epoch。
-		best_val_top1: 历史最佳验证 top1。
-		class_to_idx: 类别映射。
-		args: 训练参数。
-
-	Returns:
-		None。
-	"""
-	# checkpoint 里同时保存模型、优化器、学习率调度器和运行参数，方便后续恢复训练或做测试复现。
-	payload = {
-		"epoch": epoch,
-		"model_state_dict": model.state_dict(),
-		"optimizer_state_dict": optimizer.state_dict(),
-		"scheduler_state_dict": scheduler.state_dict(),
-		"best_val_top1": best_val_top1,
-		"class_to_idx": class_to_idx,
-		"args": vars(args),
-	}
-	torch.save(payload, path)
-
 
 def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	"""执行完整训练流程。
