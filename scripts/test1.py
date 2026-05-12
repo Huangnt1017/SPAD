@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from scipts.train import build_model, resolve_path, set_seed
+from scripts.train import build_model, resolve_path, set_seed
 from utils.data import discover_spad_classification_samples, load_point_cloud_auto
 from utils.loss import DEFAULT_SPAD_BOX_BOUNDS, box_iou_3d_aligned, canonicalize_boxes_3d, decode_normalized_boxes_3d
 

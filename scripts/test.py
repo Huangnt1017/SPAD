@@ -30,7 +30,7 @@ from utils.loss import (
 	decode_normalized_boxes_3d,
 	split_cls_and_box_predictions,
 )
-from scipts.train import build_model, compute_topk_hits, prepare_model_inputs, resolve_path, set_seed
+from scripts.train import build_model, compute_topk_hits, prepare_model_inputs, resolve_path, set_seed
 
 """
 SPAD 测试与评估模块。
@@ -55,7 +55,7 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		fallback: Model name used when no keyword can be inferred.
 
 	Returns:
-		Model name in {dgcnn, pointnet2, pointtransformer, pointmlp, 3detr, dct}.
+		Model name in {dgcnn, pointnet2, pointtransformer, pointmlp, pointnext, tnpc, 3detr, dct}.
 	"""
 	name = checkpoint_path.stem.lower()
 	if "pointtransformer" in name or "point_transformer" in name:
@@ -72,6 +72,8 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		return "dct"
 	if "dgcnn" in name:
 		return "dgcnn"
+	if "tnpc" in name:
+		return "tnpc"
 	return fallback
 
 def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, str]:
@@ -640,7 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
 		"--model",
 		type=str,
 		default="auto",
-		choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "pointnext", "3detr", "dct"],
+		choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "pointnext", "tnpc", "3detr", "dct"],
 		help="Backbone model",
 	)
 	parser.add_argument("--batch-size", type=int, default=16)

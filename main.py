@@ -16,8 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from scipts import test as test_script
-from scipts import train as train_script
+from scripts import test as test_script
+from scripts import train as train_script
 
 
 def main() -> None:

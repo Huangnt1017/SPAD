@@ -117,7 +117,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointmlp/pointnext/3detr/dct。
+		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointmlp/pointnext/tnpc/3detr/dct。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -150,6 +150,10 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "pointnext":
 		module = load_module_from_file(baseline_dir / "PointNeXt.py", "baseline_pointnext")
 		return module.PointNeXtClassification(num_classes=num_classes)
+
+	if name == "tnpc":
+		module = load_module_from_file(baseline_dir / "TNPC.py", "baseline_tnpc")
+		return module.TNPCClassification(num_classes=num_classes)
 
 	if name == "3detr":
 		module = load_module_from_file(baseline_dir / "3DETR.py", "baseline_3detr")
@@ -611,7 +615,16 @@ def build_parser() -> argparse.ArgumentParser:
 		"--model",
 		type=str,
 		default="dgcnn",
-		choices=["dgcnn", "pointnet2", "pointtransformer", "pointmlp", "pointnext", "3detr", "dct"],
+		choices=[
+			"dgcnn",
+			"pointnet2",
+			"pointtransformer",
+			"pointmlp",
+			"pointnext",
+			"tnpc",
+			"3detr",
+			"dct",
+		],
 		help="Backbone model",
 	)
 	parser.add_argument("--epochs", type=int, default=80)
