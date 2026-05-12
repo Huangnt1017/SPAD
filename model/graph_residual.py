@@ -1,26 +1,12 @@
 """
-单光子点云图残差多任务网络 (Graph Residual Multi-Task Network for SPAD)
+单光子点云图残差多任务网络 (Graph Residual Multi-Task Network for SPAD)  v3
 
-该模块实现了基于"坐标注意力图残差模块"的多任务深度学习模型，
-专门针对单光子雪崩二极管 (SPAD) 激光雷达的稀疏点云数据。
-
-物理动机:
-    单光子激光雷达在浓雾等复杂场景中采集的点云信噪比极低。
-    通用点云网络缺乏对几何位置中心的显式约束，深层特征易因
-    噪声干扰发生"位置漂移"。本网络通过"坐标残差"机制使
-    每一层图卷积都能直接访问原始三维空间坐标，从而抑制
-    噪声引起的特征形变，提高目标分类与 3D 定位精度。
-
-显存优化 (v2):
-    - EdgeFeature 分块处理 (chunked): 峰值显存降至 1/chunk
-    - Gradient Checkpoint: 训练时以计算换空间
-    - 默认 k=16, max_chunk_size=4
-
-核心架构 (参考 model/readme.md 任务1):
-    - KNN 动态建图 (纯 PyTorch 实现)
-    - 图残差模块: NGF/GCN + 自注意力门控 + 坐标残差
-    - 全局双池化 (Max + Avg)
-    - 双预测头: 分类 logits + 3D Box 回归
+v3 更新:
+    - QKV 注意力：Q(中心坐标+特征), K(邻居特征+Δ坐标), V(邻居特征+Δ特征)
+    - 每层加权随机下采样，点数逐层减半 (1024→512→256→128→64)
+    - KNN 使用完整 4D 向量 (x,y,z,intensity)
+    - 坐标 p 与特征 f 始终同时流入各 block
+    - 轻量通道: 32→64→128→256→512，目标 B=32
 
 References:
     - model/readme.md 任务1
@@ -29,348 +15,289 @@ References:
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 兼容不同 PyTorch 版本的 checkpoint 导入
+# 兼容 checkpoint API
 try:
-    from torch.utils.checkpoint import checkpoint as _torch_checkpoint
-    _HAS_CHECKPOINT = True
+    from torch.utils.checkpoint import checkpoint as _ckpt
+    _HAS_CKPT = True
 except (ImportError, AttributeError):
-    _HAS_CHECKPOINT = False
-    def _torch_checkpoint(fn, *args, **kwargs):
+    _HAS_CKPT = False
+    def _ckpt(fn, *args, **kwargs):
         return fn(*args)
 
 
-# ═══════════════════════════════════════════════════════════
-# KNN 工具函数
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# 4D KNN (含强度)
+# ══════════════════════════════════════════════════
 
-def get_knn_indices(
-    points_xyz: torch.Tensor,
-    k: int,
-    exclude_self: bool = True,
-) -> torch.Tensor:
-    """计算每个点的 K 近邻索引（纯 PyTorch 实现，无 C++ 扩展依赖）。
+def knn_4d(points: torch.Tensor, k: int) -> torch.Tensor:
+    """计算 4D 近邻索引（x, y, z, intensity）。
 
-    通过批量矩阵乘法计算成对欧氏平方距离，排除自身后取 top-k。
-    时间复杂度 O(B·N²·D)，在 N=1024、D=3 时高效运行。
+    强度按经验缩放因子 0.1 归一化到与坐标近似的量级，
+    避免强度维主导或完全失效。
 
     Args:
-        points_xyz: 点云坐标张量，形状 (B, N, 3)。
-        k: 近邻数量，应满足 1 ≤ k < N。
-        exclude_self: 是否排除自身点。KNN 构图时通常为 True。
+        points: (B, N, 4) — x, y, z, intensity。
+        k: 近邻数。
 
     Returns:
-        knn_idx: 近邻索引，形状 (B, N, k)，值域 [0, N-1]。
+        knn_idx: (B, N, k)，int64。
     """
-    B, N, _ = points_xyz.shape
+    B, N, _ = points.shape
+    # 分离坐标与强度，强度缩放防止量纲差异
+    xyz = points[..., :3]
+    intensity = points[..., 3:4] * 0.1  # 缩放因子
 
-    if exclude_self and k >= N:
-        raise ValueError(
-            f"k ({k}) must be less than N ({N}) when exclude_self=True."
-        )
+    xx = torch.sum(xyz ** 2, dim=2, keepdim=True)  # (B, N, 1)
+    ii = torch.sum(intensity ** 2, dim=2, keepdim=True)
+    dist_xyz = xx + xx.transpose(2, 1) - 2.0 * torch.bmm(xyz, xyz.transpose(2, 1))
+    dist_i = ii + ii.transpose(2, 1) - 2.0 * torch.bmm(intensity, intensity.transpose(2, 1))
+    dist = dist_xyz + dist_i  # 4D 欧氏距离
 
-    # ||p_i - p_j||² = ||p_i||² + ||p_j||² - 2·p_i·p_j
-    xx = torch.sum(points_xyz ** 2, dim=2, keepdim=True)          # (B, N, 1)
-    dist = xx + xx.transpose(2, 1) \
-           - 2.0 * torch.bmm(points_xyz, points_xyz.transpose(2, 1))  # (B, N, N)
+    # 排除自身
+    diag = torch.eye(N, device=points.device, dtype=torch.bool).unsqueeze(0).expand(B, -1, -1)
+    dist.masked_fill_(diag, float('inf'))
 
-    if exclude_self:
-        diag_mask = torch.eye(
-            N, device=points_xyz.device, dtype=torch.bool
-        ).unsqueeze(0).expand(B, -1, -1)
-        dist.masked_fill_(diag_mask, float("inf"))
-
-    _, knn_idx = torch.topk(dist, k, dim=2, largest=False)  # (B, N, k)
+    _, knn_idx = torch.topk(dist, k, dim=2, largest=False)
     return knn_idx
 
 
-# ═══════════════════════════════════════════════════════════
-# 边特征提取层 (内存高效版)
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# 加权随机下采样
+# ══════════════════════════════════════════════════
 
-class EdgeFeature(nn.Module):
-    """局部邻域图边特征提取层（内存高效分块版），等价于 EdgeConv。
+def weighted_downsample(
+    xyz: torch.Tensor,
+    feats: torch.Tensor,
+    target_n: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """基于特征 L2 范数的加权随机下采样。
 
-    对每个中心点 i 取 K 个近邻 j，构建边特征 e_{ij} = [f_i, f_j - f_i]，
-    通过共享 MLP 变换后最大池化聚合。
+    Args:
+        xyz: (B, N, 4) 点坐标+强度。
+        feats: (B, N, C) 特征。
+        target_n: 目标点数，应 ≤ N。
 
-    **显存优化**: 沿近邻维度分块循环处理，峰值从 (B,N,k,2C) 降至
-    (B,N,chunk,2C)。C=1024 时 ~2.5 GB → ~0.5 GB (chunk=4)。
+    Returns:
+        xyz_down: (B, target_n, 4)
+        feats_down: (B, target_n, C)
     """
+    B, N, _ = feats.shape
+    if target_n >= N:
+        return xyz, feats
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        k: int = 16,
-        max_chunk_size: int = 4,
-    ):
-        """初始化。
+    # 特征范数作为重要性分数
+    scores = feats.norm(p=2, dim=-1)  # (B, N)
+    scores = scores.clamp(min=1e-8)
+    probs = scores / scores.sum(dim=1, keepdim=True)
 
-        Args:
-            in_channels: 输入特征维度 C_in。
-            out_channels: 输出特征维度 C_out。
-            k: 近邻数量。
-            max_chunk_size: 分块大小。越小越省显存但越慢。
-                设为 0 或 ≥ k 则禁用分块。
-        """
-        super().__init__()
-        self.k = k
-        self.max_chunk_size = max_chunk_size if max_chunk_size > 0 else k
-
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels * 2, out_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(out_channels, out_channels),
-        )
-
-    def forward(
-        self, x: torch.Tensor, knn_idx: torch.Tensor
-    ) -> torch.Tensor:
-        """前向传播：分块提取边特征并跨块取最大值。
-
-        Args:
-            x: 点特征，形状 (B, N, C_in)。
-            knn_idx: KNN 索引，形状 (B, N, k)。
-
-        Returns:
-            out: 聚合后的局部特征，形状 (B, N, C_out)。
-        """
-        B, N, C = x.shape
-        k = knn_idx.shape[-1]
-        chunk = min(self.max_chunk_size, k)
-
-        out: Optional[torch.Tensor] = None
-
-        for chunk_start in range(0, k, chunk):
-            chunk_end = min(chunk_start + chunk, k)
-            kc = chunk_end - chunk_start
-            knn_chunk = knn_idx[:, :, chunk_start:chunk_end]  # (B, N, kc)
-
-            # 批量索引 gather 邻居特征
-            batch_idx = (
-                torch.arange(B, device=x.device)
-                .view(B, 1, 1)
-                .expand(-1, N, kc)
-            )
-            x_neighbors = x[batch_idx, knn_chunk, :]          # (B, N, kc, C)
-            x_center = x.unsqueeze(2).expand(-1, -1, kc, -1)  # (B, N, kc, C)
-
-            # 边特征 + MLP
-            edge_feat = torch.cat(
-                [x_center, x_neighbors - x_center], dim=-1
-            )  # (B, N, kc, 2C)
-            edge_feat = self.mlp(edge_feat)  # (B, N, kc, C_out)
-
-            # 当前 chunk 内 max-pool
-            chunk_max = edge_feat.max(dim=2)[0]  # (B, N, C_out)
-
-            # 跨 chunk 累积最大值
-            if out is None:
-                out = chunk_max
-            else:
-                out = torch.maximum(out, chunk_max)
-
-            # 及时释放中间张量
-            del x_neighbors, x_center, edge_feat, chunk_max, knn_chunk, batch_idx
-
-        if out is None:
-            raise RuntimeError("EdgeFeature: k must be >= 1")
-        return out
+    idx = torch.multinomial(probs, target_n, replacement=False)  # (B, target_n)
+    batch_idx = torch.arange(B, device=feats.device).view(B, 1).expand(-1, target_n)
+    xyz_down = xyz[batch_idx, idx, :]
+    feats_down = feats[batch_idx, idx, :]
+    return xyz_down, feats_down
 
 
-# ═══════════════════════════════════════════════════════════
-# 图残差模块
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# 图残差模块 (v3: QKV 注意力 + 下采样)
+# ══════════════════════════════════════════════════
 
 class GraphResidualBlock(nn.Module):
-    r"""图残差模块 —— 网络的核心构建块。
+    r"""图残差模块 v3：QKV 局部注意力 + 坐标残差 + 加权下采样。
 
-    针对性解决 SPAD 点云两大痛点:
-    1. 噪声几何形变 → 坐标残差连接锚定位置
-    2. 通道信息不平衡 → 自注意力门控自适应调制
+    QKV 注意力数据流::
 
-    数据流::
-
-        feat ──→ [LN] ──┬──→ [EdgeFeature] ──→ [ReLU] ──┐
-                         │                                  │
-                         └──→ [Linear → ReLU → Sigmoid] ───┤
-                                                            │
-                                   [逐元素点乘 Attention] ←─┘
-                                            │
-                                       [Linear]
-                                            │
-                                            ├──→ (+) ←── P_proj
-                                            │
-                                         [ReLU]
-                                            │
-                                         Output
+        p_i, f_i (中心点)
+           │
+        KNN(p) → neighbors p_j, f_j
+           │
+        Q = Linear([f_i, p_i])              ← 中心查询 (linear(f) + linear(p))
+        K = Linear([f_j, p_j - p_i])        ← 邻居键 (特征图 + 坐标图)
+        V = Linear([f_j, f_j - f_i])        ← 邻居值 (特征图 + 差分)
+           │
+        attn = sigmoid( MLP([Q, K, Q⊙K, Δp]) )
+           │
+        out = Σ(attn · V)                   ← 加权聚合
+           │
+        out = Linear(out) + Linear_res(p_i) ← 坐标残差
+           │
+        [weighted_downsample] → 下采样输出
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        k: int = 16,
-        max_chunk_size: int = 4,
+        k: int = 12,
+        downsample: bool = True,
         use_checkpoint: bool = True,
-    ) -> None:
+    ):
         super().__init__()
         self.k = k
+        self.downsample = downsample
         self.use_checkpoint = use_checkpoint
+        C_in, C_out = in_channels, out_channels
 
-        # 坐标投影: 3D → C_out，供残差连接
-        self.point_proj = nn.Sequential(
-            nn.Linear(3, out_channels),
+        # Q: 中心特征(4+C_in) → C_out
+        self.linear_q = nn.Linear(C_in + 4, C_out)
+
+        # K: 邻居特征+Δ坐标 (C_in + 4) → C_out
+        self.linear_k = nn.Linear(C_in + 4, C_out)
+
+        # V: 邻居特征+Δ特征 (C_in + C_in) → C_out
+        self.linear_v = nn.Linear(C_in * 2, C_out)
+
+        # 标量注意力权重: [Q, K, Q⊙K, Δp] (3*C_out + 4) → 1
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(C_out * 3 + 4, C_out // 2),
             nn.ReLU(inplace=True),
-            nn.Linear(out_channels, out_channels),
+            nn.Linear(C_out // 2, 1),
         )
 
-        # 层归一化
-        self.ln = nn.LayerNorm(in_channels)
+        # 输出投影
+        self.linear_out = nn.Linear(C_out, C_out)
 
-        # Flow_A: 图特征提取 (NGF → GCN)
-        self.edge_feat = EdgeFeature(in_channels, out_channels, k, max_chunk_size)
+        # 坐标投影用于残差: 4D → C_out
+        self.linear_res = nn.Linear(4, C_out)
 
-        # Flow_B: 自注意力权重
-        self.attn_proj = nn.Sequential(
-            nn.Linear(in_channels, out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-        # 融合后精炼
-        self.fuse_linear = nn.Linear(out_channels, out_channels)
+        # 归一化
+        self.ln = nn.LayerNorm(C_in)
 
         # 输出激活
         self.act = nn.ReLU(inplace=True)
 
     def _forward_impl(
         self,
-        feat: torch.Tensor,
-        xyz: torch.Tensor,
+        p: torch.Tensor,
+        f: torch.Tensor,
         knn_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        """核心前向逻辑（可被 checkpoint 包装）。"""
-        # 1. 坐标投影
-        P_proj = self.point_proj(xyz)                       # (B, N, C_out)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """核心前向逻辑。返回 (f_out, p, knn_idx) 或 (f_out, p_down, knn_idx_new)。"""
+        B, N, C_in = f.shape
+        k = knn_idx.shape[-1]
+        C_out = self.linear_out.out_features
 
-        # 2. 层归一化
-        F_norm = self.ln(feat)                              # (B, N, C_in)
+        # ── 层归一化 ──
+        f_norm = self.ln(f)  # (B, N, C_in)
 
-        # 3. Flow_A: 图特征提取 + ReLU
-        A = self.edge_feat(F_norm, knn_idx)                 # (B, N, C_out)
-        A = torch.relu(A)
+        # ── 初始化累积器 ──
+        out = f.new_zeros(B, N, C_out)
 
-        # 4. Flow_B: 自注意力权重 + Sigmoid
-        B = self.attn_proj(F_norm)                          # (B, N, C_out)
-        B = torch.sigmoid(B)
+        # ── 逐邻居聚合（轻量，无需一次性创建 (B,N,k,C) 张量）──
+        for j in range(k):
+            nbr_idx = knn_idx[:, :, j]  # (B, N)
+            batch_idx = torch.arange(B, device=f.device).view(B, 1).expand(-1, N)
 
-        # 5. 注意力融合
-        fused = A * B                                       # (B, N, C_out)
+            # 邻居坐标和特征
+            p_nbr = p[batch_idx, nbr_idx, :]   # (B, N, 4)
+            f_nbr = f_norm[batch_idx, nbr_idx, :]  # (B, N, C_in)
 
-        # 6. 特征映射
-        fused = self.fuse_linear(fused)                     # (B, N, C_out)
+            # Δ
+            dp = p_nbr - p                     # (B, N, 4)
+            df = f_nbr - f_norm                # (B, N, C_in)
 
-        # 7. 坐标残差连接
-        out = self.act(fused + P_proj)                      # (B, N, C_out)
-        return out
+            # QKV
+            Q = self.linear_q(torch.cat([f_norm, p], dim=-1))      # (B, N, C_out)
+            K = self.linear_k(torch.cat([f_nbr, dp], dim=-1))      # (B, N, C_out)
+            V = self.linear_v(torch.cat([f_nbr, df], dim=-1))      # (B, N, C_out)
+
+            # 标量注意力
+            attn_in = torch.cat([Q, K, Q * K, dp], dim=-1)        # (B, N, 3*C_out+4)
+            attn_w = self.attn_mlp(attn_in)                        # (B, N, 1)
+            attn_w = torch.sigmoid(attn_w)
+
+            # 加权累积
+            out = out + attn_w * V  # (B, N, C_out)
+
+        # ── 取平均（除 k） + 残差 ──
+        out = out / k
+        out = self.linear_out(out) + self.linear_res(p)  # 坐标残差
+        f_out = self.act(out)
+
+        # ── 下采样 ──
+        if self.downsample:
+            target_n = N // 2
+            p_down, f_out = weighted_downsample(p, f_out, target_n)
+            # 对新坐标重算 KNN
+            knn_new = knn_4d(p_down, min(self.k, target_n - 1))
+            return f_out, p_down, knn_new
+        return f_out, p, knn_idx
 
     def forward(
         self,
-        feat: torch.Tensor,
-        xyz: torch.Tensor,
+        p: torch.Tensor,
+        f: torch.Tensor,
         knn_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        """前向传播（训练时启用梯度检查点以节省显存）。
-
-        梯度检查点以 ~20% 额外计算为代价，将中间激活存储降至接近 0，
-        使 batch_size=8-16 可在 12GB 显卡上训练。
-        """
-        if self.use_checkpoint and self.training:
-            return torch.utils.checkpoint.checkpoint(
-                self._forward_impl, feat, xyz, knn_idx, use_reentrant=False
-            )
-        return self._forward_impl(feat, xyz, knn_idx)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """前向（训练时启用梯度检查点）。"""
+        if self.use_checkpoint and self.training and _HAS_CKPT:
+            return _ckpt(self._forward_impl, p, f, knn_idx, use_reentrant=False)
+        return self._forward_impl(p, f, knn_idx)
 
 
-# ═══════════════════════════════════════════════════════════
-# 外层模型: 图残差多任务网络
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# 外层多任务网络
+# ══════════════════════════════════════════════════
 
 class GraphResidualMultiTaskNet(nn.Module):
-    """基于图残差网络的多任务 SPAD 点云目标检测模型。
+    """图残差多任务网络 v3。
 
-    同时执行:
-    1. 分类: 预测点云所属类别 (logits)
-    2. 3D Box 回归: 预测轴对齐包围盒 [xmin, xmax, ymin, ymax, zmin, zmax]
-
-    通道升维: 64 → 128 → 256 → 512 → 1024
-    全局池化: MaxPool + AvgPool → 2048 维
-    双预测头: 各自独立的 3 层 MLP
+    通道: 4 → 32 → 64 → 128 → 256 → 512
+    点数: 1024 → 512 → 256 → 128 → 64
+    池化: Max+Avg → 1024 维
+    双头: cls (num_classes) + box (6)
 
     Args:
-        num_classes: 分类类别数。
-        k: KNN 近邻数量。
-        max_chunk_size: EdgeFeature 分块大小 (0=不分块)。
-        use_checkpoint: 是否使用梯度检查点。
-        dropout: 预测头 dropout 比例。
+        num_classes: 类别数。
+        k: KNN 近邻数。
+        use_checkpoint: 梯度检查点。
+        dropout: 预测头 dropout。
     """
 
     def __init__(
         self,
         num_classes: int = 26,
-        k: int = 16,
-        max_chunk_size: int = 4,
+        k: int = 12,
         use_checkpoint: bool = True,
-        dropout: float = 0.5,
-    ) -> None:
+        dropout: float = 0.3,
+    ):
         super().__init__()
         self.k = k
 
-        # 初始特征嵌入: (B, N, 4) → (B, N, 64)
+        # Stem: (B,N,4) → (B,N,32)
         self.stem = nn.Sequential(
-            nn.Linear(4, 64),
+            nn.Linear(4, 32),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
+            nn.Linear(32, 32),
         )
 
-        # 图残差模块堆叠: 64 → 128 → 256 → 512 → 1024
-        block_cfg = dict(
-            k=k, max_chunk_size=max_chunk_size, use_checkpoint=use_checkpoint
-        )
-        self.block1 = GraphResidualBlock(64, 128, **block_cfg)
-        self.block2 = GraphResidualBlock(128, 256, **block_cfg)
-        self.block3 = GraphResidualBlock(256, 512, **block_cfg)
-        self.block4 = GraphResidualBlock(512, 1024, **block_cfg)
+        # 4 层图残差，每层减半
+        block_cfg = dict(k=k, use_checkpoint=use_checkpoint)
+        self.block1 = GraphResidualBlock(32, 64, downsample=True, **block_cfg)
+        self.block2 = GraphResidualBlock(64, 128, downsample=True, **block_cfg)
+        self.block3 = GraphResidualBlock(128, 256, downsample=True, **block_cfg)
+        self.block4 = GraphResidualBlock(256, 512, downsample=True, **block_cfg)
 
-        # 全局池化后维度: 1024 + 1024 = 2048
-        pooled_dim = 2048
+        pooled_dim = 1024  # 512 * 2
 
-        # 分类预测头
+        # 分类头
         self.cls_head = nn.Sequential(
-            nn.Linear(pooled_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
+            nn.Linear(pooled_dim, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(256, num_classes),
         )
 
-        # 3D Box 回归预测头
+        # Box 头
         self.box_head = nn.Sequential(
-            nn.Linear(pooled_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
+            nn.Linear(pooled_dim, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
@@ -378,65 +305,54 @@ class GraphResidualMultiTaskNet(nn.Module):
         )
 
     def forward(self, points: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """模型前向传播。
-
-        兼容 utils/loss.py split_cls_and_box_predictions 字典解析:
-        - logits 通过 key 'logits'
-        - box_pred 通过 key 'box_pred'
+        """前向传播。
 
         Args:
-            points: 输入点云，形状 (B, N, 4)，通道 x, y, z, intensity。
+            points: (B, N, 4) — x, y, z, intensity。
 
         Returns:
-            dict: {'logits': (B, num_classes), 'box_pred': (B, 6)}
+            {'logits': (B, num_classes), 'box_pred': (B, 6)}
         """
         B, N, _ = points.shape
 
-        # 分离坐标
-        xyz = points[:, :, :3]  # (B, N, 3)
+        # ── 初始化 ──
+        p = points.clone()                         # (B, N, 4) 坐标+强度
+        f = self.stem(points)                      # (B, N, 32) 初始特征
+        knn_idx = knn_4d(p, min(self.k, N - 1))    # (B, N, k)
 
-        # 初始特征嵌入
-        feat = self.stem(points)  # (B, N, 64)
+        # ── 4 层图残差 ──
+        f, p, knn_idx = self.block1(p, f, knn_idx)  # 1024→512,  32→64
+        f, p, knn_idx = self.block2(p, f, knn_idx)  # 512→256,   64→128
+        f, p, knn_idx = self.block3(p, f, knn_idx)  # 256→128,  128→256
+        f, p, knn_idx = self.block4(p, f, knn_idx)  # 128→64,   256→512
 
-        # 预计算 KNN 图（所有块复用）
-        knn_idx = get_knn_indices(xyz, self.k)  # (B, N, k)
+        # ── 全局池化 ──
+        f_max = f.max(dim=1)[0]    # (B, 512)
+        f_avg = f.mean(dim=1)      # (B, 512)
+        f_pooled = torch.cat([f_max, f_avg], dim=1)  # (B, 1024)
 
-        # 堆叠图残差模块
-        feat = self.block1(feat, xyz, knn_idx)  # (B, N, 128)
-        feat = self.block2(feat, xyz, knn_idx)  # (B, N, 256)
-        feat = self.block3(feat, xyz, knn_idx)  # (B, N, 512)
-        feat = self.block4(feat, xyz, knn_idx)  # (B, N, 1024)
+        # ── 双头 ──
+        logits = self.cls_head(f_pooled)
+        box_preds = self.box_head(f_pooled)
 
-        # 全局池化: Max + Avg
-        feat_max = feat.max(dim=1)[0]   # (B, 1024)
-        feat_avg = feat.mean(dim=1)     # (B, 1024)
-        feat_pooled = torch.cat([feat_max, feat_avg], dim=1)  # (B, 2048)
-
-        # 双头预测
-        logits = self.cls_head(feat_pooled)     # (B, num_classes)
-        box_preds = self.box_head(feat_pooled)  # (B, 6)
-
-        return {"logits": logits, "box_pred": box_preds}
+        return {'logits': logits, 'box_pred': box_preds}
 
 
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 # 快速验证
-# ═══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    print("=== GraphResidualMultiTaskNet 快速验证 ===\n")
+if __name__ == '__main__':
+    os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+    print("=== GraphResidualMultiTaskNet v3 验证 ===\n")
 
     B, N = 2, 1024
     dummy = torch.randn(B, N, 4)
 
-    # 默认配置 (显存优化)
-    model = GraphResidualMultiTaskNet(
-        num_classes=26, k=16, max_chunk_size=4, use_checkpoint=True
-    )
+    model = GraphResidualMultiTaskNet(num_classes=26, k=12, use_checkpoint=False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"参数量: {n_params / 1e6:.2f} M")
 
-    # 前向传播
     model.eval()
     with torch.no_grad():
         out = model(dummy)
@@ -444,21 +360,62 @@ if __name__ == "__main__":
     print(f"输入:   {dummy.shape}")
     print(f"logits: {out['logits'].shape}")
     print(f"box:    {out['box_pred'].shape}")
-    assert out["logits"].shape == (B, 26)
-    assert out["box_pred"].shape == (B, 6)
+    assert out['logits'].shape == (B, 26)
+    assert out['box_pred'].shape == (B, 6)
 
     # 通道验证
     for i, block in enumerate([model.block1, model.block2, model.block3, model.block4], 1):
-        c_in = block.edge_feat.mlp[0].in_features // 2
-        c_out = block.edge_feat.mlp[-1].out_features
-        print(f"  block{i}: {c_in} → {c_out}")
+        c_in = block.linear_q.in_features - 4
+        c_out = block.linear_out.out_features
+        ds = 'Y' if block.downsample else 'N'
+        print(f"  block{i}: C_in={c_in:3d} C_out={c_out:3d} downsample={ds}")
 
-    # 兼容性验证
+    # 兼容性
     import sys
     sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]))
     from utils.loss import split_cls_and_box_predictions
     l, b = split_cls_and_box_predictions(out)
     assert l is not None and b is not None
-    assert torch.equal(l, out["logits"])
-    assert torch.equal(b, out["box_pred"])
-    print("\n全部验证通过! split_cls_and_box_predictions 兼容 OK")
+
+    print("\n全部通过!")
+
+    # ══════════════════════════════════════════════
+    # GPU 显存测试
+    # ══════════════════════════════════════════════
+    print("\n=== GPU 显存测试 ===")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        try:
+            props = torch.cuda.get_device_properties(0)
+            if hasattr(props, 'total_memory'):
+                total_gb = props.total_memory / 1024**3
+            elif hasattr(props, 'total_mem'):
+                total_gb = props.total_mem / 1024**3
+            else:
+                total_gb = 0.0
+            if total_gb > 0:
+                print(f"总显存: {total_gb:.1f} GB")
+        except Exception:
+            pass
+        print()
+
+        for bs in [4, 8, 16, 32]:
+            try:
+                m = GraphResidualMultiTaskNet(num_classes=26, k=12, use_checkpoint=True).cuda()
+                pts = torch.randn(bs, N, 4).cuda()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                m.train()
+                o = m(pts)
+                loss = o['logits'].sum() + o['box_pred'].sum()
+                loss.backward()
+                peak = torch.cuda.max_memory_allocated() / 1024**2
+                print(f"  B={bs:2d}: peak {peak:6.0f} MB")
+                del m, pts, o, loss
+                torch.cuda.empty_cache()
+            except torch.cuda.OutOfMemoryError:
+                print(f"  B={bs:2d}: OOM!")
+                torch.cuda.empty_cache()
+                break
+    else:
+        print("无 CUDA，跳过。")

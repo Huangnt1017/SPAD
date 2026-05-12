@@ -1,0 +1,17 @@
+# Python 字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# SPAD 项目缓存
+.split_cache.json
+
+# IDE
+.idea/
+.vscode/
+
+# Checkpoints (太大)
+checkpoints/*.pth
+
+# 日志
+logs/*.log
