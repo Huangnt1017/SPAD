@@ -64,6 +64,8 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		return "pointnet2"
 	if "pointmlp" in name:
 		return "pointmlp"
+	if "pointnext" in name or "pointnxt" in name:
+		return "pointnext"
 	if "3detr" in name:
 		return "3detr"
 	if "dct" in name:
@@ -634,7 +636,13 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification evaluation")
 	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
 	parser.add_argument("--checkpoint", type=str, default=r"D:\PYproject\SPAD\checkpoints\dgcnn_20260426_183404_669391_best.pth", help="Path to trained checkpoint")
-	parser.add_argument("--model", type=str, default="auto", choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "3detr", "dct"], help="Backbone model")
+	parser.add_argument(
+		"--model",
+		type=str,
+		default="auto",
+		choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "pointnext", "3detr", "dct"],
+		help="Backbone model",
+	)
 	parser.add_argument("--batch-size", type=int, default=16)
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
 	parser.add_argument("--train-ratio", type=float, default=0.6)

@@ -117,7 +117,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointmlp/3detr/dct。
+		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointmlp/pointnext/3detr/dct。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -146,6 +146,10 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "pointmlp":
 		module = load_module_from_file(baseline_dir / "PointMLP.py", "baseline_pointmlp")
 		return module.PointMLPClassification(num_classes=num_classes)
+
+	if name == "pointnext":
+		module = load_module_from_file(baseline_dir / "PointNeXt.py", "baseline_pointnext")
+		return module.PointNeXtClassification(num_classes=num_classes)
 
 	if name == "3detr":
 		module = load_module_from_file(baseline_dir / "3DETR.py", "baseline_3detr")
@@ -603,7 +607,13 @@ def build_parser() -> argparse.ArgumentParser:
 	# 命令行参数覆盖数据路径、训练超参、损失权重和增强开关，便于不同实验复用同一脚本。
 	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification training")
 	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
-	parser.add_argument("--model", type=str, default="dgcnn", choices=["dgcnn", "pointnet2", "pointtransformer", "pointmlp", "3detr", "dct"], help="Backbone model")
+	parser.add_argument(
+		"--model",
+		type=str,
+		default="dgcnn",
+		choices=["dgcnn", "pointnet2", "pointtransformer", "pointmlp", "pointnext", "3detr", "dct"],
+		help="Backbone model",
+	)
 	parser.add_argument("--epochs", type=int, default=80)
 	parser.add_argument("--batch-size", type=int, default=16)
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
