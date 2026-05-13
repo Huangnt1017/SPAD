@@ -64,6 +64,8 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		return "pointnet2"
 	if "pointmlp" in name:
 		return "pointmlp"
+	if "spt" in name:
+		return "spt"
 	if "pointnext" in name or "pointnxt" in name:
 		return "pointnext"
 	if "3detr" in name:
@@ -642,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
 		"--model",
 		type=str,
 		default="auto",
-		choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "pointnext", "tnpc", "3detr", "dct"],
+		choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "spt", "pointnext", "tnpc", "3detr", "dct"],
 		help="Backbone model",
 	)
 	parser.add_argument("--batch-size", type=int, default=16)

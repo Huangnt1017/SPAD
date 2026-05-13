@@ -148,6 +148,24 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 		module = load_module_from_file(baseline_dir / "PointMLP.py", "baseline_pointmlp")
 		return module.PointMLPClassification(num_classes=num_classes)
 
+	if name == "spt":
+		module = load_module_from_file(baseline_dir / "SPT.py", "baseline_spt")
+		import types
+		cfg = types.SimpleNamespace()
+		cfg.num_point = 1024
+		cfg.model = types.SimpleNamespace()
+		cfg.model.nblocks = 3
+		cfg.model.nneighbor = 16
+		cfg.model.blocks = [1, 1, 1, 1]
+		cfg.model.num_samples = 256
+		cfg.model.spike_mode = 'lif'
+		cfg.model.timestep = 4
+		cfg.model.use_encoder = False
+		cfg.model.transformer_dim = 64
+		cfg.input_dim = 4
+		cfg.num_classes = num_classes
+		return module.SPTNet(cfg)
+
 	if name == "pointnext":
 		module = load_module_from_file(baseline_dir / "PointNeXt.py", "baseline_pointnext")
 		return module.PointNeXtClassification(num_classes=num_classes)
@@ -582,6 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"pointnet2",
 			"pointtransformer",
 			"pointmlp",
+			"spt",
 			"pointnext",
 			"tnpc",
 			"3detr",
