@@ -298,12 +298,54 @@ class PointNeXtClassification(nn.Module):
 
 
 def _quick_shape_test() -> None:
+    """快速形状验证 + GPU 显存压力测试。"""
+    import gc
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = PointNeXtClassification(num_classes=26, k=16).to(device)
     pts = torch.randn(2, 1024, 4, device=device)
     logits, box_pred = model(pts)
     print("PointNeXt logits:", logits.shape)
     print("PointNeXt box_pred:", box_pred.shape)
+
+    # ══════════════════════════════════════════════
+    # GPU 显存测试
+    # ══════════════════════════════════════════════
+    print("\n=== GPU 显存测试 ===")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        try:
+            props = torch.cuda.get_device_properties(0)
+            total_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+            if total_mem:
+                print(f"总显存: {total_mem / 1024**3:.1f} GB")
+        except Exception:
+            pass
+        print()
+
+        N = 1024
+        for bs in [4, 8, 16, 32]:
+            try:
+                m = PointNeXtClassification(num_classes=26, k=16).cuda()
+                pts = torch.randn(bs, N, 4).cuda()
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.reset_peak_memory_stats()
+                m.train()
+                o = m(pts)
+                loss = o[0].sum() + o[1].sum()
+                loss.backward()
+                peak = torch.cuda.max_memory_allocated() / 1024**2
+                print(f"  B={bs:2d}: peak {peak:6.0f} MB")
+                del m, pts, o, loss
+                torch.cuda.empty_cache()
+                gc.collect()
+            except torch.cuda.OutOfMemoryError:
+                print(f"  B={bs:2d}: OOM!")
+                torch.cuda.empty_cache()
+                gc.collect()
+                break
+    else:
+        print("无 CUDA，跳过。")
 
 
 if __name__ == "__main__":

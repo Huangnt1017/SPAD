@@ -63,6 +63,14 @@ Use this skill for repeatable 3D point cloud work across the SPAD project, espec
 5. Connect the training loop with a loss function and metrics that match the labels.
 6. Run a short training pass to catch shape, dtype, or convergence issues.
 7. Review outputs, confusion patterns, and segmentation masks or predicted classes.
+8. **GPU 显存测试 (逐 batch size 扫查)**: 在每个模型的 `if __name__ == "__main__":` 中加入统一显存测试:
+   - 打印 GPU 型号和总显存
+   - 循环遍历 batch size [4, 8, 16, 32]
+   - 每次迭代: 创建模型 → `.cuda()` → 随机输入 → `reset_peak_memory_stats()` → 前向 + 反向 → 打印峰值显存 → `del` 清理 → `empty_cache()` + `gc.collect()`
+   - 捕获 `torch.cuda.OutOfMemoryError` 并在 OOM 时 break
+   - 对于返回 `(logits, box_pred)` 元组的模型: `loss = o[0].sum() + o[1].sum()`
+   - 对于返回 `{"logits": ..., "box_pred": ...}` 字典的模型: `loss = o['logits'].sum() + o['box_pred'].sum()`
+   - 输出格式示例: `  B= 4: peak    154 MB`
 
 ## Review Checklist
 1. Public functions include docstrings with Args, Returns, and Raises.
@@ -73,6 +81,7 @@ Use this skill for repeatable 3D point cloud work across the SPAD project, espec
 6. Top-k, IoU, and AP metrics handle edge cases (small class counts, empty subsets, invalid boxes).
 7. Logging/reporting exposes enough context to debug failed samples or skipped evaluations.
 8. A short sanity run completes without shape, dtype, or device errors.
+9. **GPU 显存测试已包含**: 验证脚本在关键步骤后输出 allocated / reserved 显存，峰值显存合理且无泄漏趋势。
 
 ## Rapid Defect Identification Protocol (for files >200 lines)
 Use this protocol when you need to **quickly locate defects** in a long pipeline script without reading it line by line. It is especially effective for debugging data loaders, augmentation chains, training loops, or evaluation code.
@@ -131,6 +140,7 @@ If the issue is still unresolved, ask whether you should scan another candidate 
 - training scripts and evaluation loops
 - classification and segmentation model wiring
 - debugging notes for point cloud shape and label alignment issues
+- **GPU 显存分析报告** — 每次模型验证包含 allocated/reserved/peak 显存追踪
 
 ## References
 - See the repo utilities and data readers for existing point cloud conversion and training patterns.

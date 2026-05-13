@@ -1,319 +1,516 @@
+"""
+Point Transformer V1 for Object Classification + 3D BBox
+
+Pointcept 官方实现复现 (Xiaoyang Wu)
+- 5 阶段编码器 + 全局池化 + 分类/框回归头
+- 使用 PointTransformerLayer (向量注意力) + TransitionDown (FPS+kNN) + Bottleneck
+- 输入: (B, N, 4) xyzi → 输出: (logits [B, C], box_pred [B, 6])
+
+Reference:
+@inproceedings{zhao2021point,
+  title={Point transformer},
+  author={Zhao, Hengshuang and Jiang, Li and Jia, Jiaya and Torr, Philip HS and Koltun, Vladlen},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={16259--16268},
+  year={2021}
+}
+"""
+
+import os
+import sys
+# 确保项目根目录在 path 中, 以便 import utils
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+from utils.pointcept_utils import (
+    LayerNorm1d, farthest_point_sample, index_points, knn_point, square_distance
+)
 
 
-def square_distance(src, dst):
+# ============================================================================
+# Point Transformer Layer (ICCV 2021 向量注意力)
+# ============================================================================
+
+class PointTransformerLayer(nn.Module):
     """
-    src: [B, N, 3]
-    dst: [B, M, 3]
-    return: [B, N, M]
+    Point Transformer 层:
+    x'_i = sum_j softmax(gamma(phi(x_i)-psi(x_j)+delta_ij)) * (alpha(x_j)+delta_ij)
+
+    遵循 Pointcept 官方实现:
+    - in_planes, out_planes, share_planes=8, nsample=16
+    - 3D 位置编码 (仅 xyz)
     """
-    return torch.sum((src[:, :, None] - dst[:, None]) ** 2, dim=-1)
+    def __init__(self, in_planes, out_planes, share_planes=8, nsample=16):
+        super().__init__()
+        self.mid_planes = mid_planes = out_planes // 1
+        self.out_planes = out_planes
+        self.share_planes = share_planes
+        self.nsample = nsample
+
+        self.linear_q = nn.Linear(in_planes, mid_planes)
+        self.linear_k = nn.Linear(in_planes, mid_planes)
+        self.linear_v = nn.Linear(in_planes, out_planes)
+        self.linear_p = nn.Sequential(
+            nn.Linear(3, 3),
+            LayerNorm1d(3),
+            nn.ReLU(inplace=True),
+            nn.Linear(3, out_planes),
+        )
+        self.linear_w = nn.Sequential(
+            LayerNorm1d(mid_planes),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid_planes, out_planes // share_planes),
+            LayerNorm1d(out_planes // share_planes),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_planes // share_planes, out_planes // share_planes),
+        )
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, pxo):
+        """
+        Args:
+            pxo: [p, x, o] = [(N, 3), (N, C), (B,)]
+            变长点云格式: N = 总点数, B = batch size
+        Returns:
+            x: (N, C) 更新后的特征
+        """
+        p, x, o = pxo  # (N, 3), (N, C), (B,)
+        x_q, x_k, x_v = self.linear_q(x), self.linear_k(x), self.linear_v(x)
+
+        # kNN 搜索并在自身位置上分组
+        idx = knn_point_batched(self.nsample, p, o, p, o)
+        x_k_grouped = group_points(x_k, idx)       # (N, nsample, C')
+        x_v_grouped = group_points(x_v, idx)       # (N, nsample, C_out)
+
+        # 相对位置编码 (3D xyz)
+        p_grouped = group_points(p, idx)            # (N, nsample, 3)
+        p_r = p_grouped - p.unsqueeze(1)            # 相对位置
+        p_r = self.linear_p(p_r)                     # (N, nsample, C_out)
+
+        # 注意力权重
+        r_qk = x_k_grouped - x_q.unsqueeze(1) + einops_reduce_sum(
+            p_r, self.mid_planes
+        )  # (N, nsample, C')
+        w = self.linear_w(r_qk)                     # (N, nsample, C_out//share)
+        w = self.softmax(w)                         # 在 nsample 维度上 softmax
+
+        # 加权聚合 (分组向量注意力)
+        x_v_plus_p = x_v_grouped + p_r              # (N, nsample, C_out)
+        x_v_plus_p = x_v_plus_p.reshape(
+            -1, self.nsample, self.share_planes, self.out_planes // self.share_planes
+        )  # (N, nsample, share, C'//share)
+        w = w.unsqueeze(-1)                         # (N, nsample, C'//share, 1)
+        x = torch.sum(x_v_plus_p * w, dim=1)        # (N, share, C'//share)
+        x = x.reshape(-1, self.out_planes)          # (N, C_out)
+        return x
 
 
-def index_points(points, idx):
+def einops_reduce_sum(x, mid_planes):
+    """替代 einops.reduce(x, 'n ns (i j) -> n ns j', reduction='sum', j=mid_planes)"""
+    N, nsample, C = x.shape
+    assert C % mid_planes == 0
+    x = x.reshape(N, nsample, C // mid_planes, mid_planes)
+    return x.sum(dim=2)
+
+
+def knn_point_batched(k, xyz, offset, new_xyz, new_offset):
     """
-    points: [B, N, C]
-    idx: [B, N, K] or [B, S]
-    return: [B, N, K, C] or [B, S, C]
+    变长点云上的 kNN 搜索。
+    xyz: (N, 3), offset: (B,)
+    new_xyz: (M, 3), new_offset: (B,)
+    Returns: idx (M, k)
     """
-    device = points.device
-    B = points.shape[0]
-
-    view_shape = list(idx.shape)
-    view_shape[1:] = [1] * (len(view_shape) - 1)
-
-    repeat_shape = list(idx.shape)
-    repeat_shape[0] = 1
-
-    batch_idx = torch.arange(B, device=device).view(view_shape).repeat(repeat_shape)
-    return points[batch_idx, idx, :]
-
-
-def knn_point(k, xyz, new_xyz):
-    """
-    xyz: [B, N, 3]
-    new_xyz: [B, S, 3]
-    return idx: [B, S, k]
-    """
-    dist = square_distance(new_xyz, xyz)  # [B, S, N]
-    idx = dist.topk(k=k, dim=-1, largest=False)[1]
+    device = xyz.device
+    M = new_xyz.shape[0]
+    idx = torch.zeros(M, k, dtype=torch.long, device=device)
+    for i in range(len(offset)):
+        s_i = 0 if i == 0 else offset[i - 1].item()
+        e_i = offset[i].item()
+        s_new = 0 if i == 0 else new_offset[i - 1].item()
+        e_new = new_offset[i].item()
+        if e_i - s_i <= 0 or e_new - s_new <= 0:
+            continue
+        # 计算距离
+        dist = torch.cdist(new_xyz[s_new:e_new], xyz[s_i:e_i])  # (n_new, n)
+        # 取 k 个最近邻
+        if k > dist.shape[1]:
+            k_actual = dist.shape[1]
+            topk_idx = dist.topk(k=k_actual, dim=-1, largest=False)[1]
+            # pad
+            pad = topk_idx[:, :1].repeat(1, k - k_actual)
+            idx[s_new:e_new] = torch.cat([topk_idx, pad], dim=1) + s_i
+        else:
+            idx[s_new:e_new] = dist.topk(k=k, dim=-1, largest=False)[1] + s_i
     return idx
 
+
+def group_points(feat, idx):
+    """
+    根据索引分组特征。
+    feat: (N, C), idx: (N, K)
+    Returns: (N, K, C)
+    """
+    N, K = idx.shape
+    C = feat.shape[1]
+    # flatten idx: (N*K) → gather along dim=0 → reshape back
+    idx_flat = idx.reshape(-1)  # (N*K,)
+    idx_flat = idx_flat.unsqueeze(-1).expand(-1, C)  # (N*K, C)
+    grouped = feat.gather(0, idx_flat)  # (N*K, C)
+    return grouped.reshape(N, K, C)
+
+
+# ============================================================================
+# Transition Down (FPS + kNN 分组 + MLP + 最大池化)
+# ============================================================================
 
 class TransitionDown(nn.Module):
     """
     Point Transformer 下采样模块:
-    FPS + kNN 分组 + 局部最大池化（PointNet 风格）
-    - FPS 和 kNN 仅在 xyz 坐标（前3维）上进行，保持几何合理性
-    - 相对位置编码使用完整 4 维（dxyz + dintensity），让强度参与空间-特征融合
+    - FPS 采样关键点
+    - kNN 分组邻居
+    - MLP + 最大池化
     """
-    def __init__(self, in_channels, out_channels, npoint, k=16):
+    def __init__(self, in_planes, out_planes, stride=1, nsample=16):
         super().__init__()
-        self.npoint = npoint
-        self.k = k
-        # in_channels + 4: 特征通道 + 相对位置(dx,dy,dz,dintensity)
-        self.mlp = nn.Sequential(
-            nn.Conv2d(in_channels + 4, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    @staticmethod
-    def farthest_point_sample(xyz, npoint):
-        device = xyz.device
-        B, N, _ = xyz.shape
-        centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
-        distance = torch.full((B, N), 1e10, device=device)
-        farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
-        batch_idx = torch.arange(B, dtype=torch.long, device=device)
-
-        for i in range(npoint):
-            centroids[:, i] = farthest
-            centroid = xyz[batch_idx, farthest, :].view(B, 1, 3)
-            dist = torch.sum((xyz - centroid) ** 2, dim=-1)
-            mask = dist < distance
-            distance[mask] = dist[mask]
-            farthest = torch.max(distance, dim=-1)[1]
-        return centroids
-
-    def forward(self, xyz_full, feat):
-        """
-        Args:
-            xyz_full: [B, N, 4] — 完整 xyzi 点云（xyz + intensity）
-            feat:     [B, N, C] — 点特征
-        Returns:
-            new_xyz_full: [B, S, 4] — 下采样后的 xyzi 点
-            new_feat:     [B, S, C_out] — 下采样后的特征
-        """
-        # 仅用 xyz 坐标（前3维）做 FPS 和 kNN，保证几何合理性
-        xyz = xyz_full[:, :, :3].contiguous()               # [B, N, 3]
-
-        fps_idx = self.farthest_point_sample(xyz, self.npoint)  # [B, S]
-        new_xyz_full = index_points(xyz_full, fps_idx)          # [B, S, 4] — 完整 xyzi
-        new_xyz = new_xyz_full[:, :, :3]                        # [B, S, 3] — 仅用于 kNN
-
-        idx = knn_point(self.k, xyz, new_xyz)                   # [B, S, K]
-        grouped_xyz_full = index_points(xyz_full, idx)          # [B, S, K, 4] — 完整 xyzi
-        grouped_feat = index_points(feat, idx)                  # [B, S, K, C]
-
-        # 4 维相对位置: dxyz + dintensity，让强度参与局部几何编码
-        rel_xyz_full = grouped_xyz_full - new_xyz_full.unsqueeze(2)  # [B, S, K, 4]
-        x = torch.cat([grouped_feat, rel_xyz_full], dim=-1)          # [B, S, K, C+4]
-        x = x.permute(0, 3, 2, 1).contiguous()                       # [B, C+4, K, S]
-        x = self.mlp(x)
-        x = torch.max(x, dim=2)[0]                                   # [B, C_out, S]
-        new_feat = x.transpose(1, 2).contiguous()                    # [B, S, C_out]
-        return new_xyz_full, new_feat
-
-
-class PointTransformerLayer(nn.Module):
-    """
-    Point Transformer 层 (ICCV 2021):
-    x'_i = sum_j softmax(gamma(phi(x_i)-psi(x_j)+delta_ij)) * (alpha(x_j)+delta_ij)
-    - kNN 仅在 xyz 坐标上进行（保留原文几何定义）
-    - 位置编码 delta 使用 4 维相对特征（dxyz + dintensity），让强度参与注意力计算
-    """
-    def __init__(self, channels, k=16):
-        super().__init__()
-        self.k = k
-        self.channels = channels
-        self.mid = channels
-
-        self.to_q = nn.Linear(channels, self.mid, bias=False)
-        self.to_k = nn.Linear(channels, self.mid, bias=False)
-        self.to_v = nn.Linear(channels, self.mid, bias=False)
-
-        # 位置编码: 4 维相对特征 (dx, dy, dz, dintensity) → 通道维
-        self.pos_mlp = nn.Sequential(
-            nn.Linear(4, channels),
-            nn.BatchNorm1d(channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels, channels),
-        )
-
-        self.attn_mlp = nn.Sequential(
-            nn.Linear(channels, channels),
-            nn.BatchNorm1d(channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels, channels),
-        )
-
-        self.out_linear = nn.Linear(channels, channels, bias=False)
-
-    def forward(self, xyz_full, feat):
-        """
-        Args:
-            xyz_full: [B, N, 4] — 完整 xyzi 点云
-            feat:     [B, N, C] — 点特征
-        Returns:
-            [B, N, C] — 更新后的点特征
-        """
-        B, N, C = feat.shape
-        # 仅用 xyz 坐标（前3维）做 kNN 近邻搜索
-        xyz = xyz_full[:, :, :3].contiguous()               # [B, N, 3]
-        idx = knn_point(self.k, xyz, xyz)                   # [B, N, k]
-        neighbor_xyz_full = index_points(xyz_full, idx)      # [B, N, k, 4] — 完整 xyzi
-        neighbor_feat = index_points(feat, idx)              # [B, N, k, C]
-
-        q = self.to_q(feat).unsqueeze(2)                     # [B, N, 1, C]
-        k = self.to_k(neighbor_feat)                         # [B, N, k, C]
-        v = self.to_v(neighbor_feat)                         # [B, N, k, C]
-
-        # 4 维相对位置编码: dxyz + dintensity
-        rel_pos_full = neighbor_xyz_full - xyz_full.unsqueeze(2)  # [B, N, k, 4]
-        pos = self.pos_mlp(rel_pos_full.reshape(B * N * self.k, 4)).reshape(B, N, self.k, C)
-
-        attn = q - k + pos                                   # [B, N, k, C]
-        attn = self.attn_mlp(attn.reshape(B * N * self.k, C)).reshape(B, N, self.k, C)
-        attn = F.softmax(attn, dim=2)                        # 向量注意力在近邻维度上
-
-        out = torch.sum(attn * (v + pos), dim=2)             # [B, N, C]
-        out = self.out_linear(out)
-        return out
-
-
-class PTBlock(nn.Module):
-    def __init__(self, channels, k=16):
-        super().__init__()
-        self.fc1 = nn.Sequential(
-            nn.Linear(channels, channels, bias=False),
-            nn.BatchNorm1d(channels),
-            nn.ReLU(inplace=True),
-        )
-        self.pt = PointTransformerLayer(channels, k=k)
-        self.fc2 = nn.Sequential(
-            nn.Linear(channels, channels, bias=False),
-            nn.BatchNorm1d(channels),
-        )
+        self.stride, self.nsample = stride, nsample
+        if stride != 1:
+            # 下采样: 需要 FPS + kNN 分组
+            self.linear = nn.Linear(3 + in_planes, out_planes, bias=False)
+            self.pool = nn.MaxPool1d(nsample)
+        else:
+            self.linear = nn.Linear(in_planes, out_planes, bias=False)
+        self.bn = nn.BatchNorm1d(out_planes)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, xyz_full, feat):
+    def forward(self, pxo):
         """
         Args:
-            xyz_full: [B, N, 4] — 完整 xyzi 点云
-            feat:     [B, N, C] — 点特征
+            pxo: [p, x, o] = [(N, 3), (N, C), (B,)]
         Returns:
-            [B, N, C] — 残差连接后的特征
+            [p_new, x_new, o_new]
         """
-        B, N, C = feat.shape
-        x = self.fc1(feat.reshape(B * N, C)).reshape(B, N, C)
-        x = self.pt(xyz_full, x)
-        x = self.fc2(x.reshape(B * N, C)).reshape(B, N, C)
-        return self.relu(x + feat)
+        p, x, o = pxo  # (N, 3), (N, C), (B,)
+        if self.stride != 1:
+            # 计算新的 offset (每个样本下采样到 N/stride)
+            n_o_list = []
+            for i in range(len(o)):
+                if i == 0:
+                    n_points = o[0].item() // self.stride
+                else:
+                    n_points = (o[i].item() - o[i - 1].item()) // self.stride
+                n_points = max(n_points, 1)  # 至少保留 1 个点
+                prev = 0 if i == 0 else n_o_list[-1]
+                n_o_list.append(prev + n_points)
+            n_o = torch.tensor(n_o_list, dtype=torch.long, device=o.device)
+
+            # FPS 采样
+            fps_idx_list = []
+            for i in range(len(o)):
+                s_i = 0 if i == 0 else o[i - 1].item()
+                e_i = o[i].item()
+                s_new = 0 if i == 0 else n_o[i - 1].item()
+                e_new = n_o[i].item()
+                npoint = e_new - s_new
+                if npoint <= 0 or e_i - s_i <= 0:
+                    continue
+                batch_xyz = p[s_i:e_i].unsqueeze(0)  # (1, N, 3)
+                fps_idx = farthest_point_sample(batch_xyz, npoint)
+                fps_idx_list.append(fps_idx[0] + s_i)
+
+            if len(fps_idx_list) > 0:
+                all_fps_idx = torch.cat(fps_idx_list)
+            else:
+                all_fps_idx = torch.arange(0, dtype=torch.long, device=o.device)
+
+            n_p = p[all_fps_idx.long(), :]  # (M, 3)
+
+            # kNN 分组
+            idx = knn_point_batched(self.nsample, p, o, n_p, n_o)
+            # 分组特征: concat(xyz, feat)
+            x_cat = torch.cat([p, x], dim=-1)  # (N, 3+C)
+            grouped = group_points(x_cat, idx)  # (M, nsample, 3+C)
+            x = self.relu(
+                self.bn(self.linear(grouped).transpose(1, 2).contiguous())
+            )  # (M, C_out, nsample)
+            x = self.pool(x).squeeze(-1)  # (M, C_out)
+            p, o = n_p, n_o
+        else:
+            x = self.relu(self.bn(self.linear(x)))  # (N, C)
+        return [p, x, o]
 
 
-class PointTransformerClassification(nn.Module):
-    def __init__(self, num_classes=26, k=16):
+# ============================================================================
+# Bottleneck (Point Transformer 残差块)
+# ============================================================================
+
+class Bottleneck(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, share_planes=8, nsample=16):
+        super(Bottleneck, self).__init__()
+        self.linear1 = nn.Linear(in_planes, planes, bias=False)
+        self.bn1 = nn.BatchNorm1d(planes)
+        self.transformer = PointTransformerLayer(planes, planes, share_planes, nsample)
+        self.bn2 = nn.BatchNorm1d(planes)
+        self.linear3 = nn.Linear(planes, planes * self.expansion, bias=False)
+        self.bn3 = nn.BatchNorm1d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, pxo):
+        p, x, o = pxo  # (N, 3), (N, C), (B,)
+        identity = x
+        x = self.relu(self.bn1(self.linear1(x)))
+        x = self.relu(self.bn2(self.transformer([p, x, o])))
+        x = self.bn3(self.linear3(x))
+        x += identity
+        x = self.relu(x)
+        return [p, x, o]
+
+
+# ============================================================================
+# Point Transformer Classification + BBox
+# ============================================================================
+
+class PointTransformerCls(nn.Module):
+    """
+    Point Transformer V1 分类模型 (Pointcept 架构)
+
+    5 阶段编码器:
+    - stride = [1, 4, 4, 4, 4] → 下采样率: 1x, 4x, 16x, 64x, 256x
+    - nsample = [8, 16, 16, 16, 16]
+    - planes = [32, 64, 128, 256, 512]
+
+    输入格式: 使用 data_dict {"coord": (N,3), "feat": (N,C), "offset": (B,)}
+    输出: 分类 logits + 3D bbox 预测
+    """
+    def __init__(self, block, blocks, in_channels=6, num_classes=40, box_dim=6):
         super().__init__()
-        self.k = k
+        self.in_channels = in_channels
+        self.in_planes = in_channels
+        planes = [32, 64, 128, 256, 512]
+        share_planes = 8
+        stride = [1, 4, 4, 4, 4]
+        nsample = [8, 16, 16, 16, 16]
 
-        self.stem = nn.Sequential(
-            nn.Linear(4, 32, bias=False),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-        )
-
-        self.block1 = PTBlock(32, k)
-        self.td1 = TransitionDown(32, 64, npoint=512, k=k)
-        self.block2 = PTBlock(64, k)
-        self.td2 = TransitionDown(64, 128, npoint=128, k=k)
-        self.block3 = PTBlock(128, k)
-        self.td3 = TransitionDown(128, 256, npoint=32, k=k)
-        self.block4 = PTBlock(256, k)
+        self.enc1 = self._make_enc(block, planes[0], blocks[0], share_planes,
+                                    stride=stride[0], nsample=nsample[0])  # N/1
+        self.enc2 = self._make_enc(block, planes[1], blocks[1], share_planes,
+                                    stride=stride[1], nsample=nsample[1])  # N/4
+        self.enc3 = self._make_enc(block, planes[2], blocks[2], share_planes,
+                                    stride=stride[2], nsample=nsample[2])  # N/16
+        self.enc4 = self._make_enc(block, planes[3], blocks[3], share_planes,
+                                    stride=stride[3], nsample=nsample[3])  # N/64
+        self.enc5 = self._make_enc(block, planes[4], blocks[4], share_planes,
+                                    stride=stride[4], nsample=nsample[4])  # N/256
 
         self.cls_head = nn.Sequential(
-            nn.Linear(256, 256, bias=False),
+            nn.Linear(planes[4], 256),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes),
+            nn.Dropout(p=0.5),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(128, num_classes),
         )
 
         self.box_head = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(planes[4], 128),
             nn.BatchNorm1d(128),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(0.2),
-            nn.Linear(128, 6),
+            nn.Linear(128, box_dim),
+        )
+
+    def _make_enc(self, block, planes, blocks, share_planes=8, stride=1, nsample=16):
+        layers = [TransitionDown(self.in_planes, planes * block.expansion, stride, nsample)]
+        self.in_planes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.in_planes, self.in_planes, share_planes, nsample=nsample))
+        return nn.Sequential(*layers)
+
+    def _batched_forward(self, p, x, o):
+        """执行 5 阶段编码器前向"""
+        p1, x1, o1 = self.enc1([p, x, o])
+        p2, x2, o2 = self.enc2([p1, x1, o1])
+        p3, x3, o3 = self.enc3([p2, x2, o2])
+        p4, x4, o4 = self.enc4([p3, x3, o3])
+        p5, x5, o5 = self.enc5([p4, x4, o4])
+        return x5, o5
+
+    def forward(self, data_dict):
+        """
+        Args:
+            data_dict: {
+                "coord": (N, 3), "feat": (N, C), "offset": (B,)
+            }
+        Returns:
+            logits: (B, num_classes)
+            box_pred: (B, box_dim)
+        """
+        p0 = data_dict["coord"]
+        x0 = data_dict["feat"]
+        o0 = data_dict["offset"].int()
+        # 如果 in_channels==3, 只使用坐标; 否则拼接坐标+特征
+        x0 = p0 if self.in_channels == 3 else torch.cat((p0, x0), 1)
+
+        x5, o5 = self._batched_forward(p0, x0, o0)
+
+        # 全局平均池化 (按样本)
+        x_list = []
+        for i in range(o5.shape[0]):
+            s_i = 0 if i == 0 else o5[i - 1].item()
+            e_i = o5[i].item()
+            cnt = e_i - s_i
+            x_b = x5[s_i:e_i, :].sum(0, True) / cnt
+            x_list.append(x_b)
+        x = torch.cat(x_list, 0)  # (B, C)
+
+        logits = self.cls_head(x)
+        box_pred = self.box_head(x)
+        return logits, box_pred
+
+
+# ============================================================================
+# 具体模型变体 (适配 SPAD 训练管道)
+# ============================================================================
+
+class PointTransformerClassification(PointTransformerCls):
+    """
+    PointTransformerClassification — 适配 SPAD 训练管道
+
+    输入: (B, N, 4) xyzi 点云
+    输出: (logits [B, num_classes], box_pred [B, 6])
+    """
+    def __init__(self, num_classes=26, block_config=(1, 1, 1, 1, 1), in_channels=4, box_dim=6):
+        super().__init__(
+            Bottleneck, list(block_config),
+            in_channels=in_channels, num_classes=num_classes, box_dim=box_dim
         )
 
     @staticmethod
     def _normalize_input_points(x):
-        """
-        统一输入为 (B, N, 4):
-        - 支持 (B, N, 4) 与 (B, 4, N)
-        - 支持仅 xyz 的 (B, N, 3)/(B, 3, N)，自动补一维 0 强度
-        """
+        """统一输入格式为 (B, N, 4)"""
         if x.ndim != 3:
-            raise ValueError(f"PointTransformerClassification expects 3D input, got shape {tuple(x.shape)}")
-
+            raise ValueError(f"Expected 3D input, got shape {tuple(x.shape)}")
         if x.shape[-1] in (3, 4):
             points = x
         elif x.shape[1] in (3, 4):
             points = x.transpose(1, 2).contiguous()
         else:
-            raise ValueError(
-                "PointTransformerClassification expects input layout (B,N,4)/(B,4,N) or xyz-only "
-                f"(B,N,3)/(B,3,N), got {tuple(x.shape)}"
-            )
-
+            raise ValueError(f"Unsupported shape {tuple(x.shape)}")
         if points.shape[-1] == 3:
-            pad_i = torch.zeros(points.shape[0], points.shape[1], 1, dtype=points.dtype, device=points.device)
+            pad_i = torch.zeros(points.shape[0], points.shape[1], 1,
+                                dtype=points.dtype, device=points.device)
             points = torch.cat([points, pad_i], dim=-1)
-
         return points
 
     def forward(self, x):
         """
         Args:
-            x: [B, N, 4] 完整 xyzi 点云（也支持 (B, 4, N)、(B, N, 3)、(B, 3, N)）
+            x: (B, N, 4) xyzi 点云
         Returns:
-            logits:   [B, num_classes] — 类别 logits
-            box_pred: [B, 6] — 包围盒预测 [xmin, xmax, ymin, ymax, zmin, zmax]
+            logits: (B, num_classes)
+            box_pred: (B, 6)
         """
-        x = self._normalize_input_points(x)              # 统一为 (B, N, 4)
+        x = self._normalize_input_points(x)
+        B, N, C_in = x.shape
 
-        # 完整 xyzi 作为几何+强度联合表示贯穿整个网络
-        # 各模块内部仅用前3维做 kNN/FPS，位置编码使用完整 4 维
-        xyz_full = x                                      # [B, N, 4]
-        B, N, _ = x.shape
+        # 构建 data_dict
+        coord = x[:, :, :3].reshape(B * N, 3).contiguous()
+        feat = x[:, :, 3:].reshape(B * N, -1).contiguous()
+        offset = torch.arange(N, (B + 1) * N, step=N, dtype=torch.long, device=x.device)
 
-        # stem: xyzi(4) → 32 维初始特征
-        feat = self.stem(x.reshape(B * N, 4)).reshape(B, N, 32)
-        feat = self.block1(xyz_full, feat)
+        data_dict = {"coord": coord, "feat": feat, "offset": offset}
+        return super().forward(data_dict)
 
-        x1, f1 = self.td1(xyz_full, feat)                 # x1: [B, 512, 4], f1: [B, 512, 64]
-        f1 = self.block2(x1, f1)
 
-        x2, f2 = self.td2(x1, f1)                         # x2: [B, 128, 4], f2: [B, 128, 128]
-        f2 = self.block3(x2, f2)
+# ============================================================================
+# 不同大小的模型变体
+# ============================================================================
 
-        x3, f3 = self.td3(x2, f2)                         # x3: [B, 32, 4], f3: [B, 32, 256]
-        f3 = self.block4(x3, f3)
+def point_transformer_cls26(num_classes=26, **kwargs):
+    """PointTransformer-Cls26: blocks=[1,1,1,1,1]"""
+    return PointTransformerClassification(num_classes=num_classes, block_config=(1, 1, 1, 1, 1), **kwargs)
 
-        g = torch.max(f3, dim=1)[0]                       # 全局最大池化 → [B, 256]
-        logits = self.cls_head(g)
-        box_pred = self.box_head(g)
-        return logits, box_pred
 
+def point_transformer_cls38(num_classes=26, **kwargs):
+    """PointTransformer-Cls38: blocks=[1,2,2,2,2]"""
+    return PointTransformerClassification(num_classes=num_classes, block_config=(1, 2, 2, 2, 2), **kwargs)
+
+
+def point_transformer_cls50(num_classes=26, **kwargs):
+    """PointTransformer-Cls50: blocks=[1,2,3,5,2]"""
+    return PointTransformerClassification(num_classes=num_classes, block_config=(1, 2, 3, 5, 2), **kwargs)
+
+
+# ============================================================================
+# 快速测试 + GPU 显存测试
+# ============================================================================
 
 def _quick_test():
+    """形状验证。"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Testing PointTransformer V1 on {device}")
 
-    cls_model = PointTransformerClassification(num_classes=26, k=16).to(device)
-
+    model = PointTransformerClassification(num_classes=26).to(device)
     pts = torch.randn(2, 1024, 4, device=device)
+    logits, box_pred = model(pts)
+    print(f"Input:  {tuple(pts.shape)}")
+    print(f"Logits: {tuple(logits.shape)}")
+    print(f"Box:    {tuple(box_pred.shape)}")
+    print("✓ PointTransformer V1 works correctly")
 
-    cls_logits, box_pred = cls_model(pts)
 
-    print("cls:", cls_logits.shape)  # [2, 26]
-    print("box:", box_pred.shape)    # [2, 6]
+def _gpu_memory_test():
+    """GPU 显存压力测试 (逐 batch size 扫查)。"""
+    import gc
+    if not torch.cuda.is_available():
+        print("无 CUDA，跳过 GPU 显存测试。")
+        return
+
+    print("\n=== GPU 显存测试 ===")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    try:
+        props = torch.cuda.get_device_properties(0)
+        total_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+        if total_mem:
+            print(f"总显存: {total_mem / 1024**3:.1f} GB")
+    except Exception:
+        pass
+    print()
+
+    N = 1024
+    for bs in [4, 8, 16, 32]:
+        try:
+            m = PointTransformerClassification(num_classes=26).cuda()
+            pts = torch.randn(bs, N, 4).cuda()
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.reset_peak_memory_stats()
+            m.train()
+            o = m(pts)
+            loss = o[0].sum() + o[1].sum()
+            loss.backward()
+            peak = torch.cuda.max_memory_allocated() / 1024**2
+            print(f"  B={bs:2d}: peak {peak:6.0f} MB")
+            del m, pts, o, loss
+            torch.cuda.empty_cache()
+            gc.collect()
+        except torch.cuda.OutOfMemoryError:
+            print(f"  B={bs:2d}: OOM!")
+            torch.cuda.empty_cache()
+            gc.collect()
+            break
 
 
 if __name__ == "__main__":
     _quick_test()
+    _gpu_memory_test()

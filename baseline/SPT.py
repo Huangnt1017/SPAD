@@ -1,6 +1,16 @@
 """SPT backbone for SPAD point cloud classification and 3D box regression.
 Strictly reproduces https://github.com/PeppaWu/SPT incorporating spiking nodes,
 while appending dual-head regression parameters.
+
+@inproceedings{wu2025spiking,
+  title={Spiking point transformer for point cloud classification},
+  author={Wu, Peixi and Chai, Bosong and Li, Hebei and Zheng, Menghua and Peng, Yansong and Wang, Zeyu and Nie, Xuan and Zhang, Yueyi and Sun, Xiaoyan},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume={39},
+  number={20},
+  pages={21563--21571},
+  year={2025}
+}
 """
 
 from __future__ import annotations
@@ -283,3 +293,77 @@ class PointTransformerCls(nn.Module):
         return {"logits": res_cls, "box_pred": res_box}
 
 SPTNet = PointTransformerCls
+
+
+# ═══════════════════════════════════════════════════════
+# 验证 + GPU 显存测试
+# ═══════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import gc
+    from types import SimpleNamespace
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"=== SPT 验证 (device={device}) ===")
+
+    # 创建简易配置
+    cfg = SimpleNamespace(
+        num_point=1024,
+        input_dim=4,
+        num_classes=26,
+        model=SimpleNamespace(
+            nblocks=3,
+            nneighbor=16,
+            blocks=[1, 1, 1, 1],
+            num_samples=256,
+            spike_mode="lif",
+            timestep=4,
+            use_encoder=False,
+            transformer_dim=64,
+        ),
+    )
+
+    model = PointTransformerCls(cfg).to(device)
+    pts = torch.randn(2, 1024, 4, device=device)
+    out = model(pts)
+    print(f"logits: {out['logits'].shape}, box_pred: {out['box_pred'].shape}")
+
+    # ══════════════════════════════════════════════
+    # GPU 显存测试
+    # ══════════════════════════════════════════════
+    print("\n=== GPU 显存测试 ===")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        try:
+            props = torch.cuda.get_device_properties(0)
+            total_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+            if total_mem:
+                print(f"总显存: {total_mem / 1024**3:.1f} GB")
+        except Exception:
+            pass
+        print()
+
+        N = 1024
+        for bs in [4, 8, 16, 32]:
+            try:
+                m = PointTransformerCls(cfg).cuda()
+                pts = torch.randn(bs, N, 4).cuda()
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.reset_peak_memory_stats()
+                m.train()
+                o = m(pts)
+                loss = o['logits'].sum() + o['box_pred'].sum()
+                loss.backward()
+                peak = torch.cuda.max_memory_allocated() / 1024**2
+                print(f"  B={bs:2d}: peak {peak:6.0f} MB")
+                del m, pts, o, loss
+                torch.cuda.empty_cache()
+                gc.collect()
+            except torch.cuda.OutOfMemoryError:
+                print(f"  B={bs:2d}: OOM!")
+                torch.cuda.empty_cache()
+                gc.collect()
+                break
+    else:
+        print("无 CUDA，跳过。")

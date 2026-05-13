@@ -118,7 +118,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointmlp/pointnext/tnpc/3detr/dct。
+		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -135,10 +135,6 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "dgcnn":
 		module = load_module_from_file(baseline_dir / "DGCNN.py", "baseline_dgcnn")
 		return module.DGCNNCls(num_classes=num_classes)
-
-	if name == "pointtransformer":
-		module = load_module_from_file(baseline_dir / "PointTransformer.py", "baseline_point_transformer")
-		return module.PointTransformerClassification(num_classes=num_classes)
 
 	if name == "pointnet2":
 		module = load_module_from_file(baseline_dir / "PointNet++.py", "baseline_pointnet2")
@@ -181,6 +177,19 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "dct":
 		module = load_module_from_file(baseline_dir / "DCT.py", "baseline_dct")
 		return module.DCTClassification(num_classes=num_classes)
+
+	# === Point Transformer 系列 (Pointcept 复现) ===
+	if name == "pointtransformer":
+		module = load_module_from_file(baseline_dir / "PointTransformer.py", "baseline_point_transformer")
+		return module.PointTransformerClassification(num_classes=num_classes)
+
+	if name == "pointtransv2":
+		module = load_module_from_file(baseline_dir / "PointTransV2.py", "baseline_point_trans_v2")
+		return module.PointTransV2Classification(num_classes=num_classes)
+
+	if name == "pointtransv3":
+		module = load_module_from_file(baseline_dir / "PointTransV3.py", "baseline_point_trans_v3")
+		return module.PointTransV3Classification(num_classes=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -599,6 +608,8 @@ def build_parser() -> argparse.ArgumentParser:
 			"dgcnn",
 			"pointnet2",
 			"pointtransformer",
+			"pointtransv2",
+			"pointtransv3",
 			"pointmlp",
 			"spt",
 			"pointnext",
