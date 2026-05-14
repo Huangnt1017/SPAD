@@ -1,10 +1,8 @@
-
 ---
 name: python-code-assistant
 description: 当用户请求涉及 Python 代码编写、修改、审查、注释或架构设计时，自动提供符合 PEP 8、类型安全、文档完善的代码。
 allowed-tools: Read, Write, Bash
 triggers:
-  # 英文触发词（核心）
   - "python"
   - "code"
   - "function"
@@ -38,7 +36,6 @@ triggers:
   - "sdk"
   - "library"
   - "dependency"
-  # 中文触发词（辅助）
   - "代码"
   - "函数"
   - "类"
@@ -59,193 +56,303 @@ triggers:
   - "依赖"
   - "功能"
   - "复现"
+  - "命名"
+  - "变量"
 ---
 
-# Python 代码编写与注释规范 (Code & Documentation Standards)
+# Python 代码编写与注释规范
 
 ## 适用范围
-当用户请求涉及 Python 代码的编写、修改、注释、审查、测试或架构设计时，始终遵循本文件定义的规范。所有生成的代码必须**可直接运行**、**类型安全**、**文档完整**。
+所有生成的 Python 代码必须**可直接运行**、**类型安全**、**命名语义化**、**文档完整**。本规范适用于函数、类、方法、模块、变量等一切代码元素。
 
 ---
 
-## 1. 代码风格 (Code Style)
+## 1. 命名规范
 
-### 1.1 基础格式
-- 严格遵循 **PEP 8**。
-- 缩进使用 **4 个空格**，禁止使用 tab。
-- 每行最多 **100 个字符**（文档字符串或注释可放宽至 120）。
-- 文件末尾有且仅有一个换行符。
-- 导入顺序：标准库 → 第三方库 → 本地模块，每组之间空一行。
-  ```python
-  import os
-  import sys
-  from typing import Optional
+### 1.1 通用规则
+- 名称必须**自解释**——读者无需查看实现即可理解其用途
+- 单字母变量仅允许: 循环索引 `i, j, k`、坐标 `x, y, z`、批量维度缩写 `B, N, C`
+- 禁止: 拼音命名、无意义缩写(`d`, `r`, `t`)、拼写错误
 
-  import numpy as np
-  import torch
+### 1.2 分类命名表
 
-  from my_package import utils
-  ```
+| 元素 | 风格 | 示例 |
+|---|---|---|
+| 模块 / 文件 | `lower_with_under.py` | `pointnet_utils.py`, `data_augment.py` |
+| 公共类 | `CapWords` | `PointTransformerLayer`, `SetAbstraction` |
+| 私有类 | `_CapWords` | `_CustomBatchNorm` |
+| 公共函数 | `lower_with_under()` | `compute_loss()`, `farthest_point_sample()` |
+| 私有/内部函数 | `_lower_with_under()` | `_init_weights()`, `_wkv_forward()` |
+| 公共方法 | `lower_with_under()` | `forward()`, `build_loss_func()` |
+| 参数 / 局部变量 | `lower_with_under` | `num_classes`, `embed_dim`, `drop_path_rate` |
+| 模块级常量 | `CAPS_WITH_UNDER` | `PROJECT_ROOT`, `DEFAULT_GRID_SIZE` |
+| 属性名 | `lower_with_under` | `self.in_channels`, `self.num_heads` |
+| 布尔变量 | `is_` / `has_` / `enable_` 前缀 | `is_training`, `has_bias`, `enable_checkpoint` |
+| 计数量 | `num_` / `count_` 前缀 | `num_points`, `count_samples` |
 
-### 1.2 命名规范
-- 模块/包：`lower_with_under.py`
-- 类：`CapWords`（如 `PointCloudProcessor`）
-- 函数/方法：`lower_with_under()`（如 `compute_intensity`）
-- 变量：`lower_with_under`
-- 常量：`CAPS_WITH_UNDER`（模块级）
-- 私有成员：以单下划线 `_` 开头（protected）、双下划线 `__` 开头（name mangling，非必要不用）
+### 1.3 禁止的命名 (模糊通名)
+`data`, `input`, `output`, `result`, `temp`, `value`, `item`, `info`, `array`, `list`, `dict`, `d`, `r`, `t`, `tmp` —— 一律替换为语义明确的具体名称。
 
 ---
 
-## 2. 类型提示 (Type Hints)
-所有公共函数、方法、类属性**必须**有完整的类型提示。使用内置泛型或 `typing` 模块。
+## 2. 文档字符串 — 强制标准
+
+### 2.1 必须包含 docstring 的元素
+| 元素 | 要求 |
+|---|---|
+| 模块文件头 | 说明用途 + 列出主要导出 |
+| 公共类 | 含 `__init__` 各参数 + 至少 1 个 Example |
+| `__init__` 方法 | 列出所有构造参数及其用途 |
+| `forward` 方法 | Args 含张量形状 `(B,N,C)`, Returns 含形状 |
+| 公共函数/方法 | 含 Args/Returns/Raises(视情况) |
+| 私有复杂方法(>10行或≥3分支) | 至少一行用途说明 |
+
+### 2.2 模块头标准模板
 ```python
-from typing import List, Tuple, Optional, Union
-import torch
+"""模块用途简述.
 
-def fit_bayesian_model(
-    points: torch.Tensor,          # shape: (N, 4) [x, y, z, intensity]
-    prior_strength: float = 1.0,
-    n_iter: int = 1000
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    ...
-    """
-    ...
+主要导出:
+    ClassName  — 一句话说明
+    func_name  — 一句话说明
+"""
 ```
 
----
-
-## 3. 文档字符串 (Docstrings)
-
-一律使用 **Google 风格** docstring，包含：
-- 简短描述（第一行）
-- 详细说明（可选，空行后）
-- Args: 参数列表，每项包含类型和解释
-- Returns: 返回值类型及解释
-- Raises: 可能抛出的异常
-- Example (可选): 使用示例
-
+### 2.3 类 docstring 标准模板
 ```python
-def denoise_lidar(
-    raw_data: np.ndarray,
-    fog_model: str = "gamma"
-) -> np.ndarray:
-    """使用贝叶斯方法去除 LiDAR 点云中的雾气噪声。
+class MyModule(nn.Module):
+    """一句话概述.
 
-    该函数对 64x64 像素、128 时间 bin 的输入张量进行逐像素的
-    伽马-高斯混合分布拟合，并返回去噪后的强度图像。
+    详细描述架构流程.
 
     Args:
-        raw_data: 形状为 (64, 64, 128) 的数组，值为光子计数强度。
-        fog_model: 雾分布模型，可选 "gamma" 或 "exp".
+        in_channels: 输入通道数.
+        out_channels: 输出通道数.
+
+    Example:
+        >>> m = MyModule(3, 64)
+        >>> y = m(x)  # (B, 64, N)
+    """
+```
+
+### 2.4 函数/方法 docstring 模板
+```python
+def farthest_point_sample(xyz, npoint):
+    """最远点采样 (FPS).
+
+    贪心选取 npoint 个相互距离最远的采样点.
+
+    Args:
+        xyz: (B, N, 3) 点云坐标.
+        npoint: 采样点数.
 
     Returns:
-        与输入同形状的数组，体素强度为去除雾气分量后的期望值。
-
-    Raises:
-        ValueError: 如果 raw_data 包含 NaN 或形状不为 (64, 64, 128).
+        centroids: (B, npoint) 采样点索引 (dtype=long).
     """
-    ...
 ```
 
 ---
 
-## 4. 注释 (Comments)
+## 3. 内联注释与形状注解
 
-### 4.1 代码注释原则
-- 解释 **“为什么”** 这样做，而不是重复代码干了什么。
-- 复杂算法、临时解决方案（workaround）、性能敏感处必须添加注释。
-- 注释与代码同行或单独一行，使用 `# ` 开头（井号后一个空格）。
-- 避免无意义的注释（如 `# 赋值给 x`）。
-- TODO/FIXME 标签格式：
-  ```python
-  # TODO(作者): 采用量子隧穿改进此处 MCMC 跳跃，预计 v1.2 完成
-  # FIXME(作者): 当 NaN 出现时回退到先验，参见 issue #42
-  ```
+### 3.1 必须注释的位置
+1. **张量形状变换** — reshape / permute / transpose 前一行注明目标形状
+2. **非显而易见的分支** — 解释为什么有这个分支
+3. **魔法数字** — 如 `0.02` / `1e-5` 注明来源
+4. **临时方案** — `# TODO(author) YYYY-MM-DD: reason`
 
-### 4.2 类型注释补充
-对于复杂类型，可使用 `# type:` 辅助说明（虽然推荐使用原生 type hints，但在遗留代码或动态场景可用）：
 ```python
-result = get_config()  # type: dict[str, Any]
+# 格式转换: (B, N, 3) → (B, 3, N) 以适应 Conv1d
+pts = x[:, :, :3].transpose(1, 2).contiguous()  # (B, 3, N)
+
+# 用 KNN k=16, 平衡感受野与计算开销
+idx = knn_point(16, xyz, xyz)  # (B, N, 16)
+
+# truncated_normal std=0.02 来自 ViT 论文
+nn.init.trunc_normal_(m.weight, std=0.02)
 ```
 
+### 3.2 禁止的注释
+- `# 赋值` / `# 调用` — 纯语法重复, 直接删除
+- 被注释掉的代码 — 使用 git 管理历史, 不要留在文件中
+
 ---
 
-## 5. 异常与错误处理 (Exception Handling)
-- 捕获**具体的**异常，严禁使用裸露的 `except:`。
-- 在 docstring 的 Raises 中记录可能传播的异常。
-- 自定义异常类继承自 `Exception`，类名以 `Error` 结尾。
+## 4. 类内部结构约定
+
 ```python
-class PointCloudFormatError(Exception):
-    """当点云文件格式不符合预期时抛出。"""
-    pass
-```
+class MyModel(nn.Module):
+    """类概述 (必须)."""
 
----
+    def __init__(self, ...):
+        super().__init__()
+        # ---- 核心参数 ----
+        self.dim = dim            # 特征维度
 
-## 6. 模块与包设计 (Module Design)
-- 模块职责单一，功能相近的函数/类归入同一模块。
-- `__init__.py` 中明确导出公共 API，使用 `__all__`。
-- 所有配置项集中放在 `config.py` 或 `settings.py` 中，使用 pydantic 或 dataclass 管理。
-- 处理 I/O、算法、可视化分开为独立模块：`io.py`, `algorithms.py`, `viz.py`。
+        # ---- 子模块 ----
+        self.embedding = nn.Linear(dim, dim * 4)   # 嵌入层: D → 4D
 
----
+        # ---- 可学习参数 ----
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
 
-## 7. 测试 (Testing)
-- 使用 `pytest` 框架。
-- 测试文件命名：`test_<模块名>.py`，放置在 `tests/` 目录下。
-- 函数测试命名：`test_<函数名>_<场景>_<预期结果>`。
-- 对外部依赖（文件系统、网络、数据库）使用 `unittest.mock` 或 `pytest-mock`。
+        # ---- 初始化 ----
+        self.apply(self._init_weights)
 
----
+    def forward(self, x):
+        """前向传播 (...)."""
+        ...
 
-## 8. 性能与安全提醒
-- 避免在循环中进行重复属性访问（如 `len(list)` 挪到循环外）。
-- 大数据集使用生成器表达式 (`(...)`) 而非列表推导式 (`[...]`)。
-- 禁止使用 `eval()` 或 `exec()` 处理用户输入。
-- 文件路径拼接使用 `pathlib.Path`。
-
----
-
-## 9. 代码生成示例
-当被要求“创建一个从点云中提取特征的类”时，应输出如下结构：
-```python
-"""点云特征提取模块，提供 PointCloudFeatureExtractor 类。"""
-from pathlib import Path
-from typing import Optional
-import numpy as np
-
-class PointCloudFeatureExtractor:
-    """从 LiDAR 点云中计算几何与强度特征。"""
-    def __init__(self, voxel_size: float = 0.1) -> None:
-        self.voxel_size = voxel_size
-
-    def extract(self, points: np.ndarray) -> np.ndarray:
-        """提取特征向量。
-
-        Args:
-            points: (N, 4) 数组 [x, y, z, intensity].
-
-        Returns:
-            (N, D) 特征矩阵.
-        """
+    def _init_weights(self, m):
+        """权重初始化."""
         ...
 ```
 
+规则: 方法顺序为 `__init__` → 公开方法 → 私有方法; `__init__` 内用 `# ---- 分组 ----` 分隔; 属性声明必须带行内注释.
+
 ---
 
-## 注意事项
-- 本 Skill 为**补充性**规范，不覆盖项目已有特定风格（如 `black` 格式化配置），但需在回答中提醒用户保持一致性。
-- 当用户未指定风格时，默认使用本文档的约定。
+## 5. 完整代码生成示例
+
+```python
+"""PointNet++ Set Abstraction 模块."""
+
+import torch
+import torch.nn as nn
+from typing import Optional, Tuple, List
+
+
+def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    """最远点采样 (FPS).
+
+    Args:
+        xyz: (B, N, 3) 点云坐标.
+        npoint: 采样点数, 必须 <= N.
+
+    Returns:
+        centroids: (B, npoint) 采样点索引 (long).
+
+    Raises:
+        ValueError: 若 npoint > N.
+    """
+    B, N, C = xyz.shape
+    if npoint > N:
+        raise ValueError(f"npoint ({npoint}) > N ({N})")
+
+    device = xyz.device
+    centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
+    distance = torch.full((B, N), 1e10, device=device)       # 初始化为极大值
+    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    batch_indices = torch.arange(B, dtype=torch.long, device=device)
+
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, C)  # (B, 1, C)
+        dist = torch.sum((xyz - centroid) ** 2, dim=-1)            # (B, N)
+        mask = dist < distance         # 只更新距离变小的点
+        distance[mask] = dist[mask]
+        farthest = torch.max(distance, dim=-1)[1]
+
+    return centroids
+
+
+class SetAbstraction(nn.Module):
+    """PointNet++ Set Abstraction (SA) 模块.
+
+    流程: FPS → BallQuery → 中心归一化 → MLP(Conv2d) → 最大池化.
+
+    Args:
+        npoint: FPS 采样点数. None 时 group_all=True.
+        radius: Ball Query 半径. group_all 时忽略.
+        nsample: 每组最大近邻数.
+        in_channel: 输入特征通道 (不含 xyz 的 3 维).
+        mlp: MLP 输出通道列表, e.g. [64, 64, 128].
+        group_all: 全部点作为一组 (最后一层 SA).
+
+    Example:
+        >>> sa = SetAbstraction(512, 0.2, 32, 1, [64, 64, 128])
+        >>> new_xyz, new_feat = sa(xyz, points)
+    """
+
+    def __init__(
+        self,
+        npoint: Optional[int],
+        radius: Optional[float],
+        nsample: Optional[int],
+        in_channel: int,
+        mlp: List[int],
+        group_all: bool = False,
+    ) -> None:
+        super().__init__()
+        self.npoint = npoint               # FPS 采样点数
+        self.radius = radius               # Ball Query 半径
+        self.nsample = nsample             # 每组最大近邻数
+        self.group_all = group_all         # 全局分组标志
+
+        # MLP: 输入 = 归一化坐标(3) + 点特征(in_channel)
+        layers: List[nn.Module] = []
+        last_channel = in_channel + 3
+        for out_channel in mlp:
+            layers.append(nn.Conv2d(last_channel, out_channel, kernel_size=1))
+            layers.append(nn.BatchNorm2d(out_channel))
+            layers.append(nn.ReLU(inplace=True))
+            last_channel = out_channel
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        xyz: torch.Tensor,
+        points: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向传播.
+
+        Args:
+            xyz: (B, 3, N) 点云坐标.
+            points: (B, D, N) 点特征, 可为 None.
+
+        Returns:
+            new_xyz: (B, 3, S) 采样后坐标.
+            new_points: (B, C_out, S) 池化后特征.
+        """
+        B, _, N = xyz.shape
+        xyz_nc = xyz.transpose(1, 2).contiguous()            # (B, N, 3)
+        if points is not None:
+            points_nc = points.transpose(1, 2).contiguous()   # (B, N, D)
+        else:
+            points_nc = None
+
+        if self.group_all:
+            new_xyz_nc, new_points = self._group_all(xyz_nc, points_nc)
+        else:
+            new_xyz_nc, new_points = self._group(xyz_nc, points_nc)
+
+        # Conv2d 处理: (B, C, K, S)
+        new_points = new_points.permute(0, 3, 2, 1).contiguous()
+        new_points = self.mlp(new_points)
+        new_points = torch.max(new_points, dim=2)[0]          # 最大池化 → (B, C_out, S)
+
+        new_xyz = new_xyz_nc.transpose(1, 2).contiguous()     # (B, 3, S)
+        return new_xyz, new_points
 ```
 
 ---
 
-### 📌 补充说明：语言对 Skill 的影响
+## 6. 自我审查清单
 
-- **Skill 正文**：中英文混写完全没问题，AI 理解两种语言的能力都很强。关键是将规则描述得**清晰无歧义**。
-- **触发词 (triggers)**：建议 **英文优先，中文做补充**。因为代码领域的术语在 prompt 中更多以英文出现（如 “refactor this function”），但中文用户也会说“帮我注释这个函数”。同时列出两者能保证最大化触发率。
-- 如果你的工作场景全是中文交互，可以把 `triggers` 全部换成中文词汇。
+| # | 检查项 | 达标标准 |
+|---|---|---|
+| 1 | 模块头 docstring | 写明用途 + 主要导出 |
+| 2 | 公共类 docstring | 含 Args + Example |
+| 3 | `__init__` docstring | 所有构造参数均已列出 |
+| 4 | `forward` docstring | Args/Returns 含张量形状 `(B,N,C)` |
+| 5 | 公共方法 docstring | >5 行必须有 Args/Returns |
+| 6 | 私有方法 docstring | >10 行或 ≥3 分支必须有 |
+| 7 | 类型提示 | 所有公开函数/方法的参数与返回值 |
+| 8 | 张量形状注释 | 每次 reshape/permute/transpose 前一行 |
+| 9 | 变量名语义化 | 禁止 x/data/result/temp 等通名 |
+| 10 | 魔力数字有注释 | 如 0.02/1e-5 有来源 |
+| 11 | 分支有注释 | if/else 意图可见 |
+| 12 | TODO 规范 | `# TODO(name) YYYY-MM-DD: why` |
+| 13 | 命名风格 | 类 CapWords, 函数 lower_under, 常量 CAPS |
+| 14 | 布尔前缀 | is_/has_/enable_ |
+| 15 | 导入顺序 | 标准库 → 第三方 → 本地 |
 
-将上述代码块保存为 `.github/skills/python-code-assistant/SKILL.md`，然后在你的项目文件夹中使用 Copilot Chat，AI 就会自动继承这套“代码质量守则”。
+> **验收标准**: 任何一位未接触过该代码的同事，只看 docstring + 注释即可理解: 每个类/函数的作用、每个参数的含义、输入输出的张量形状.
