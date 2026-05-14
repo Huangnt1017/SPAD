@@ -1,6 +1,305 @@
-"""PointNet utilities for the SPT model."""
+"""PointNet utilities — consolidated geometric operations for all baselines.
+
+Central hub for shared point cloud geometric functions:
+- square_distance, index_points, farthest_point_sample, knn_point, query_ball_point
+- fps (alias), fps_points, knn_point_with_break_tie, grouping, interpolation
+- farthest_point_sample_varlen, knn_point_varlen, knn_query_and_group
+- LayerNorm1d, offset/batch utils, off_diagonal
+- PointNetSetAbstraction, sample_and_group
+"""
 
 from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+try:
+    from spikingjelly.clock_driven.neuron import (
+        MultiStepLIFNode, MultiStepEIFNode,
+        MultiStepParametricLIFNode, MultiStepIFNode
+    )
+except ImportError:
+    import logging
+    logging.warning("Please install spikingjelly: pip install spikingjelly")
+
+
+# ============================================================================
+# 基础几何辅助函数
+# ============================================================================
+
+def square_distance(src, dst):
+    """欧氏距离平方: src[B,N,C] dst[B,M,C] → [B,N,M]"""
+    if src.dim() == 4 and dst.dim() == 4:
+        return torch.sum((src[:, :, :, None] - dst[:, :, None]) ** 2, dim=-1)
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
+    return dist
+
+
+def index_points(points, idx):
+    """根据索引收集点: points[B,N,C] idx[B,S]或[B,S,K] → [B,S,C]或[B,S,K,C]"""
+    idx = idx.to(torch.int64)
+    raw_size = idx.size()
+    idx = idx.reshape(raw_size[0], raw_size[1], -1) if len(raw_size) == 4 else idx.reshape(raw_size[0], -1)
+    idx_size = list(idx.shape)
+    idx_size.append(points.size(-1))
+    res = torch.gather(points, 2 if len(raw_size) == 4 else 1, idx[..., None].expand(*idx_size))
+    return res.reshape(*raw_size, -1)
+
+
+def farthest_point_sample(xyz, npoint):
+    """最远点采样 (FPS): xyz[B,N,3] → centroids[B,npoint] (索引)"""
+    device = xyz.device
+    B, N, C = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
+    distance = torch.ones(B, N, device=device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    batch_indices = torch.arange(B, dtype=torch.long, device=device)
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, C)
+        dist = torch.sum((xyz - centroid) ** 2, -1)
+        mask = dist < distance
+        distance[mask] = dist[mask]
+        farthest = torch.max(distance, -1)[1]
+    return centroids
+
+
+# Alias for compatibility
+fps = farthest_point_sample
+
+
+def fps_points(xyz, npoint):
+    """FPS 采样并直接返回坐标: xyz[B,N,3] → [B,npoint,3]"""
+    idx = farthest_point_sample(xyz, npoint)
+    return index_points(xyz, idx)
+
+
+def knn_point(k, xyz, new_xyz):
+    """kNN 搜索: xyz[B,N,C] new_xyz[B,S,C] → idx[B,S,k]"""
+    dist = square_distance(new_xyz, xyz)
+    _, idx = dist.topk(k, dim=-1, largest=False, sorted=False)
+    return idx
+
+
+def knn_point_with_break_tie(k, xyz, new_xyz):
+    """带微小噪声的 kNN，用于避免平局情况。"""
+    dist = square_distance(new_xyz, xyz)
+    noise = torch.rand_like(dist) * 1e-8
+    idx = (dist + noise).topk(k=k, dim=-1, largest=False)[1]
+    return idx
+
+
+def query_ball_point(radius, nsample, xyz, new_xyz):
+    """Ball Query: 以 new_xyz 为中心、半径 radius 内的近邻点索引。"""
+    device = xyz.device
+    B, N, C = xyz.shape
+    _, S, _ = new_xyz.shape
+    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
+    sqrdists = square_distance(new_xyz, xyz)
+    group_idx[sqrdists > radius ** 2] = N
+    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
+    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
+    mask = group_idx == N
+    group_idx[mask] = group_first[mask]
+    return group_idx
+
+
+def grouping(feat, idx):
+    """根据索引分组: feat[N,C] idx[N,K] → [N,K,C] (纯 PyTorch gather)"""
+    N, K = idx.shape
+    C = feat.shape[1]
+    idx_flat = idx.reshape(-1).unsqueeze(-1).expand(-1, C)
+    grouped = feat.gather(0, idx_flat)
+    return grouped.reshape(N, K, C)
+
+
+def grouping_with_xyz(xyz, feat, idx):
+    """分组并拼接坐标: xyz[N,3] feat[N,C] idx[N,K] → pos[N,K,3], grouped_feat[N,K,C]"""
+    grouped_xyz = grouping(xyz, idx)
+    grouped_feat = grouping(feat, idx)
+    return grouped_xyz, grouped_feat
+
+
+def interpolation(unknown_xyz, known_xyz, known_feat, n_unknown, n_known, k=3):
+    """反距离加权插值: 用于上采样点特征。"""
+    dist = square_distance(unknown_xyz, known_xyz)
+    dist, idx = dist.topk(k=k, dim=-1, largest=False)
+    dist_recip = 1.0 / (dist + 1e-8)
+    norm = torch.sum(dist_recip, dim=-1, keepdim=True)
+    weight = dist_recip / norm
+    interpolated_feat = torch.sum(
+        index_points(known_feat, idx) * weight.unsqueeze(-1), dim=2
+    )
+    return interpolated_feat
+
+
+# ============================================================================
+# 变长点云版本 (使用 offset 约定)
+# ============================================================================
+
+def farthest_point_sample_varlen(xyz, offset, new_offset):
+    """变长点云的 FPS。"""
+    device = xyz.device
+    npoints_new = new_offset[-1].item()
+    new_xyz_idx = torch.zeros(npoints_new, dtype=torch.long, device=device)
+    for i in range(len(offset)):
+        s_i = 0 if i == 0 else offset[i - 1].item()
+        e_i = offset[i].item()
+        s_new = 0 if i == 0 else new_offset[i - 1].item()
+        e_new = new_offset[i].item()
+        npoint = e_new - s_new
+        if npoint <= 0 or e_i - s_i <= 0:
+            continue
+        batch_xyz = xyz[s_i:e_i, :].unsqueeze(0)
+        idx = farthest_point_sample(batch_xyz, npoint)
+        new_xyz_idx[s_new:e_new] = idx[0] + s_i
+    return new_xyz_idx
+
+
+def knn_point_varlen(k, xyz, offset, new_xyz, new_offset):
+    """变长点云的 kNN。"""
+    device = xyz.device
+    M = new_xyz.shape[0]
+    idx = torch.zeros(M, k, dtype=torch.long, device=device)
+    for i in range(len(offset)):
+        s_i = 0 if i == 0 else offset[i - 1].item()
+        e_i = offset[i].item()
+        s_new = 0 if i == 0 else new_offset[i - 1].item()
+        e_new = new_offset[i].item()
+        if e_i - s_i <= 0 or e_new - s_new <= 0:
+            continue
+        batch_xyz = xyz[s_i:e_i, :].unsqueeze(0)
+        batch_new_xyz = new_xyz[s_new:e_new, :].unsqueeze(0)
+        batch_idx = knn_point(k, batch_xyz, batch_new_xyz)
+        idx[s_new:e_new, :] = batch_idx[0]
+    return idx
+
+
+def knn_query_and_group(feat, xyz, offset, new_xyz=None, new_offset=None,
+                        nsample=16, idx=None, with_xyz=True):
+    """Pointcept 风格的 knn_query_and_group。"""
+    if new_xyz is None:
+        new_xyz = xyz
+        new_offset = offset
+    if idx is None:
+        idx = knn_point_varlen(nsample, xyz, offset, new_xyz, new_offset)
+    if with_xyz:
+        grouped_xyz = new_xyz.unsqueeze(1).expand(-1, nsample, -1)
+        grouped_feat = feat[idx.long(), :]
+        return torch.cat([grouped_xyz, grouped_feat], dim=-1)
+    else:
+        return feat[idx.long(), :]
+
+
+# ============================================================================
+# LayerNorm1d (Point Transformer V1 使用)
+# ============================================================================
+
+class LayerNorm1d(nn.Module):
+    """对点云特征进行 LayerNorm (包装 BatchNorm1d)。"""
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        self.norm = nn.BatchNorm1d(normalized_shape, eps=eps, affine=elementwise_affine)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            return self.norm(x.transpose(1, 2)).transpose(1, 2)
+        elif x.dim() == 2:
+            return self.norm(x.t()).t()
+        else:
+            raise NotImplementedError(f"LayerNorm1d: unsupported dim {x.dim()}")
+
+
+# ============================================================================
+# Batch / Offset 转换
+# ============================================================================
+
+@torch.no_grad()
+def offset2bincount(offset):
+    return torch.diff(offset, prepend=torch.tensor([0], device=offset.device, dtype=torch.long))
+
+
+@torch.no_grad()
+def bincount2offset(bincount):
+    return torch.cumsum(bincount, dim=0)
+
+
+@torch.no_grad()
+def offset2batch(offset):
+    bincount = offset2bincount(offset)
+    return torch.arange(len(bincount), device=offset.device, dtype=torch.long).repeat_interleave(bincount)
+
+
+@torch.no_grad()
+def batch2offset(batch):
+    return torch.cumsum(batch.bincount(), dim=0).long()
+
+
+def off_diagonal(x):
+    """返回方阵非对角元素的扁平视图。"""
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
+# ============================================================================
+# Sample & Group (SPT 使用)
+# ============================================================================
+
+def sample_and_group(npoint, radius, nsample, xyz, points, use_encoder, returnfps=False, knn=False):
+    T, B, N, C = xyz.shape
+    S = npoint
+    loc = xyz[0] if not use_encoder else xyz.flatten(0, 1)
+
+    fps_idx = farthest_point_sample(loc, npoint)
+
+    torch.cuda.empty_cache()
+    new_xyz = index_points(loc, fps_idx)
+    new_xyz = new_xyz.repeat(T, 1, 1, 1) if not use_encoder else new_xyz.view(T, B, -1, C)
+
+    torch.cuda.empty_cache()
+    if knn:
+        dists = square_distance(new_xyz, xyz)
+        idx = dists.argsort()[:, :, :, :nsample]
+    else:
+        idx = query_ball_point(radius, nsample, xyz, new_xyz)
+    torch.cuda.empty_cache()
+    grouped_xyz = index_points(xyz, idx)
+    torch.cuda.empty_cache()
+    grouped_xyz_norm = grouped_xyz - new_xyz.view(T, B, S, 1, C)
+    torch.cuda.empty_cache()
+
+    if points is not None:
+        grouped_points = index_points(points, idx)
+        new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
+    else:
+        new_points = grouped_xyz_norm
+    if returnfps:
+        return new_xyz, new_points, grouped_xyz, fps_idx
+    return new_xyz, new_points
+
+
+def sample_and_group_all(xyz, points):
+    device = xyz.device
+    T, B, N, C = xyz.shape
+    new_xyz = torch.zeros(T, B, 1, C).to(device)
+    grouped_xyz = xyz.view(T, B, 1, N, C)
+    if points is not None:
+        new_points = torch.cat([grouped_xyz, points.view(T, B, 1, N, -1)], dim=-1)
+    else:
+        new_points = grouped_xyz
+    return new_xyz, new_points
+
+
+# ============================================================================
+# Spike-related code (SPT model)
+# ============================================================================
 
 import torch
 import torch.nn as nn

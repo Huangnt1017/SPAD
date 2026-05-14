@@ -1,4 +1,8 @@
-"""SPT backbone for SPAD point cloud classification and 3D box regression.
+"""SPT: Spiking Point Transformer for Point Cloud Classification + 3D BBox
+
+GitHub:  https://github.com/PeppaWu/SPT
+Local:   D:\PYproject\SPAD\baseline\SPT.py
+
 Strictly reproduces https://github.com/PeppaWu/SPT incorporating spiking nodes,
 while appending dual-head regression parameters.
 

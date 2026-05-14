@@ -1,6 +1,9 @@
 """
 Point Transformer V1 for Object Classification + 3D BBox
 
+GitHub:  https://github.com/Pointcept/Pointcept
+Local:   D:\essay\3d目标检测复现仓库\Pointcept-main
+
 Pointcept 官方实现复现 (Xiaoyang Wu)
 - 5 阶段编码器 + 全局池化 + 分类/框回归头
 - 使用 PointTransformerLayer (向量注意力) + TransitionDown (FPS+kNN) + Bottleneck
@@ -28,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from utils.pointcept_utils import (
+from utils.pointnet_utils import (
     LayerNorm1d, farthest_point_sample, index_points, knn_point, square_distance
 )
 

@@ -1,7 +1,10 @@
 """
-3DETR — 3D Detection Transformer (基于 facebookresearch/3detr 官方实现)
+3DETR — 3D Detection Transformer
 
-复现官方 3DETR 架构并适配 SPAD 单光子点云:
+GitHub:  https://github.com/facebookresearch/3detr
+Local:   D:\essay\3d目标检测复现仓库\3detr (参考)
+
+基于 facebookresearch/3detr 官方实现, 适配 SPAD 单光子点云:
     - PointNet++ pre-encoder (纯 Python 实现, 无需 CUDA 编译)
     - Sine/Fourier 3D 位置编码 (PositionEmbeddingCoordsSine)
     - Transformer Encoder: vanilla self-attention
@@ -18,6 +21,14 @@
     - models/position_embedding.py → PositionEmbeddingCoordsSine
     - models/helpers.py         → GenericMLP, NORM_DICT, get_clones
     - third_party/pointnet2/    → PointnetSAModuleVotes (纯 Python 版)
+
+@inproceedings{misra2021end,
+  title={An end-to-end transformer model for 3d object detection},
+  author={Misra, Ishan and Girdhar, Rohit and Joulin, Armand},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={2906--2917},
+  year={2021}
+}
 """
 
 from __future__ import annotations

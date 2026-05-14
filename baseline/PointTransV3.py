@@ -1,6 +1,9 @@
 """
 Point Transformer V3 for Object Classification + 3D BBox
 
+GitHub:  https://github.com/Pointcept/Pointcept
+Local:   D:\essay\3d目标检测复现仓库\Pointcept-main
+
 Pointcept 官方实现复现 (Xiaoyang Wu)
 - Serialized Attention + Serialized Pooling/Unpooling
 - 使用 Z-order / Hilbert 序列化实现高效注意力
@@ -57,7 +60,7 @@ except ImportError:
             else:
                 raise AttributeError(f"Key '{key}' not found")
 
-from utils.pointcept_utils import (
+from utils.pointnet_utils import (
     offset2batch, batch2offset, offset2bincount,
     farthest_point_sample, knn_point, index_points
 )

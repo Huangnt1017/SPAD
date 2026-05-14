@@ -1,5 +1,9 @@
 """
-from https://github.com/WangYueFt/dgcnn
+DGCNN: Dynamic Graph CNN for Learning on Point Clouds
+
+GitHub:  https://github.com/WangYueFt/dgcnn
+Local:   D:\essay\3d目标检测复现仓库\dgcnn (baseline 参考)
+
 @article{wang2019dynamic,
   title={Dynamic graph cnn for learning on point clouds},
   author={Wang, Yue and Sun, Yongbin and Liu, Ziwei and Sarma, Sanjay E and Bronstein, Michael M and Solomon, Justin M},

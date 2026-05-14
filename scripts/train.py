@@ -118,7 +118,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet2/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -139,6 +139,14 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "pointnet2":
 		module = load_module_from_file(baseline_dir / "PointNet++.py", "baseline_pointnet2")
 		return module.PointNet2ClassificationSSG(num_class=num_classes)
+
+	if name == "pointnet":
+		module = load_module_from_file(baseline_dir / "pointnet.py", "baseline_pointnet")
+		return module.PointNetCls(num_classes=num_classes)
+
+	if name == "pointnet2msg":
+		module = load_module_from_file(baseline_dir / "PointNet++.py", "baseline_pointnet2")
+		return module.PointNet2ClassificationMSG(num_class=num_classes)
 
 	if name == "pointmlp":
 		module = load_module_from_file(baseline_dir / "PointMLP.py", "baseline_pointmlp")
@@ -190,6 +198,21 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "pointtransv3":
 		module = load_module_from_file(baseline_dir / "PointTransV3.py", "baseline_point_trans_v3")
 		return module.PointTransV3Classification(num_classes=num_classes)
+
+	# === PointRWKV ===
+	if name == "pointrwkv":
+		module = load_module_from_file(baseline_dir / "PointRWKV.py", "baseline_point_rwkv")
+		return module.PointRWKVClassification(num_classes=num_classes)
+
+	# === Point-BERT ===
+	if name == "pointbert":
+		module = load_module_from_file(baseline_dir / "PointBERT.py", "baseline_point_bert")
+		return module.PointBERTClassification(num_classes=num_classes)
+
+	# === Point-MAE ===
+	if name == "pointmae":
+		module = load_module_from_file(baseline_dir / "PointMAE.py", "baseline_point_mae")
+		return module.PointMAEClassification(num_classes=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -606,7 +629,12 @@ def build_parser() -> argparse.ArgumentParser:
 		default="dgcnn",
 		choices=[
 			"dgcnn",
+			"pointnet",
 			"pointnet2",
+			"pointnet2msg",
+			"pointbert",
+			"pointmae",
+			"pointrwkv",
 			"pointtransformer",
 			"pointtransv2",
 			"pointtransv3",

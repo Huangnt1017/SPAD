@@ -1,6 +1,9 @@
 """
 Point Transformer V2 for Object Classification + 3D BBox
 
+GitHub:  https://github.com/Pointcept/Pointcept
+Local:   D:\essay\3d目标检测复现仓库\Pointcept-main
+
 Pointcept 官方实现复现 (Xiaoyang Wu)
 - Grouped Vector Attention (GVA) + Grid Pool (Partition-based Pooling)
 - 编码器-解码器架构 (分类只用编码器部分)
@@ -48,7 +51,7 @@ except ImportError:
     TORCH_GEOMETRIC_AVAILABLE = False
     print("WARNING: torch_geometric not available, using fallback GridPool")
 
-from utils.pointcept_utils import (
+from utils.pointnet_utils import (
     offset2batch, batch2offset, offset2bincount,
     farthest_point_sample, knn_point, index_points, square_distance
 )

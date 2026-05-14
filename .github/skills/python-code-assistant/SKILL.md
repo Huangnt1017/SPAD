@@ -58,6 +58,7 @@ triggers:
   - "库"
   - "依赖"
   - "功能"
+  - "复现"
 ---
 
 # Python 代码编写与注释规范 (Code & Documentation Standards)
@@ -184,7 +185,6 @@ class PointCloudFormatError(Exception):
 ---
 
 ## 6. 模块与包设计 (Module Design)
-- 每个 `.py` 文件不超过 **500 行**（特殊情况可放宽，但需注释说明）。
 - 模块职责单一，功能相近的函数/类归入同一模块。
 - `__init__.py` 中明确导出公共 API，使用 `__all__`。
 - 所有配置项集中放在 `config.py` 或 `settings.py` 中，使用 pydantic 或 dataclass 管理。
