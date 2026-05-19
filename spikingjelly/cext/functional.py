@@ -1,7 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import _C_gemm
+import logging
+
+try:
+    import _C_gemm
+    _has_c_gemm = True
+except ImportError:
+    _has_c_gemm = False
+    logging.info('spikingjelly.cext.functional: _C_gemm not found, will use torch.mm fallback')
 
 class sparse_mm_dense_atf(torch.autograd.Function):
     @staticmethod
@@ -9,9 +16,11 @@ class sparse_mm_dense_atf(torch.autograd.Function):
         # sparse: [M, N]  dense: [N, P]  y:[M, P]
         if sparse.requires_grad or dense.requires_grad:
             ctx.save_for_backward(sparse, dense)
-        y = torch.zeros(size=[sparse.shape[0], dense.shape[1]], dtype=torch.float, device=sparse.device)
-        _C_gemm.sparse_mm_dense_cusparse(sparse, dense, y)
-        # y = torch.mm(sparse, dense)
+        if _has_c_gemm:
+            y = torch.zeros(size=[sparse.shape[0], dense.shape[1]], dtype=torch.float, device=sparse.device)
+            _C_gemm.sparse_mm_dense_cusparse(sparse, dense, y)
+        else:
+            y = torch.mm(sparse, dense)
         return y
 
     @staticmethod
@@ -22,9 +31,11 @@ class sparse_mm_dense_atf(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             grad_sparse = grad_output.mm(dense.t())
         if ctx.needs_input_grad[1]:
-            grad_dense = torch.zeros_like(dense.data)
-            _C_gemm.sparse_mm_dense_cusparse(sparse.t(), grad_output, grad_dense)
-            # grad_dense = sparse.t().mm(grad_output)
+            if _has_c_gemm:
+                grad_dense = torch.zeros_like(dense.data)
+                _C_gemm.sparse_mm_dense_cusparse(sparse.t(), grad_output, grad_dense)
+            else:
+                grad_dense = sparse.t().mm(grad_output)
         return grad_sparse, grad_dense
 
 
