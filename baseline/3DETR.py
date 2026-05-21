@@ -62,66 +62,23 @@ from utils.detr3_util import (
     shift_scale_points,
     scale_points,
 )
+from utils.pointnet_utils import (
+    square_distance,
+    index_points,
+    farthest_point_sample,
+    query_ball_point,
+)
 
 
 # ═══════════════════════════════════════════════════════
-# PointNet++ 工具函数 (纯 Python, 无需 CUDA 编译)
+# sample_and_group (3DETR 本地版: B,N,C 形状, 不同于 utils.pointnet_utils 的 T,B,N,C SPT 版)
 # ═══════════════════════════════════════════════════════
-
-def square_distance(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    """计算两组点之间的平方欧氏距离。"""
-    return torch.sum((src[:, :, None] - dst[:, None]) ** 2, dim=-1)
-
-
-def index_points(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """根据索引从点集中收集点。"""
-    B = points.shape[0]
-    view_shape = list(idx.shape)
-    view_shape[1:] = [1] * (len(view_shape) - 1)
-    repeat_shape = list(idx.shape)
-    repeat_shape[0] = 1
-    batch_indices = (
-        torch.arange(B, dtype=torch.long, device=points.device)
-        .view(view_shape).repeat(repeat_shape)
-    )
-    return points[batch_indices, idx, :]
-
-
-def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
-    """最远点采样 (FPS), 返回索引。"""
-    B, N, _ = xyz.shape
-    centroids = torch.zeros(B, npoint, dtype=torch.long, device=xyz.device)
-    distance = torch.full((B, N), 1e10, device=xyz.device)
-    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=xyz.device)
-    batch_indices = torch.arange(B, dtype=torch.long, device=xyz.device)
-    for i in range(npoint):
-        centroids[:, i] = farthest
-        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, dim=-1)
-        distance = torch.min(distance, dist)
-        farthest = torch.max(distance, dim=-1)[1]
-    return centroids
-
-
-def query_ball_point(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
-    """球查询, 返回分组索引。"""
-    B, N, _ = xyz.shape
-    S = new_xyz.shape[1]
-    group_idx = (torch.arange(N, dtype=torch.long, device=xyz.device)
-                 .view(1, 1, N).repeat(B, S, 1))
-    sqrdists = square_distance(new_xyz, xyz)
-    group_idx[sqrdists > radius ** 2] = N
-    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
-    group_first = group_idx[:, :, 0].view(B, S, 1).repeat(1, 1, nsample)
-    group_idx[group_idx == N] = group_first[group_idx == N]
-    return group_idx
-
 
 def sample_and_group(
     npoint: int, radius: float, nsample: int,
     xyz: torch.Tensor, points: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """FPS + 球查询 + 分组 + 坐标归一化。"""
+    """FPS + 球查询 + 分组 + 坐标归一化 (标准 (B,N,C) 形状)。"""
     fps_idx = farthest_point_sample(xyz, npoint)
     new_xyz = index_points(xyz, fps_idx)
     idx = query_ball_point(radius, nsample, xyz, new_xyz)
@@ -353,7 +310,7 @@ class TransformerEncoderLayer(nn.Module):
         return self.forward_post(src, src_mask, src_key_padding_mask, pos)
 
 
-class TransformerEncoder(nn.Module):
+class DETRTransformerEncoder(nn.Module):
     """
     堆叠多个 TransformerEncoderLayer.
     对应官方 TransformerEncoder (transformer.py).
@@ -425,7 +382,7 @@ class TransformerEncoder(nn.Module):
         return None, output, None  # xyz=None, output, xyz_inds=None
 
 
-class MaskedTransformerEncoder(TransformerEncoder):
+class MaskedTransformerEncoder(DETRTransformerEncoder):
     """
     Masked Transformer Encoder — 带半径掩码 + 中间降采样.
     对应官方 MaskedTransformerEncoder (transformer.py).
@@ -1190,7 +1147,7 @@ def build_encoder(
     )
 
     if enc_type == "vanilla":
-        encoder = TransformerEncoder(
+        encoder = DETRTransformerEncoder(
             encoder_layer=encoder_layer, num_layers=enc_nlayers
         )
     elif enc_type == "masked":

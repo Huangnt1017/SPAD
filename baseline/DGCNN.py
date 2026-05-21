@@ -2,7 +2,7 @@
 DGCNN: Dynamic Graph CNN for Learning on Point Clouds
 
 GitHub:  https://github.com/WangYueFt/dgcnn
-Local:   D:\essay\3d目标检测复现仓库\dgcnn (baseline 参考)
+Local:   D:\essay\3d目标检测复现仓库\dgcnn-master (baseline 参考)
 
 @article{wang2019dynamic,
   title={Dynamic graph cnn for learning on point clouds},

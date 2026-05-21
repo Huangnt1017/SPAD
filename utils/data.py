@@ -88,6 +88,12 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Te
 # ============================================
 # Multi-task Data Pipeline (for train/test scripts)
 # ============================================
+SPAD_NORM_BOUNDS = {
+    "x": (1.0, 64.0),
+    "y": (1.0, 64.0),
+    "z": (1.0, 110.0),
+}
+
 ALPHABET_CLASSES: List[str] = [chr(ord("A") + i) for i in range(26)]
 ALPHABET_CLASS_TO_IDX: Dict[str, int] = {name: idx for idx, name in enumerate(ALPHABET_CLASSES)}
 
@@ -351,6 +357,51 @@ def _canonical_sample_path(sample: Dict[str, Optional[str]]) -> str:
     return Path(str(sample.get("path", ""))).as_posix().lower()
 
 
+def normalize_points(points: np.ndarray) -> np.ndarray:
+    """
+    将点云 (N, 4) 的 x/y/z/intensity 归一化到 [0, 1]。
+    x/y/z 使用固定物理范围，intensity 使用当前样本的 min/max。
+    """
+    normed = points.copy()
+    x_min, x_max = SPAD_NORM_BOUNDS["x"]
+    y_min, y_max = SPAD_NORM_BOUNDS["y"]
+    z_min, z_max = SPAD_NORM_BOUNDS["z"]
+
+    normed[:, 0] = (normed[:, 0] - x_min) / (x_max - x_min)
+    normed[:, 1] = (normed[:, 1] - y_min) / (y_max - y_min)
+    normed[:, 2] = (normed[:, 2] - z_min) / (z_max - z_min)
+
+    i_min = points[:, 3].min()
+    i_max = points[:, 3].max()
+    if i_max > i_min:
+        normed[:, 3] = (normed[:, 3] - i_min) / (i_max - i_min)
+    else:
+        normed[:, 3] = 0.0
+
+    normed = np.clip(normed, 0.0, 1.0)
+    return normed.astype(np.float32)
+
+
+def normalize_bbox(bbox: np.ndarray) -> np.ndarray:
+    """
+    将 bbox [xmin, xmax, ymin, ymax, zmin, zmax] 归一化到 [0, 1]，与点云使用相同的空间范围。
+    """
+    normed = bbox.copy()
+    x_min, x_max = SPAD_NORM_BOUNDS["x"]
+    y_min, y_max = SPAD_NORM_BOUNDS["y"]
+    z_min, z_max = SPAD_NORM_BOUNDS["z"]
+
+    normed[0] = (normed[0] - x_min) / (x_max - x_min)
+    normed[1] = (normed[1] - x_min) / (x_max - x_min)
+    normed[2] = (normed[2] - y_min) / (y_max - y_min)
+    normed[3] = (normed[3] - y_min) / (y_max - y_min)
+    normed[4] = (normed[4] - z_min) / (z_max - z_min)
+    normed[5] = (normed[5] - z_min) / (z_max - z_min)
+
+    normed[:6] = np.clip(normed[:6], 0.0, 1.0)
+    return normed.astype(np.float32)
+
+
 def _symbol_from_augmented_position(meta: Dict) -> str:
     tx = int(meta.get("target_x_range", [20, 35])[0])
     ty = int(meta.get("target_y_range", [5, 20])[0])
@@ -488,13 +539,17 @@ class SPADMultiTaskDataset(Dataset):
         if len(x_range) != 2 or len(y_range) != 2 or len(z_range) != 2:
             raise ValueError(f"Invalid target ranges in augmentation meta for sample: {sample['path']}")
 
-        label_row = [
+        label_row = np.array([
             float(x_range[0]), float(x_range[1]),
             float(y_range[0]), float(y_range[1]),
             float(z_range[0]), float(z_range[1]),
             float(label_idx),
-        ]
-        labels_array = np.array([label_row], dtype=np.float32)
+        ], dtype=np.float32)
+
+        points = normalize_points(points)
+        label_row = normalize_bbox(label_row)
+
+        labels_array = label_row.reshape(1, -1)
 
         points_tensor = torch.from_numpy(points)
         label_tensor = torch.from_numpy(labels_array)

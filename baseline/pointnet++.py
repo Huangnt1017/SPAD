@@ -210,53 +210,6 @@ class PointNetSetAbstractionMsg(nn.Module):
         return new_xyz, new_points_concat
 
 
-class PointNetSetAbstraction(nn.Module):
-    """
-    PointNet++ Set Abstraction (SSG)
-    """
-    def __init__(self, npoint, radius, nsample, in_channel, mlp, group_all):
-        super().__init__()
-        self.npoint = npoint
-        self.radius = radius
-        self.nsample = nsample
-        self.group_all = group_all
-
-        layers = []
-        last_channel = in_channel + 3
-        for out_channel in mlp:
-            layers.append(nn.Conv2d(last_channel, out_channel, 1))
-            layers.append(nn.BatchNorm2d(out_channel))
-            layers.append(nn.ReLU(inplace=True))
-            last_channel = out_channel
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, xyz, points):
-        """
-        xyz: [B, 3, N]
-        points: [B, D, N] or None
-        Return:
-            new_xyz: [B, 3, S]
-            new_points: [B, D', S]
-        """
-        xyz = xyz.transpose(1, 2).contiguous()  # [B, N, 3]
-        if points is not None:
-            points = points.transpose(1, 2).contiguous()  # [B, N, D]
-
-        if self.group_all:
-            new_xyz, new_points = sample_and_group_all(xyz, points)
-        else:
-            new_xyz, new_points = sample_and_group(
-                self.npoint, self.radius, self.nsample, xyz, points
-            )  # new_points: [B, S, K, C]
-
-        new_points = new_points.permute(0, 3, 2, 1).contiguous()  # [B, C, K, S]
-        new_points = self.mlp(new_points)
-        new_points = torch.max(new_points, 2)[0]  # [B, D', S]
-
-        new_xyz = new_xyz.transpose(1, 2).contiguous()  # [B, 3, S]
-        return new_xyz, new_points
-
-
 # ============================================================================
 # Feature Propagation (FP) 模块 — 用于上采样/分割网络
 # ============================================================================

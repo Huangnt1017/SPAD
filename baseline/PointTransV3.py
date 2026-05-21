@@ -409,7 +409,7 @@ class MLP(nn.Module):
 # Block (CPE + Attention + MLP)
 # ============================================================================
 
-class Block(PointModule):
+class PTv3Block(PointModule):
     """
     PTv3 Block:
     - CPE: 条件位置编码 (Conv1d 替代 spconv SubMConv3d)
@@ -740,7 +740,7 @@ class PointTransformerV3Cls(PointModule):
                 )
             for i in range(enc_depths[s]):
                 enc.add(
-                    Block(
+                    PTv3Block(
                         channels=enc_channels[s],
                         num_heads=enc_num_head[s],
                         patch_size=enc_patch_size[s],

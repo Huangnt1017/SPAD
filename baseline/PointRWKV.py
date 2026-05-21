@@ -43,26 +43,7 @@ from utils.point_rwkv_utils import (
     knn_point, fps, index_points, square_distance,
     Group, Encoder, MultiScaleGrouping, PointNetFeaturePropagation
 )
-
-
-# ============================================================================
-# DropPath (Stochastic Depth)
-# ============================================================================
-
-class DropPath(nn.Module):
-    """逐样本的随机深度 (Stochastic Depth)。"""
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x):
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor = torch.floor(random_tensor + keep_prob)
-        return x / keep_prob * random_tensor
+from utils.transformer_blocks import DropPath
 
 
 # ============================================================================

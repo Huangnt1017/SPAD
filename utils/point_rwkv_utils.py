@@ -1,15 +1,16 @@
 """
-PointRWKV & Point-BERT & Point-MAE 专用工具
+PointRWKV / PointBERT / PointMAE 共用的非几何辅助工具。
 
-唯一内容 (非几何基础操作):
-- Group: FPS + KNN 分组 (与 Point-BERT/Point-MAE 共享)
-- Encoder: Mini-PointNet 编码器
-- MultiScaleGrouping: 多尺度分组
+仅保留 RWKV 特有的多尺度封装 + PointNet++ 特征传播 + 训练指标:
+- MultiScaleGrouping: 多尺度分组 (基于 PatchGroup + PatchEncoder)
 - PointNetFeaturePropagation: 特征传播 (三近邻插值)
 - AverageMeter: 平均值统计
 
-注意: 基础几何函数 (square_distance, knn_point, fps, index_points, fps_points)
-已迁移至 utils.pointnet_utils, 从该模块导入。
+通用 patch 原语已迁移到 utils.transformer_blocks (PatchGroup / PatchEncoder),
+此处通过别名 `Group / Encoder` re-export 以保持现有调用方兼容。
+
+基础几何函数 (square_distance / knn_point / fps / index_points / fps_points)
+来自 utils.pointnet_utils。
 """
 
 import torch
@@ -19,79 +20,11 @@ import torch.nn.functional as F
 from utils.pointnet_utils import (
     square_distance, knn_point, fps, index_points, fps_points
 )
+from utils.transformer_blocks import PatchGroup, PatchEncoder
 
-
-# ============================================================================
-# 点分组: FPS + KNN 构建局部 patches
-# ============================================================================
-
-class Group(nn.Module):
-    """FPS + KNN 分组，创建局部点 patch。
-
-    先用 FPS 采样关键点 (中心)，再用 KNN 获取每个中心的邻域点，
-    最后将邻域归一化到以中心为原点的局部坐标。
-    """
-    def __init__(self, num_group: int, group_size: int):
-        super().__init__()
-        self.num_group = num_group
-        self.group_size = group_size
-
-    def forward(self, xyz):
-        """
-        Args:
-            xyz: (B, N, 3) — 输入点云
-        Returns:
-            neighborhood: (B, G, K, 3) — 中心归一化后的局部点云 patches
-            center: (B, G, 3) — 采样中心点坐标
-        """
-        center_idx = fps(xyz, self.num_group)                    # (B, G)
-        center = index_points(xyz, center_idx)                   # (B, G, 3)
-        idx = knn_point(self.group_size, xyz, center)            # (B, G, K)
-        neighborhood = index_points(xyz, idx)                    # (B, G, K, 3)
-        neighborhood = neighborhood - center.unsqueeze(2)        # 中心归一化
-        return neighborhood, center
-
-
-# ============================================================================
-# Mini-PointNet 编码器 (用于点 patches)
-# ============================================================================
-
-class Encoder(nn.Module):
-    """Mini-PointNet 编码器，将局部点 patch 编码为特征向量。
-
-    架构: Conv1d(3→128→256) → 全局最大池化 → 拼接 → Conv1d(512→512→C)
-    """
-    def __init__(self, encoder_channel: int):
-        super().__init__()
-        self.encoder_channel = encoder_channel
-        self.first_conv = nn.Sequential(
-            nn.Conv1d(3, 128, 1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(128, 256, 1),
-        )
-        self.second_conv = nn.Sequential(
-            nn.Conv1d(512, 512, 1),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(512, encoder_channel, 1),
-        )
-
-    def forward(self, point_groups):
-        """
-        Args:
-            point_groups: (B, G, K, 3) — 归一化后的点 patches
-        Returns:
-            feature: (B, G, C) — 编码后的 patch 特征
-        """
-        B, G, K, _ = point_groups.shape
-        point_groups = point_groups.reshape(B * G, K, 3).permute(0, 2, 1)  # (B*G, 3, K)
-        feature = self.first_conv(point_groups)                            # (B*G, 256, K)
-        feature_global = torch.max(feature, dim=2, keepdim=True)[0]        # (B*G, 256, 1)
-        feature = torch.cat([feature_global.expand(-1, -1, K), feature], dim=1)  # (B*G, 512, K)
-        feature = self.second_conv(feature)                                 # (B*G, C, K)
-        feature_global = torch.max(feature, dim=2)[0]                       # (B*G, C)
-        return feature_global.reshape(B, G, self.encoder_channel)
+# 兼容别名 — 旧代码以 Group / Encoder 名导入
+Group = PatchGroup
+Encoder = PatchEncoder
 
 
 # ============================================================================

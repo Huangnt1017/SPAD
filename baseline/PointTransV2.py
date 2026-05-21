@@ -280,7 +280,7 @@ class GroupedVectorAttention(nn.Module):
 # Block (注意力 + FFN 残差块)
 # ============================================================================
 
-class Block(nn.Module):
+class PTv2Block(nn.Module):
     def __init__(
         self,
         embed_channels: int,
@@ -352,7 +352,7 @@ class BlockSequence(nn.Module):
         self.neighbours = neighbours
         self.blocks = nn.ModuleList()
         for i in range(depth):
-            block = Block(
+            block = PTv2Block(
                 embed_channels=embed_channels,
                 groups=groups,
                 qkv_bias=qkv_bias,
@@ -508,7 +508,7 @@ class GVAPatchEmbed(nn.Module):
 # Encoder (下采样 + 特征提取)
 # ============================================================================
 
-class Encoder(nn.Module):
+class PTv2Encoder(nn.Module):
     def __init__(
         self,
         depth: int,
@@ -612,7 +612,7 @@ class PointTransformerV2Cls(nn.Module):
         # Encoder stages
         self.enc_stages = nn.ModuleList()
         for i in range(self.num_stages):
-            enc = Encoder(
+            enc = PTv2Encoder(
                 depth=enc_depths[i],
                 in_channels=enc_channels_list[i],
                 embed_channels=enc_channels_list[i + 1],

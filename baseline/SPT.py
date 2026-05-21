@@ -38,7 +38,7 @@ from utils.pointnet_utils import (
 class globals:
     MID_TIME = 0.0
 
-class TransformerBlock(nn.Module):
+class SPTTransformerBlock(nn.Module):
     def __init__(self, d_points, d_model, k, timestep, spike_mode, use_encoder) -> None:
         super().__init__()
         self.fc1 = nn.Sequential(
@@ -121,7 +121,7 @@ class TransformerBlock(nn.Module):
         return res, attn
 
 
-class TransitionDown(nn.Module):
+class SPTTransitionDown(nn.Module):
     def __init__(self, k, nneighbor, channels, timestep, spike_mode, use_encoder):
         super().__init__()
         self.sa = PointNetSetAbstraction(k, 0, nneighbor, channels[0], channels[1:], timestep, spike_mode, use_encoder, group_all=False, knn=True)
@@ -158,14 +158,14 @@ class Backbone(nn.Module):
             nn.BatchNorm1d(32),
         )
 
-        transblock = lambda channel: TransformerBlock(channel, transformer_dim, nneighbor, timestep, spike_mode, use_encoder)
+        transblock = lambda channel: SPTTransformerBlock(channel, transformer_dim, nneighbor, timestep, spike_mode, use_encoder)
         self.transformer1 = nn.ModuleList(transblock(32) for _ in range(blocks[0]))
 
         self.transition_downs = nn.ModuleList()
         self.transformers = nn.ModuleList()
         for i in range(nblocks):
             channel = 32 * 2 ** (i + 1)
-            self.transition_downs.append(TransitionDown(npoints // 4 ** (i + 1), nneighbor, [channel // 2 + 3, channel, channel], timestep, spike_mode, use_encoder))
+            self.transition_downs.append(SPTTransitionDown(npoints // 4 ** (i + 1), nneighbor, [channel // 2 + 3, channel, channel], timestep, spike_mode, use_encoder))
             for _ in range(blocks[i + 1]):
                 self.transformers.append(transblock(channel))
 
@@ -190,7 +190,7 @@ class Backbone(nn.Module):
         return points, xyz_and_feats
 
 
-class PointTransformerCls(nn.Module):
+class SPTPointTransformerCls(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.backbone = Backbone(cfg)
@@ -296,7 +296,7 @@ class PointTransformerCls(nn.Module):
         
         return {"logits": res_cls, "box_pred": res_box}
 
-SPTNet = PointTransformerCls
+SPTNet = SPTPointTransformerCls
 
 
 # ═══════════════════════════════════════════════════════
@@ -327,7 +327,7 @@ if __name__ == "__main__":
         ),
     )
 
-    model = PointTransformerCls(cfg).to(device)
+    model = SPTPointTransformerCls(cfg).to(device)
     pts = torch.randn(2, 1024, 4, device=device)
     out = model(pts)
     print(f"logits: {out['logits'].shape}, box_pred: {out['box_pred'].shape}")
@@ -350,7 +350,7 @@ if __name__ == "__main__":
         N = 1024
         for bs in [4, 8, 16, 32]:
             try:
-                m = PointTransformerCls(cfg).cuda()
+                m = SPTPointTransformerCls(cfg).cuda()
                 pts = torch.randn(bs, N, 4).cuda()
                 torch.cuda.empty_cache()
                 gc.collect()

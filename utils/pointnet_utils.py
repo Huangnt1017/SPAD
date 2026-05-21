@@ -300,20 +300,9 @@ def sample_and_group_all(xyz, points):
 # ============================================================================
 # Spike-related code (SPT model)
 # ============================================================================
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-try:
-    from spikingjelly.clock_driven.neuron import (
-        MultiStepLIFNode, MultiStepEIFNode,
-        MultiStepParametricLIFNode, MultiStepIFNode
-    )
-except ImportError:
-    import logging
-    logging.warning("Please install spikingjelly: pip install spikingjelly")
-
+# 几何辅助函数 (square_distance/index_points/farthest_point_sample/query_ball_point/
+# sample_and_group/sample_and_group_all) 已在本文件上方定义, 此处不再重复;
+# torch / nn / F / spikingjelly 已在文件顶部 import, 此处亦无需重复 import.
 
 class HeavisideSigmoid(torch.autograd.Function):
     @staticmethod
@@ -347,98 +336,6 @@ class HeavisideParametricSigmoid(torch.autograd.Function):
 
 heaviside_sigmoid = HeavisideSigmoid.apply
 heaviside_parametric_sigmoid = HeavisideParametricSigmoid.apply
-
-
-def square_distance(src, dst):
-    if src.dim() == 4 and dst.dim() == 4:
-        return torch.sum((src[:, :, :, None] - dst[:, :, None]) ** 2, dim=-1)
-    return torch.sum((src[:, :, None] - dst[:, None]) ** 2, dim=-1)
-
-
-def index_points(points, idx):
-    idx = idx.to(torch.int64)
-    raw_size = idx.size()
-    idx = idx.reshape(raw_size[0], raw_size[1], -1) if len(raw_size) == 4 else idx.reshape(raw_size[0], -1)
-    idx_size = list(idx.shape)
-    idx_size.append(points.size(-1))
-    res = torch.gather(points, 2 if len(raw_size) == 4 else 1, idx[..., None].expand(*idx_size))
-    return res.reshape(*raw_size, -1)
-
-
-def farthest_point_sample(xyz, npoint):
-    device = xyz.device
-    B, N, C = xyz.shape
-    centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
-    distance = torch.ones(B, N, device=device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
-    batch_indices = torch.arange(B, dtype=torch.long, device=device)
-    for i in range(npoint):
-        centroids[:, i] = farthest
-        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
-        mask = dist < distance
-        distance[mask] = dist[mask]
-        farthest = torch.max(distance, -1)[1]
-    return centroids
-
-
-def query_ball_point(radius, nsample, xyz, new_xyz):
-    device = xyz.device
-    B, N, C = xyz.shape
-    _, S, _ = new_xyz.shape
-    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
-    sqrdists = square_distance(new_xyz, xyz)
-    group_idx[sqrdists > radius ** 2] = N
-    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
-    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
-    mask = group_idx == N
-    group_idx[mask] = group_first[mask]
-    return group_idx
-
-
-def sample_and_group(npoint, radius, nsample, xyz, points, use_encoder, returnfps=False, knn=False):
-    T, B, N, C = xyz.shape
-    S = npoint
-    loc = xyz[0] if not use_encoder else xyz.flatten(0, 1)
-
-    fps_idx = farthest_point_sample(loc, npoint)
-
-    torch.cuda.empty_cache()
-    new_xyz = index_points(loc, fps_idx)
-    new_xyz = new_xyz.repeat(T, 1, 1, 1) if not use_encoder else new_xyz.view(T, B, -1, C)
-
-    torch.cuda.empty_cache()
-    if knn:
-        dists = square_distance(new_xyz, xyz)
-        idx = dists.argsort()[:, :, :, :nsample]
-    else:
-        idx = query_ball_point(radius, nsample, xyz, new_xyz)
-    torch.cuda.empty_cache()
-    grouped_xyz = index_points(xyz, idx)
-    torch.cuda.empty_cache()
-    grouped_xyz_norm = grouped_xyz - new_xyz.view(T, B, S, 1, C)
-    torch.cuda.empty_cache()
-
-    if points is not None:
-        grouped_points = index_points(points, idx)
-        new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
-    else:
-        new_points = grouped_xyz_norm
-    if returnfps:
-        return new_xyz, new_points, grouped_xyz, fps_idx
-    return new_xyz, new_points
-
-
-def sample_and_group_all(xyz, points):
-    device = xyz.device
-    T, B, N, C = xyz.shape
-    new_xyz = torch.zeros(T, B, 1, C).to(device)
-    grouped_xyz = xyz.view(T, B, 1, N, C)
-    if points is not None:
-        new_points = torch.cat([grouped_xyz, points.view(T, B, 1, N, -1)], dim=-1)
-    else:
-        new_points = grouped_xyz
-    return new_xyz, new_points
 
 
 class MoELIFNode(nn.Module):
