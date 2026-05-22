@@ -27,6 +27,7 @@ from utils.loss import (
 	DEFAULT_SPAD_BOX_BOUNDS,
 	box_iou_3d_aligned,
 	canonicalize_boxes_3d,
+	center_to_corners,
 	decode_normalized_boxes_3d,
 	split_cls_and_box_predictions,
 )
@@ -437,7 +438,13 @@ def evaluate(
 
 			if box_preds is not None and box_targets is not None:
 				try:
-					pred_boxes = canonicalize_boxes_3d(box_preds, device=device, dtype=box_targets.dtype)
+					# 新约定: 模型输出 [B,3] 中心点; 用固定半宽重建 6 维 bbox。
+					# 兼容老模型 [B,6] 角点输出 (3DETR 等仍用 6 维内部表示)。
+					box_preds_t = torch.as_tensor(box_preds, device=device, dtype=box_targets.dtype)
+					if box_preds_t.shape[-1] == 3:
+						pred_boxes = center_to_corners(box_preds_t, device=device, dtype=box_targets.dtype)
+					else:
+						pred_boxes = canonicalize_boxes_3d(box_preds_t, device=device, dtype=box_targets.dtype)
 					gt_boxes = canonicalize_boxes_3d(box_targets, device=device, dtype=box_targets.dtype)
 					if box_space == "normalized":
 						pred_boxes = decode_normalized_boxes_3d(pred_boxes, bounds=box_bounds, device=device, dtype=gt_boxes.dtype)

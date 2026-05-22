@@ -228,9 +228,9 @@ class PointTransformerCls(nn.Module):
             nn.Conv1d(256, 64, 1),
             nn.BatchNorm1d(64),
             build_spike_node(timestep, spike_mode) if spike_mode is not None else nn.ReLU(),
-            nn.Conv1d(64, 6, 1),
+            nn.Conv1d(64, 3, 1),
         )
-        
+
         self.nblocks = nblocks
         self.T = timestep
         self.spike_mode  = spike_mode

@@ -1,13 +1,26 @@
 """
-Point Transformer V2 for Object Classification + 3D BBox
+Point Transformer V2 (Wu et al., NeurIPS 2022) - 严格对齐 Pointcept 复现。
 
-GitHub:  https://github.com/Pointcept/Pointcept
-Local:   D:\essay\3d目标检测复现仓库\Pointcept-main
+参考:
+- D:\\essay\\3d目标检测复现仓库\\Pointcept-main\\Pointcept-main\\pointcept\\models\\point_transformer_v2\\
+    point_transformer_v2m1_origin.py
 
-Pointcept 官方实现复现 (Xiaoyang Wu)
-- Grouped Vector Attention (GVA) + Grid Pool (Partition-based Pooling)
-- 编码器-解码器架构 (分类只用编码器部分)
-- 输入: (B, N, 4) xyzi → 输出: (logits [B, C], box_pred [B, 6])
+复现说明:
+- ``PointBatchNorm / GroupedVectorAttention / PTv2Block(=Block) / BlockSequence / GridPool /
+  GVAPatchEmbed / PTv2Encoder(=Encoder)`` 与 Pointcept ``v2m1`` 一一对应; 默认超参 (patch_embed_*,
+  enc_depths=(2,2,6,2), enc_channels=(96,192,384,512), grid_sizes=(0.06,0.12,0.24,0.48) 等)
+  全部沿用官方值。
+- ``pointops.knn_query / pointops.grouping`` 替换为本文件 ``knn_query / grouping`` 纯 PyTorch 实现
+  (变长 offset 约定), 行为对应 ``pointops`` 的"返回 idx+dist"与"按索引 gather"。
+- ``torch_scatter.segment_csr`` 与 ``torch_geometric.nn.pool.voxel_grid`` 都尝试动态 import,
+  缺失时走 ``GridPool`` 的纯 PyTorch 回退路径 (在 ``GridPool.forward`` 注释里说明)。
+- Pointcept 参考是 **语义分割** (per-point ``seg_logits``); SPAD 用作 **分类**, 因此只保留 encoder 部分,
+  encoder 末层后做按 offset 的全局平均池化, 再接 ``cls_head`` (logits) + ``center_head`` (3D 中心点),
+  **这是与 Pointcept 唯一的差异**, 其余层一律保留。
+
+数据契约 (与项目其他 baseline 一致):
+- 输入: (B, N, 4) xyzi 点云。
+- 输出: tuple (logits [B, num_classes], center_pred [B, 3])。
 
 Reference:
 @article{wu2022point,
@@ -562,7 +575,7 @@ class PointTransformerV2Cls(nn.Module):
         self,
         in_channels: int = 4,
         num_classes: int = 40,
-        box_dim: int = 6,
+        box_dim: int = 3,
         patch_embed_depth: int = 1,
         patch_embed_channels: int = 48,
         patch_embed_groups: int = 6,
@@ -630,7 +643,8 @@ class PointTransformerV2Cls(nn.Module):
             )
             self.enc_stages.append(enc)
 
-        # Classification head
+        # 分类头: 与 Pointcept 的 seg_head 结构一致 (Linear → BN → ReLU → Linear), 仅在最后一层
+        # 接 ``num_classes`` 输出; 增加两层 Dropout(0.5) 与 SPAD 项目其他 baseline 的分类头保持一致。
         final_channels = enc_channels_list[-1]
         self.cls_head = nn.Sequential(
             nn.Linear(final_channels, 256),
@@ -644,8 +658,8 @@ class PointTransformerV2Cls(nn.Module):
             nn.Linear(128, num_classes),
         )
 
-        # Box regression head
-        self.box_head = nn.Sequential(
+        # 中心点回归头 (SPAD 特有 center-only 约定): 输出 [B, 3], 由全局特征预测归一化中心。
+        self.center_head = nn.Sequential(
             nn.Linear(final_channels, 128),
             nn.BatchNorm1d(128),
             nn.LeakyReLU(negative_slope=0.2),
@@ -656,39 +670,45 @@ class PointTransformerV2Cls(nn.Module):
     def forward(self, data_dict):
         """
         Args:
-            data_dict: {"coord": (N,3), "feat": (N,C), "offset": (B,)}
+            data_dict: {
+                ``coord``: (N, 3) 变长批拼接坐标
+                ``feat``: (N, C_in) 变长批拼接特征 (Pointcept 约定 feat 含 coord, 见 SPAD 适配封装)
+                ``offset``: (B,) cumsum 形式的 batch 划分
+            }
+
         Returns:
             logits: (B, num_classes)
-            box_pred: (B, box_dim)
+            center_pred: (B, 3) 归一化空间中心点
         """
         coord = data_dict["coord"]
         feat = data_dict["feat"]
         offset = data_dict["offset"].int()
 
+        # 数据流: patch_embed 把 in_channels → patch_embed_channels=48; 然后 4 个 encoder 阶段
+        # 每阶段 = GridPool 下采样 + BlockSequence 注意力块, 末端 feat 维度 = enc_channels[-1] (默认 512)。
         points = [coord, feat, offset]
         points = self.patch_embed(points)
-
         for i in range(self.num_stages):
             points, _ = self.enc_stages[i](points)
-
         coord, feat, offset = points
 
-        # 全局平均池化 (按样本)
-        x_list = []
+        # 全局平均池化: 按 offset 把每个样本对应的点特征取均值, 得到 (B, final_channels)。
+        # 数据流: feat 形状 (N_final, C_final) → 逐 batch slice [s_i:e_i] → mean(0) → (1, C) → cat → (B, C)。
+        pooled = []
         for i in range(len(offset)):
-            s_i = 0 if i == 0 else offset[i - 1].item()
-            e_i = offset[i].item()
+            s_i = 0 if i == 0 else int(offset[i - 1].item())
+            e_i = int(offset[i].item())
             cnt = e_i - s_i
             if cnt > 0:
-                x_b = feat[s_i:e_i].mean(0, keepdim=True)
+                pooled.append(feat[s_i:e_i].mean(0, keepdim=True))
             else:
-                x_b = torch.zeros(1, feat.shape[1], device=feat.device)
-            x_list.append(x_b)
-        x = torch.cat(x_list, 0)  # (B, C)
+                # 极端情况: GridPool 把整个 batch 压成空 — 用零向量占位避免崩溃。
+                pooled.append(torch.zeros(1, feat.shape[1], device=feat.device, dtype=feat.dtype))
+        feat_global = torch.cat(pooled, dim=0)  # (B, final_channels)
 
-        logits = self.cls_head(x)
-        box_pred = self.box_head(x)
-        return logits, box_pred
+        logits = self.cls_head(feat_global)
+        center_pred = self.center_head(feat_global)
+        return logits, center_pred
 
 
 # ============================================================================
@@ -696,47 +716,53 @@ class PointTransformerV2Cls(nn.Module):
 # ============================================================================
 
 class PointTransV2Classification(PointTransformerV2Cls):
-    """
-    PointTransV2Classification — 适配 SPAD 训练管道
+    """SPAD 训练管道适配封装。
 
-    输入: (B, N, 4) xyzi 点云
-    输出: (logits [B, num_classes], box_pred [B, 6])
+    与项目其它 baseline 一致, 接收 (B, N, 4) xyzi 点云, 内部转换为 Pointcept 期望的
+    ``data_dict = {coord, feat, offset}``: coord 取前 3 维, feat 直接用整个 4 维向量
+    (Pointcept ``in_channels=4`` 时把 xyz+intensity 一并送入 patch_embed 的 Linear)。
     """
-    def __init__(self, num_classes=26, **kwargs):
+
+    def __init__(self, num_classes: int = 26, **kwargs):
         super().__init__(in_channels=4, num_classes=num_classes, **kwargs)
 
     @staticmethod
-    def _normalize_input_points(x):
-        """统一输入格式为 (B, N, 4)"""
+    def _normalize_input_points(x: torch.Tensor) -> torch.Tensor:
+        """统一输入为 (B, N, 4); 见 PointTransformer.py 中同名函数的实现说明。"""
         if x.ndim != 3:
-            raise ValueError(f"Expected 3D input, got shape {tuple(x.shape)}")
+            raise ValueError(f"PointTransV2Classification 仅接受 3D 输入, 收到 {tuple(x.shape)}")
         if x.shape[-1] in (3, 4):
             points = x
         elif x.shape[1] in (3, 4):
-            points = x.transpose(1, 2).contiguous()
+            points = x.transpose(1, 2).contiguous()   # (B, C, N) → (B, N, C)
         else:
-            raise ValueError(f"Unsupported shape {tuple(x.shape)}")
+            raise ValueError(f"PointTransV2Classification 不支持的形状 {tuple(x.shape)}")
         if points.shape[-1] == 3:
-            pad_i = torch.zeros(points.shape[0], points.shape[1], 1,
-                                dtype=points.dtype, device=points.device)
-            points = torch.cat([points, pad_i], dim=-1)
+            pad_intensity = torch.zeros(
+                points.shape[0], points.shape[1], 1, dtype=points.dtype, device=points.device,
+            )
+            points = torch.cat([points, pad_intensity], dim=-1)
         return points
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x: (B, N, 4) xyzi 点云
-        Returns:
-            logits: (B, num_classes)
-            box_pred: (B, 6)
-        """
-        x = self._normalize_input_points(x)
-        B, N, C_in = x.shape
+            x: (B, N, 4) xyzi 或可被 ``_normalize_input_points`` 识别的等价布局。
 
-        # Pointcept 约定: feat = concat(coord, intensity)
-        coord = x[:, :, :3].reshape(B * N, 3).contiguous()
-        feat = x.reshape(B * N, -1).contiguous()  # 全量 4 维特征
-        offset = torch.arange(N, (B + 1) * N, step=N, dtype=torch.long, device=x.device)
+        Returns:
+            (logits [B, num_classes], center_pred [B, 3])。
+        """
+        points = self._normalize_input_points(x)
+        batch_size, num_points, _ = points.shape
+
+        # 数据流: (B, N, 4) → coord (B*N, 3) + feat (B*N, 4) + offset (B,) = arange step N。
+        # Pointcept v2 习惯把全量特征 (含 xyz) 喂入 patch_embed, 故 feat 用整张 (B, N, 4)。
+        coord = points[:, :, :3].reshape(batch_size * num_points, 3).contiguous()
+        feat = points.reshape(batch_size * num_points, -1).contiguous()
+        offset = torch.arange(
+            num_points, (batch_size + 1) * num_points, step=num_points,
+            dtype=torch.long, device=points.device,
+        )
 
         data_dict = {"coord": coord, "feat": feat, "offset": offset}
         return super().forward(data_dict)
@@ -746,57 +772,57 @@ class PointTransV2Classification(PointTransformerV2Cls):
 # 快速测试 + GPU 显存测试
 # ============================================================================
 
-def _quick_test():
-    """形状验证。"""
+def _quick_test() -> None:
+    """简单 forward 形状检查; CPU/CUDA 通用。"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Testing PointTransformer V2 on {device}")
 
     model = PointTransV2Classification(num_classes=26).to(device)
     pts = torch.randn(2, 1024, 4, device=device)
-    logits, box_pred = model(pts)
+    logits, center_pred = model(pts)
     print(f"Input:  {tuple(pts.shape)}")
     print(f"Logits: {tuple(logits.shape)}")
-    print(f"Box:    {tuple(box_pred.shape)}")
-    print("✓ PointTransformer V2 works correctly")
+    print(f"Center: {tuple(center_pred.shape)}")
+    print("OK PointTransformer V2 works correctly")
 
 
-def _gpu_memory_test():
-    """GPU 显存压力测试 (逐 batch size 扫查)。"""
+def _gpu_memory_test() -> None:
+    """逐 batch size 显存扫查 (4/8/16/32)。CPU 环境下直接跳过。"""
     import gc
     if not torch.cuda.is_available():
-        print("无 CUDA，跳过 GPU 显存测试。")
+        print("无 CUDA, 跳过 GPU 显存测试。")
         return
 
     print("\n=== GPU 显存测试 ===")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     try:
         props = torch.cuda.get_device_properties(0)
-        total_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+        total_mem = getattr(props, "total_memory", getattr(props, "total_mem", 0))
         if total_mem:
-            print(f"总显存: {total_mem / 1024**3:.1f} GB")
+            print(f"总显存: {total_mem / 1024 ** 3:.1f} GB")
     except Exception:
         pass
     print()
 
-    N = 1024
-    for bs in [4, 8, 16, 32]:
+    num_points = 1024
+    for batch_size in [4, 8, 16, 32]:
         try:
             m = PointTransV2Classification(num_classes=26).cuda()
-            pts = torch.randn(bs, N, 4).cuda()
+            pts = torch.randn(batch_size, num_points, 4).cuda()
             torch.cuda.empty_cache()
             gc.collect()
             torch.cuda.reset_peak_memory_stats()
             m.train()
-            o = m(pts)
-            loss = o[0].sum() + o[1].sum()
+            out = m(pts)
+            loss = out[0].sum() + out[1].sum()
             loss.backward()
-            peak = torch.cuda.max_memory_allocated() / 1024**2
-            print(f"  B={bs:2d}: peak {peak:6.0f} MB")
-            del m, pts, o, loss
+            peak = torch.cuda.max_memory_allocated() / 1024 ** 2
+            print(f"  B={batch_size:2d}: peak {peak:6.0f} MB")
+            del m, pts, out, loss
             torch.cuda.empty_cache()
             gc.collect()
         except torch.cuda.OutOfMemoryError:
-            print(f"  B={bs:2d}: OOM!")
+            print(f"  B={batch_size:2d}: OOM!")
             torch.cuda.empty_cache()
             gc.collect()
             break

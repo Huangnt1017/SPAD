@@ -1,13 +1,25 @@
 """
-Point Transformer V3 for Object Classification + 3D BBox
+Point Transformer V3 (Wu et al., CVPR 2024) - 严格对齐 Pointcept 复现。
 
-GitHub:  https://github.com/Pointcept/Pointcept
-Local:   D:\essay\3d目标检测复现仓库\Pointcept-main
+参考:
+- D:\\essay\\3d目标检测复现仓库\\Pointcept-main\\Pointcept-main\\pointcept\\models\\point_transformer_v3\\
+    point_transformer_v3m1_base.py
 
-Pointcept 官方实现复现 (Xiaoyang Wu)
-- Serialized Attention + Serialized Pooling/Unpooling
-- 使用 Z-order / Hilbert 序列化实现高效注意力
-- 纯 PyTorch 实现 (无需 spconv / flash_attn)
+复现说明 (与官方差异):
+- 官方使用 ``spconv.SubMConv3d`` 实现 Embedding stem 与 Block 中的 CPE (Conditional Position
+  Encoding); spconv 在 Windows 上安装复杂, 这里用 ``nn.Linear + LayerNorm`` 作纯 PyTorch
+  回退 (见 Embedding.forward / Block.cpe 的注释), 牺牲一些空间结构信息以换取部署便利。
+- 官方使用 ``flash_attn`` 加速; 此处默认 ``enable_flash=False`` 走标准 ``QKᵀ @ V`` 路径,
+  patch_size 自动 clamp 到 ``min(min_per_batch_points, patch_size_max)``。
+- ``torch_scatter.segment_csr`` 缺失时用手写的 ``scatter_add_`` 回退 (在 SerializedPooling 注释里说明)。
+- ``Point / PointModule / PointSequential / RPE / SerializedAttention / MLP / PTv3Block(=Block) /
+  SerializedPooling`` 全部与 Pointcept v3m1 一一对应; 序列化函数从 ``utils/serialization.py`` 复用。
+- Pointcept 参考是 encoder-decoder 用于分割; SPAD 用作 **分类**, 仅保留 encoder + 全局平均池化,
+  再接 ``cls_head`` (logits) + ``center_head`` (3D 中心点), **这是与 Pointcept 唯一的差异**。
+
+数据契约 (与项目其他 baseline 一致):
+- 输入: (B, N, 4) xyzi 点云。
+- 输出: tuple (logits [B, num_classes], center_pred [B, 3])。
 
 Reference:
 @inproceedings{wu2024point,
@@ -674,7 +686,7 @@ class PointTransformerV3Cls(PointModule):
         self,
         in_channels: int = 4,
         num_classes: int = 40,
-        box_dim: int = 6,
+        box_dim: int = 3,
         order: Tuple[str, ...] = ("z", "z-trans"),
         stride: Tuple[int, ...] = (2, 2, 2, 2),
         enc_depths: Tuple[int, ...] = (2, 2, 2, 6, 2),
@@ -778,8 +790,8 @@ class PointTransformerV3Cls(PointModule):
             nn.Linear(128, num_classes),
         )
 
-        # Box regression head
-        self.box_head = nn.Sequential(
+        # 中心点回归头 (SPAD 特有 center-only 约定): 输出 [B, 3], 由全局特征预测归一化中心。
+        self.center_head = nn.Sequential(
             nn.Linear(final_channels, 128),
             nn.BatchNorm1d(128),
             nn.LeakyReLU(negative_slope=0.2),
@@ -790,39 +802,45 @@ class PointTransformerV3Cls(PointModule):
     def forward(self, data_dict: dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            data_dict: {"coord": (N,3), "feat": (N,C), "offset": (B,),
-                       "grid_size": float, "grid_coord": (N,3) (可选)}
+            data_dict: 至少包含以下键 (与 Pointcept v3 完全一致):
+                ``coord``: (N, 3) 全部点坐标 (variable-length 批拼接)。
+                ``feat``: (N, C_in) 全部点特征 (Pointcept v3 把 xyz+其他 一并送入)。
+                ``offset``: (B,) cumsum 形式的 batch 划分。
+                ``grid_coord``: (N, 3) int 网格坐标 (由 SPAD 适配封装传入)。
+                ``grid_size``: float 网格尺寸 (序列化分辨率)。
 
         Returns:
             logits: (B, num_classes)
-            box_pred: (B, box_dim)
+            center_pred: (B, 3) 归一化空间中心点。
         """
         point = Point(data_dict)
-        # 序列化
+
+        # 数据流: 序列化生成 Z-order / Hilbert code; 见 Point.serialization 实现。
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
 
-        # 编码器
+        # 编码: Embedding stem (Linear stem 回退替代 spconv.SubMConv3d) → 多阶段
+        # SerializedPooling + Block 注意力。
         point = self.embedding(point)
         point = self.enc(point)
 
-        # 全局平均池化 (按样本)
+        # 全局平均池化: 按 offset 把每个样本最终 token 取均值, 得到 (B, final_channels)。
+        # 数据流: point.feat (N_final, C_final) → slice [s_i:e_i] → mean(0) → cat → (B, C_final)。
         feat = point.feat
         offset = point.offset
-        x_list = []
+        pooled = []
         for i in range(len(offset)):
-            s_i = 0 if i == 0 else offset[i - 1].item()
-            e_i = offset[i].item()
+            s_i = 0 if i == 0 else int(offset[i - 1].item())
+            e_i = int(offset[i].item())
             cnt = e_i - s_i
             if cnt > 0:
-                x_b = feat[s_i:e_i].mean(0, keepdim=True)
+                pooled.append(feat[s_i:e_i].mean(0, keepdim=True))
             else:
-                x_b = torch.zeros(1, feat.shape[1], device=feat.device)
-            x_list.append(x_b)
-        x = torch.cat(x_list, 0)
+                pooled.append(torch.zeros(1, feat.shape[1], device=feat.device, dtype=feat.dtype))
+        feat_global = torch.cat(pooled, dim=0)  # (B, final_channels)
 
-        logits = self.cls_head(x)
-        box_pred = self.box_head(x)
-        return logits, box_pred
+        logits = self.cls_head(feat_global)
+        center_pred = self.center_head(feat_global)
+        return logits, center_pred
 
 
 # ============================================================================
@@ -830,59 +848,68 @@ class PointTransformerV3Cls(PointModule):
 # ============================================================================
 
 class PointTransV3Classification(PointTransformerV3Cls):
-    """
-    PointTransV3Classification — 适配 SPAD 训练管道
+    """SPAD 训练管道适配封装。
 
-    输入: (B, N, 4) xyzi 点云
-    输出: (logits [B, num_classes], box_pred [B, 6])
+    接收 (B, N, 4) xyzi 点云, 内部构造 Pointcept v3 期望的 ``data_dict``。
+    与 v2 类似: ``feat`` 把整张 (B, N, 4) 一并送入 stem (Pointcept v3 习惯)。
+
+    额外职责: 由 coord 计算整数 ``grid_coord`` (序列化所需) 用默认 ``grid_size=0.02``。
+    SPAD 的 xyz 已归一化到 [0, 1], 0.02 网格尺寸对应每轴 ~50 个体素 bin。
     """
-    def __init__(self, num_classes=26, **kwargs):
+
+    GRID_SIZE: float = 0.02  # SPAD [0,1] 归一化空间的默认 grid_size
+
+    def __init__(self, num_classes: int = 26, **kwargs):
         super().__init__(in_channels=4, num_classes=num_classes, **kwargs)
 
     @staticmethod
-    def _normalize_input_points(x):
-        """统一输入格式为 (B, N, 4)"""
+    def _normalize_input_points(x: torch.Tensor) -> torch.Tensor:
+        """统一输入为 (B, N, 4); 行为与其他 baseline 同名函数一致。"""
         if x.ndim != 3:
-            raise ValueError(f"Expected 3D input, got shape {tuple(x.shape)}")
+            raise ValueError(f"PointTransV3Classification 仅接受 3D 输入, 收到 {tuple(x.shape)}")
         if x.shape[-1] in (3, 4):
             points = x
         elif x.shape[1] in (3, 4):
-            points = x.transpose(1, 2).contiguous()
+            points = x.transpose(1, 2).contiguous()   # (B, C, N) → (B, N, C)
         else:
-            raise ValueError(f"Unsupported shape {tuple(x.shape)}")
+            raise ValueError(f"PointTransV3Classification 不支持的形状 {tuple(x.shape)}")
         if points.shape[-1] == 3:
-            pad_i = torch.zeros(points.shape[0], points.shape[1], 1,
-                                dtype=points.dtype, device=points.device)
-            points = torch.cat([points, pad_i], dim=-1)
+            pad_intensity = torch.zeros(
+                points.shape[0], points.shape[1], 1, dtype=points.dtype, device=points.device,
+            )
+            points = torch.cat([points, pad_intensity], dim=-1)
         return points
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x: (B, N, 4) xyzi 点云
+            x: (B, N, 4) xyzi 或可被 ``_normalize_input_points`` 识别的等价布局。
+
         Returns:
-            logits: (B, num_classes)
-            box_pred: (B, 6)
+            (logits [B, num_classes], center_pred [B, 3])。
         """
-        x = self._normalize_input_points(x)
-        B, N, C_in = x.shape
+        points = self._normalize_input_points(x)         # (B, N, 4)
+        batch_size, num_points, _ = points.shape
 
-        coord = x[:, :, :3].reshape(B * N, 3).contiguous()
-        # Pointcept V3 约定: feat 包含全量特征 (包括 xyz)
-        feat = x.reshape(B * N, -1).contiguous()  # (B*N, 4) = xyzi
-        offset = torch.arange(N, (B + 1) * N, step=N, dtype=torch.long, device=x.device)
-        grid_size = 0.02  # 默认网格大小
+        # 数据流: (B, N, 4) → coord (B*N, 3) + feat (B*N, 4) + offset (B,) = arange step N。
+        coord = points[:, :, :3].reshape(batch_size * num_points, 3).contiguous()
+        feat = points.reshape(batch_size * num_points, -1).contiguous()
+        offset = torch.arange(
+            num_points, (batch_size + 1) * num_points, step=num_points,
+            dtype=torch.long, device=points.device,
+        )
 
-        # 生成 grid_coord (序列化需要)
+        # grid_coord 用于 Z-order / Hilbert 序列化, 形状 (B*N, 3) int。
+        # 数据流: 减去最小坐标得到非负值 → 除 grid_size 截断取整 → int 类型。
         grid_coord = torch.div(
-            coord - coord.min(0)[0], grid_size, rounding_mode="trunc"
+            coord - coord.min(0)[0], self.GRID_SIZE, rounding_mode="trunc",
         ).int()
 
         data_dict = {
             "coord": coord,
             "feat": feat,
             "offset": offset,
-            "grid_size": grid_size,
+            "grid_size": self.GRID_SIZE,
             "grid_coord": grid_coord,
         }
         return super().forward(data_dict)
@@ -892,57 +919,57 @@ class PointTransV3Classification(PointTransformerV3Cls):
 # 快速测试 + GPU 显存测试
 # ============================================================================
 
-def _quick_test():
-    """形状验证。"""
+def _quick_test() -> None:
+    """简单 forward 形状检查; CPU/CUDA 通用。"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Testing PointTransformer V3 on {device}")
 
     model = PointTransV3Classification(num_classes=26).to(device)
     pts = torch.randn(2, 1024, 4, device=device)
-    logits, box_pred = model(pts)
+    logits, center_pred = model(pts)
     print(f"Input:  {tuple(pts.shape)}")
     print(f"Logits: {tuple(logits.shape)}")
-    print(f"Box:    {tuple(box_pred.shape)}")
-    print("✓ PointTransformer V3 works correctly")
+    print(f"Center: {tuple(center_pred.shape)}")
+    print("OK PointTransformer V3 works correctly")
 
 
-def _gpu_memory_test():
-    """GPU 显存压力测试 (逐 batch size 扫查)。"""
+def _gpu_memory_test() -> None:
+    """逐 batch size 显存扫查 (4/8/16/32)。CPU 环境下直接跳过。"""
     import gc
     if not torch.cuda.is_available():
-        print("无 CUDA，跳过 GPU 显存测试。")
+        print("无 CUDA, 跳过 GPU 显存测试。")
         return
 
     print("\n=== GPU 显存测试 ===")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     try:
         props = torch.cuda.get_device_properties(0)
-        total_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+        total_mem = getattr(props, "total_memory", getattr(props, "total_mem", 0))
         if total_mem:
-            print(f"总显存: {total_mem / 1024**3:.1f} GB")
+            print(f"总显存: {total_mem / 1024 ** 3:.1f} GB")
     except Exception:
         pass
     print()
 
-    N = 1024
-    for bs in [4, 8, 16, 32]:
+    num_points = 1024
+    for batch_size in [4, 8, 16, 32]:
         try:
             m = PointTransV3Classification(num_classes=26).cuda()
-            pts = torch.randn(bs, N, 4).cuda()
+            pts = torch.randn(batch_size, num_points, 4).cuda()
             torch.cuda.empty_cache()
             gc.collect()
             torch.cuda.reset_peak_memory_stats()
             m.train()
-            o = m(pts)
-            loss = o[0].sum() + o[1].sum()
+            out = m(pts)
+            loss = out[0].sum() + out[1].sum()
             loss.backward()
-            peak = torch.cuda.max_memory_allocated() / 1024**2
-            print(f"  B={bs:2d}: peak {peak:6.0f} MB")
-            del m, pts, o, loss
+            peak = torch.cuda.max_memory_allocated() / 1024 ** 2
+            print(f"  B={batch_size:2d}: peak {peak:6.0f} MB")
+            del m, pts, out, loss
             torch.cuda.empty_cache()
             gc.collect()
         except torch.cuda.OutOfMemoryError:
-            print(f"  B={bs:2d}: OOM!")
+            print(f"  B={batch_size:2d}: OOM!")
             torch.cuda.empty_cache()
             gc.collect()
             break

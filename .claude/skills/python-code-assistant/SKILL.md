@@ -34,8 +34,8 @@ Provide Python code that is directly runnable, clearly named, type-safe where pr
 - Comment shape transitions before `reshape`, `view`, `permute`, `transpose`, or similar layout changes.
 - Explain the reason for important constants when they are not self-evident.
 - Mark temporary logic with `TODO(name) YYYY-MM-DD: next action`.
-- Do not leave commented-out code in files.
-
+- The commented-out code can be retained in the file, if it is for testing or for switching modes.
+- Detailed explanations must be provided for the inflow and outflow of data, especially for the changes in arrays, which should be annotated.
 ## Preferred structure
 - Order class methods as `__init__`, public methods, then private helpers.
 - Keep helpers small and focused.

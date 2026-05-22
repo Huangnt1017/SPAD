@@ -322,7 +322,7 @@ class PointNet2ClassificationSSG(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
-            nn.Linear(128, 6),
+            nn.Linear(128, 3),
         )
 
     @staticmethod
@@ -438,7 +438,7 @@ class PointNet2ClassificationMSG(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
-            nn.Linear(128, 6),
+            nn.Linear(128, 3),
         )
 
     @staticmethod

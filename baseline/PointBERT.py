@@ -106,7 +106,7 @@ class PointBERTClassification(nn.Module):
             nn.BatchNorm1d(128),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(0.2),
-            nn.Linear(128, 6),
+            nn.Linear(128, 3),
         )
 
         trunc_normal_(self.cls_token, std=0.02)

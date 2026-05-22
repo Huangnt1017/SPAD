@@ -16,7 +16,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.train import build_model, resolve_path, set_seed
 from utils.data import discover_spad_classification_samples, load_point_cloud_auto
-from utils.loss import DEFAULT_SPAD_BOX_BOUNDS, box_iou_3d_aligned, canonicalize_boxes_3d, decode_normalized_boxes_3d
+from utils.loss import (
+	DEFAULT_SPAD_BOX_BOUNDS,
+	box_iou_3d_aligned,
+	canonicalize_boxes_3d,
+	center_to_corners,
+	decode_normalized_boxes_3d,
+)
 
 
 def setup_logger(log_dir: Path) -> Tuple[logging.Logger, Path]:
@@ -202,7 +208,12 @@ def run_single_test(args: argparse.Namespace) -> Dict[str, str]:
 		pred_score, pred_idx = probs.max(dim=1)
 		pred_class = idx_to_class.get(int(pred_idx.item()), str(int(pred_idx.item())))
 
-		raw_pred_box = canonicalize_boxes_3d(box_pred, device=device, dtype=logits.dtype).squeeze(0)
+		# 新约定: 模型输出 [B,3] 中心点; 用固定半宽重建 6 维 bbox。兼容老模型 [B,6]。
+		box_pred_t = torch.as_tensor(box_pred, device=device, dtype=logits.dtype)
+		if box_pred_t.shape[-1] == 3:
+			raw_pred_box = center_to_corners(box_pred_t, device=device, dtype=logits.dtype).squeeze(0)
+		else:
+			raw_pred_box = canonicalize_boxes_3d(box_pred_t, device=device, dtype=logits.dtype).squeeze(0)
 		if args.box_space == "normalized":
 			decoded_pred_box = decode_normalized_boxes_3d(
 				raw_pred_box.unsqueeze(0),

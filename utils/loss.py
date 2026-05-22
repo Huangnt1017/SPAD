@@ -24,6 +24,59 @@ import torch.nn.functional as F
 TensorLike = Union[torch.Tensor, Sequence[float]]
 DEFAULT_SPAD_BOX_BOUNDS = ((1.0, 64.0), (1.0, 64.0), (60.0, 110.0))
 
+# ----------------------------------------------------------------------------
+# 固定 bbox 尺寸 (center-only 回归约定)
+# ----------------------------------------------------------------------------
+# SPAD 数据集 GT 框尺寸固定 (由 utils/data_augment.py 中 tgt_x=(20,35) / tgt_y=(5,20) /
+# tgt_z=(80,85) 决定; z 在 meta 里以 inclusive [80,84] 存储, 故 raw 宽度为 4)。
+# 既然尺寸固定, 模型只需回归中心点 (cx, cy, cz), 测试时用 ±half_size 重建 6 维 bbox。
+#
+# Raw 半宽: (7.5, 7.5, 2.0)
+# 归一化半宽: 用 SPAD_NORM_BOUNDS 的跨度 (63, 63, 109) 除原始半宽。
+FIXED_BBOX_RAW_HALF_SIZE: Tuple[float, float, float] = (7.5, 7.5, 2.0)
+FIXED_BBOX_HALF_SIZE_NORMALIZED: Tuple[float, float, float] = (
+    7.5 / 63.0,    # ≈ 0.11905
+    7.5 / 63.0,    # ≈ 0.11905
+    2.0 / 109.0,   # ≈ 0.01835
+)
+
+
+def corners_to_center(boxes: TensorLike,
+                      device: Optional[torch.device] = None,
+                      dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """从 6 维角点框 [xmin,xmax,ymin,ymax,zmin,zmax] 提取中心点 [cx,cy,cz]。"""
+    box_tensor = canonicalize_boxes_3d(boxes, device=device, dtype=dtype)
+    centers = (box_tensor[..., 1::2] + box_tensor[..., 0::2]) * 0.5  # (..., 3)
+    return centers
+
+
+def center_to_corners(centers: TensorLike,
+                      half_size: Sequence[float] = FIXED_BBOX_HALF_SIZE_NORMALIZED,
+                      device: Optional[torch.device] = None,
+                      dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """以固定半宽从中心点 [cx,cy,cz] 重建 6 维 bbox [xmin,xmax,ymin,ymax,zmin,zmax]。
+
+    Args:
+        centers: (..., 3) 中心点张量。
+        half_size: (hx, hy, hz) 三轴半宽 (归一化空间), 默认用 SPAD 数据集固定半宽。
+
+    Returns:
+        (..., 6) bbox 张量, 顺序 [xmin,xmax,ymin,ymax,zmin,zmax]。
+    """
+    centers_tensor = torch.as_tensor(centers, dtype=dtype, device=device)
+    if centers_tensor.shape[-1] != 3:
+        raise ValueError(f"center_to_corners expects last dim = 3, got {tuple(centers_tensor.shape)}")
+    hs = torch.as_tensor(half_size, dtype=centers_tensor.dtype, device=centers_tensor.device)
+    if hs.shape != (3,):
+        raise ValueError(f"half_size must be length-3, got {tuple(hs.shape)}")
+    cx, cy, cz = centers_tensor[..., 0], centers_tensor[..., 1], centers_tensor[..., 2]
+    hx, hy, hz = hs[0], hs[1], hs[2]
+    corners = torch.stack(
+        (cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz),
+        dim=-1,
+    )
+    return corners
+
 
 def to_box_tensor(boxes: TensorLike, device: Optional[torch.device] = None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
 	"""
@@ -307,16 +360,24 @@ def build_spad_boxes_from_meta(meta: Mapping[str, Any], device: Optional[torch.d
 
 class PointCloudMultiTaskLoss(nn.Module):
 	"""
-	Multi-task loss for point cloud classification + single 3D box regression.
+	点云分类 + 3D 中心点回归的多任务损失 (center-only 约定)。
+
+	GT 框尺寸固定 (见 FIXED_BBOX_HALF_SIZE_NORMALIZED), 模型只回归中心点 [cx,cy,cz];
+	测试/可视化时再用固定半宽重建 6 维 bbox。
 
 	Total loss:
-	  L = cls_weight * L_cls + box_l1_weight * L_smooth_l1 + box_iou_weight * (1 - IoU)
+	  L = cls_weight     * L_cls
+	    + box_l1_weight  * smooth_l1(pred_center, gt_center)
+	    + box_iou_weight * (1 - IoU3D(reconstructed_pred_box, reconstructed_gt_box))
 
-	数据流转：
-	- 输入 model_outputs 拆分为 logits/box_preds；
-	- logits 与 cls_targets 计算分类损失；
-	- 当 box_preds 与 box_targets 同时存在时，再计算 box L1 与 IoU 分支；
-	- 三部分按权重加和得到 total_loss。
+	IoU 监督仍走重建后的 6 维框 (用固定半宽 from center): 这样既能让"中心更靠近 GT"通过
+	IoU 链式回传额外的梯度压力, 又不会让模型偷预测尺寸 (尺寸完全由 FIXED_BBOX_HALF_SIZE_NORMALIZED 决定)。
+	纯 smooth_l1 在中心误差很小时梯度衰减, 加上 IoU 项可以维持精化压力。
+
+	输入约定:
+	- model_outputs 第二项 (box_preds / center_preds): [B, 3] 中心点 [cx,cy,cz];
+	- box_targets: [B, 6] 6 维角点框 [xmin,xmax,ymin,ymax,zmin,zmax] (与 dataloader 现有契约一致),
+	  内部用 corners_to_center 提取中心后再算 loss。
 	"""
 
 	def __init__(
@@ -325,12 +386,18 @@ class PointCloudMultiTaskLoss(nn.Module):
 		box_l1_weight: float = 1.0,
 		box_iou_weight: float = 1.0,
 		label_smoothing: float = 0.0,
+		half_size: Sequence[float] = FIXED_BBOX_HALF_SIZE_NORMALIZED,
 	):
 		super().__init__()
 		self.cls_weight = float(cls_weight)
 		self.box_l1_weight = float(box_l1_weight)
 		self.box_iou_weight = float(box_iou_weight)
 		self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
+		self.register_buffer(
+			"_half_size",
+			torch.tensor(half_size, dtype=torch.float32),
+			persistent=False,
+		)
 
 	def forward(
 		self,
@@ -343,18 +410,16 @@ class PointCloudMultiTaskLoss(nn.Module):
 		计算多任务损失并返回分项指标。
 
 		Args:
-			model_outputs: 模型输出，支持 Tensor / tuple/list / dict。
-			cls_targets: 分类标签，形状通常为 [B]。
-			box_targets: 3D 框监督，形状为 [B,6] 或兼容格式；可选。
-			box_valid_mask: 框监督有效样本掩码，形状 [B]；可选。
+			model_outputs: 模型输出, 第二项为 [B,3] 中心点预测 (或 None)。
+			cls_targets: 分类标签 [B]。
+			box_targets: GT 框, 仍按 [B,6] 角点形式传入 (内部转中心)。
+			box_valid_mask: 有效样本掩码 [B]。
 
 		Returns:
-			包含 total_loss、cls_loss、box_l1_loss、box_iou_loss、box_iou_mean 的字典。
-
-		Raises:
-			ValueError: 框形状不匹配，或 box_valid_mask 长度与 batch 不一致。
+			字典: total_loss / cls_loss / box_l1_loss (中心 smooth-L1) / box_iou_loss /
+			       box_iou_mean (用固定半宽重建后的 3D IoU, 仅监控)。
 		"""
-		logits, box_preds = split_cls_and_box_predictions(model_outputs)
+		logits, center_preds = split_cls_and_box_predictions(model_outputs)
 		cls_targets = cls_targets.long().to(logits.device)
 
 		cls_loss = self.cls_criterion(logits, cls_targets)
@@ -368,42 +433,67 @@ class PointCloudMultiTaskLoss(nn.Module):
 			"box_iou_mean": torch.zeros((), device=logits.device),
 		}
 
-		if box_targets is None or box_preds is None:
+		if box_targets is None or center_preds is None:
 			out["total_loss"] = total_loss
 			return out
 
-		pred_boxes = canonicalize_boxes_3d(box_preds, device=logits.device, dtype=logits.dtype)
-		gt_boxes = canonicalize_boxes_3d(box_targets, device=logits.device, dtype=logits.dtype)
-
-		if pred_boxes.shape != gt_boxes.shape:
+		# 模型输出可能是 [B,3] (新约定) 或历史 [B,6] (后向兼容); 都收敛到中心 [B,3]。
+		center_preds_t = torch.as_tensor(center_preds, dtype=logits.dtype, device=logits.device)
+		if center_preds_t.shape[-1] == 6:
+			pred_centers = corners_to_center(center_preds_t, device=logits.device, dtype=logits.dtype)
+		elif center_preds_t.shape[-1] == 3:
+			pred_centers = center_preds_t
+		else:
 			raise ValueError(
-				f"Box prediction/target shape mismatch: pred={tuple(pred_boxes.shape)}, gt={tuple(gt_boxes.shape)}"
+				f"Expected center pred trailing dim 3 (or 6 for legacy), got {tuple(center_preds_t.shape)}"
+			)
+
+		gt_corners = canonicalize_boxes_3d(box_targets, device=logits.device, dtype=logits.dtype)
+		gt_centers = corners_to_center(gt_corners, device=logits.device, dtype=logits.dtype)
+
+		if pred_centers.shape != gt_centers.shape:
+			raise ValueError(
+				f"Center pred/target shape mismatch: pred={tuple(pred_centers.shape)}, gt={tuple(gt_centers.shape)}"
 			)
 
 		if box_valid_mask is None:
-			valid_mask = torch.ones(pred_boxes.shape[0], dtype=torch.bool, device=logits.device)
+			valid_mask = torch.ones(pred_centers.shape[0], dtype=torch.bool, device=logits.device)
 		else:
 			valid_mask = box_valid_mask.to(logits.device).bool()
 
-		if valid_mask.numel() != pred_boxes.shape[0]:
+		if valid_mask.numel() != pred_centers.shape[0]:
 			raise ValueError(
-				f"box_valid_mask length mismatch: mask={valid_mask.numel()}, boxes={pred_boxes.shape[0]}"
+				f"box_valid_mask length mismatch: mask={valid_mask.numel()}, centers={pred_centers.shape[0]}"
 			)
 
 		if valid_mask.any():
-			pred_valid = pred_boxes[valid_mask]
-			gt_valid = gt_boxes[valid_mask]
+			pred_c_valid = pred_centers[valid_mask]
+			gt_c_valid = gt_centers[valid_mask]
 
-			# 数据流：先在有效样本子集上做回归，再将框损失按权重合并回 total_loss。
-			box_l1_loss = F.smooth_l1_loss(pred_valid, gt_valid, reduction="mean")
-			iou = box_iou_3d_aligned(pred_valid, gt_valid)
-			box_iou_loss = 1.0 - iou.mean()
+			# 损失项 1: 中心点 smooth-L1, 作主回归监督。
+			center_l1_loss = F.smooth_l1_loss(pred_c_valid, gt_c_valid, reduction="mean")
 
-			total_loss = total_loss + self.box_l1_weight * box_l1_loss + self.box_iou_weight * box_iou_loss
+			# 损失项 2: 用固定半宽从中心重建 6 维框, 与 GT 重建框算 3D 轴对齐 IoU。
+			# IoU 反传时 half_size 视为常量, 梯度仅作用于 pred_c_valid → 推 center 靠近 GT。
+			# 数据流: pred_c_valid (B,3) → center_to_corners → pred_box_recon (B,6) → IoU vs GT。
+			half_size = self._half_size.to(device=logits.device, dtype=logits.dtype)
+			pred_box_recon = center_to_corners(pred_c_valid, half_size=half_size,
+			                                  device=logits.device, dtype=logits.dtype)
+			gt_box_recon = center_to_corners(gt_c_valid, half_size=half_size,
+			                                device=logits.device, dtype=logits.dtype)
+			iou_per_sample = box_iou_3d_aligned(pred_box_recon, gt_box_recon)
+			box_iou_loss = 1.0 - iou_per_sample.mean()
 
-			out["box_l1_loss"] = box_l1_loss
+			# 三项加权合并: cls + L1 + (1 - IoU)。
+			total_loss = (
+				total_loss
+				+ self.box_l1_weight * center_l1_loss
+				+ self.box_iou_weight * box_iou_loss
+			)
+
+			out["box_l1_loss"] = center_l1_loss
 			out["box_iou_loss"] = box_iou_loss
-			out["box_iou_mean"] = iou.mean()
+			out["box_iou_mean"] = iou_per_sample.mean()
 
 		out["total_loss"] = total_loss
 		return out
