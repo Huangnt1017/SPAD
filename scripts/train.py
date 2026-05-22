@@ -118,7 +118,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae/upp。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -213,6 +213,11 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "pointmae":
 		module = load_module_from_file(baseline_dir / "PointMAE.py", "baseline_point_mae")
 		return module.PointMAEClassification(num_classes=num_classes)
+
+	# === UPP (ICCV 2025): Point-MAE 之上的 point-level prompting PEFT 框架 ===
+	if name == "upp":
+		module = load_module_from_file(baseline_dir / "UPP.py", "baseline_upp")
+		return module.UPPClassification(num_classes=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -674,6 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"pointtransv3",
 			"pointmlp",
 			"spt",
+			"upp",
 			"pointnext",
 			"tnpc",
 			"3detr",
@@ -717,6 +723,28 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
+	# 用法示例 (PowerShell, conda env 路径见 memory/reference_train_env.md):
+	#   $env:PYTHONPATH = "D:\PYproject\SPAD"
+	#   & "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\train.py" `
+	#       --model pointnet --batch-size 32 --epochs 100
+	#
+	# 常用参数 (完整列表见 build_parser):
+	#   --model <name>          模型, 支持: dgcnn / pointnet / pointnet2 / pointnet2msg /
+	#                           pointtransformer / pointtransv2 / pointtransv3 / pointmlp /
+	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr
+	#   --batch-size 32         batch 大小
+	#   --epochs 100            训练轮数
+	#   --num-points 1024       每样本固定点数 (随机采样/补齐到该数)
+	#   --lr 1e-3 --min-lr 1e-5 余弦退火上下界
+	#   --weight-decay 1e-4     AdamW 权重衰减
+	#   --label-mode raw        raw=用文件夹/文件名标签; generated=用增强生成的标签
+	#   --no-augment-eval       验证/测试时关增强 (默认开)
+	#   --num-workers 0         DataLoader worker 数 (>0 时自动启用 persistent_workers)
+	#
+	# 输出:
+	#   logs/train_<model>_<timestamp>.log     每 epoch 两行: 分类 + box 指标
+	#   checkpoints/<model>_<timestamp>_best.pth  val 最优 ckpt
+	#   checkpoints/<model>_<timestamp>_last.pth  最后一个 epoch ckpt
 	main()
 
 

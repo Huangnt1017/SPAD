@@ -56,19 +56,39 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		fallback: Model name used when no keyword can be inferred.
 
 	Returns:
-		Model name in {dgcnn, pointnet2, pointtransformer, pointmlp, pointnext, tnpc, 3detr, dct}.
+		Model name in {dgcnn, pointnet, pointnet2, pointtransformer, pointtransv2, pointtransv3,
+		pointmlp, pointbert, pointmae, pointrwkv, pointnext, spt, tnpc, 3detr, dct, upp}.
+		注意识别顺序: 更长 / 更具体的关键字必须在更短关键字之前 (例如 pointtransv3 在
+		pointtransformer 之前; pointnet2 / pointbert / pointmae 都在 pointnet 之前),
+		否则会误命中前缀。
 	"""
 	name = checkpoint_path.stem.lower()
+	# === 顺序敏感: 长前缀优先 ===
+	# Point Transformer 系列 (v3/v2 必须在 v1 之前判定)
+	if "pointtransv3" in name or "pointtrans_v3" in name or "point_transformer_v3" in name:
+		return "pointtransv3"
+	if "pointtransv2" in name or "pointtrans_v2" in name or "point_transformer_v2" in name:
+		return "pointtransv2"
 	if "pointtransformer" in name or "point_transformer" in name:
 		return "pointtransformer"
+	# PointNet 系列 (msg / pointnet2 / pointbert / pointmae 必须在 pointnet 之前)
+	if "pointnet2msg" in name or "pointnetppmsg" in name or "pointnet++msg" in name:
+		return "pointnet2msg"
 	if "pointnet2" in name or "pointnet++" in name or "pointnetpp" in name:
 		return "pointnet2"
+	if "pointbert" in name or "point_bert" in name:
+		return "pointbert"
+	if "pointmae" in name or "point_mae" in name:
+		return "pointmae"
+	if "pointrwkv" in name or "point_rwkv" in name:
+		return "pointrwkv"
 	if "pointmlp" in name:
 		return "pointmlp"
-	if "spt" in name:
-		return "spt"
 	if "pointnext" in name or "pointnxt" in name:
 		return "pointnext"
+	# 其它简单关键字
+	if "spt" in name:
+		return "spt"
 	if "3detr" in name:
 		return "3detr"
 	if "dct" in name:
@@ -77,6 +97,11 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		return "dgcnn"
 	if "tnpc" in name:
 		return "tnpc"
+	if "upp" in name:
+		return "upp"
+	# pointnet 留到最后, 避免误吃 pointnet2/pointbert/pointmae/pointmlp 等的前缀
+	if "pointnet" in name:
+		return "pointnet"
 	return fallback
 
 def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, str]:
@@ -671,7 +696,16 @@ def build_parser() -> argparse.ArgumentParser:
 		"--model",
 		type=str,
 		default="auto",
-		choices=["auto", "dgcnn", "pointnet2", "pointtransformer", "pointmlp", "spt", "pointnext", "tnpc", "3detr", "dct"],
+		choices=[
+			"auto",
+			"dgcnn",
+			"pointnet", "pointnet2", "pointnet2msg",
+			"pointtransformer", "pointtransv2", "pointtransv3",
+			"pointmlp",
+			"pointbert", "pointmae", "pointrwkv",
+			"spt", "upp",
+			"pointnext", "tnpc", "3detr", "dct",
+		],
 		help="Backbone model",
 	)
 	parser.add_argument("--batch-size", type=int, default=16)
@@ -688,7 +722,11 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--log-dir", type=str, default="logs")
 	parser.add_argument("--output-dir", type=str, default="logs")
 	parser.add_argument("--box-space", type=str, default="absolute", choices=["absolute", "normalized"], help="How to interpret box head outputs")
-	parser.add_argument("--normalize-cm", action="store_true", help="Use normalized confusion matrix")
+	# 混淆矩阵默认归一化输出 (每行求和=1, 颜色直接反映 recall 强弱); 用 --no-normalize-cm 关闭。
+	# 与 --augment-eval / --no-augment-eval 同款双 dest 模式, 与 train.py 风格保持一致。
+	parser.add_argument("--normalize-cm", dest="normalize_cm", action="store_true", help="Use normalized confusion matrix (default)")
+	parser.add_argument("--no-normalize-cm", dest="normalize_cm", action="store_false", help="Disable normalized confusion matrix (use raw counts)")
+	parser.set_defaults(normalize_cm=True)
 	parser.set_defaults(augment_eval=True)
 	return parser
 
@@ -701,4 +739,26 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
+	# 用法示例 (PowerShell, 整套 test split 评估 + 混淆矩阵):
+	#   $env:PYTHONPATH = "D:\PYproject\SPAD"
+	#   & "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\test.py" `
+	#       --model dgcnn `
+	#       --checkpoint "D:\PYproject\SPAD\checkpoints\dgcnn_xxx_best.pth" `
+	#       --batch-size 32
+	#
+	# 常用参数 (完整列表见 build_parser):
+	#   --model auto            自动从 ckpt 文件名识别 (支持所有 baseline);
+	#                           显式可传: dgcnn / pointnet / pointnet2 / pointnet2msg /
+	#                           pointtransformer / pointtransv2 / pointtransv3 / pointmlp /
+	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr
+	#   --checkpoint <path>     必填, 训练产出的 best.pth 路径
+	#   --batch-size 32         eval batch
+	#   --no-augment-eval       关闭 eval 增强 (默认开, 与训练 augment_eval=True 对齐)
+	#   --no-normalize-cm       关闭混淆矩阵归一化 (默认归一化, 每行求和=1 反映 recall)
+	#   --box-space absolute    box 输出空间, absolute=原始坐标; normalized=归一化空间
+	#
+	# 输出:
+	#   logs/test_<model>_<timestamp>.log         评估总指标 + 每类 precision/recall/f1
+	#   logs/cm_<model>_<timestamp>.png           混淆矩阵图 (默认归一化)
+	#   logs/metrics_<model>_<timestamp>.json     完整指标 (top1/top3/box_iou/box_ap...)
 	main()
