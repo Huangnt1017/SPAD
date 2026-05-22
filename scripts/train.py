@@ -118,7 +118,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae/upp。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -213,6 +213,11 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "pointmae":
 		module = load_module_from_file(baseline_dir / "PointMAE.py", "baseline_point_mae")
 		return module.PointMAEClassification(num_classes=num_classes)
+
+	# === UPP (ICCV 2025): Point-MAE 之上的 point-level prompting PEFT 框架 ===
+	if name == "upp":
+		module = load_module_from_file(baseline_dir / "UPP.py", "baseline_upp")
+		return module.UPPClassification(num_classes=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
