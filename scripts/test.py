@@ -697,14 +697,9 @@ def build_parser() -> argparse.ArgumentParser:
 		type=str,
 		default="auto",
 		choices=[
-			"auto",
-			"dgcnn",
-			"pointnet", "pointnet2", "pointnet2msg",
+			"auto", "dgcnn", "pointnet", "pointnet2", "pointnet2msg",
 			"pointtransformer", "pointtransv2", "pointtransv3",
-			"pointmlp",
-			"pointbert", "pointmae", "pointrwkv",
-			"spt", "upp",
-			"pointnext", "tnpc", "3detr", "dct",
+			"pointmlp", "pointbert", "pointmae", "pointrwkv", "spt", "upp",
 		],
 		help="Backbone model",
 	)
@@ -739,26 +734,4 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-	# 用法示例 (PowerShell, 整套 test split 评估 + 混淆矩阵):
-	#   $env:PYTHONPATH = "D:\PYproject\SPAD"
-	#   & "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\test.py" `
-	#       --model dgcnn `
-	#       --checkpoint "D:\PYproject\SPAD\checkpoints\dgcnn_xxx_best.pth" `
-	#       --batch-size 32
-	#
-	# 常用参数 (完整列表见 build_parser):
-	#   --model auto            自动从 ckpt 文件名识别 (支持所有 baseline);
-	#                           显式可传: dgcnn / pointnet / pointnet2 / pointnet2msg /
-	#                           pointtransformer / pointtransv2 / pointtransv3 / pointmlp /
-	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr
-	#   --checkpoint <path>     必填, 训练产出的 best.pth 路径
-	#   --batch-size 32         eval batch
-	#   --no-augment-eval       关闭 eval 增强 (默认开, 与训练 augment_eval=True 对齐)
-	#   --no-normalize-cm       关闭混淆矩阵归一化 (默认归一化, 每行求和=1 反映 recall)
-	#   --box-space absolute    box 输出空间, absolute=原始坐标; normalized=归一化空间
-	#
-	# 输出:
-	#   logs/test_<model>_<timestamp>.log         评估总指标 + 每类 precision/recall/f1
-	#   logs/cm_<model>_<timestamp>.png           混淆矩阵图 (默认归一化)
-	#   logs/metrics_<model>_<timestamp>.json     完整指标 (top1/top3/box_iou/box_ap...)
 	main()
