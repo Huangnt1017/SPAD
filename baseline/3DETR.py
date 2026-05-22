@@ -879,9 +879,15 @@ class Model3DETR(nn.Module):
         enc_xyz_out, enc_features, enc_inds_out = self.encoder(
             pre_enc_features, xyz=pre_enc_xyz
         )
-        # Vanilla encoder 返回 xyz=None, xyz_inds=None → 使用 pre_encoder 的输出
+        # vanilla encoder 返回 xyz=None: 沿用 pre_encoder 的 xyz
         enc_xyz = enc_xyz_out if enc_xyz_out is not None else pre_enc_xyz
-        enc_inds = enc_inds_out if enc_inds_out is not None else pre_enc_inds
+        # 官方逻辑 (model_3detr.py:202-207): vanilla 没有降采样, enc_inds 直接是 pre_enc_inds;
+        # masked 在第 0 层后过 interim_downsampling, 返回的是相对当前点序的索引,
+        # 需要 gather 回到原始点云索引空间, 与 vanilla 路径保持语义一致。
+        if enc_inds_out is None:
+            enc_inds = pre_enc_inds
+        else:
+            enc_inds = torch.gather(pre_enc_inds, 1, enc_inds_out.type(torch.int64))
 
         return enc_xyz, enc_features, enc_inds
 
@@ -1235,9 +1241,77 @@ def build_3detr(
 
 
 # ═══════════════════════════════════════════════════════
-# 兼容导入: 保留旧类名作为别名
+# SPAD 训练入口 — train.py 直接构造的薄包装
 # ═══════════════════════════════════════════════════════
-ThreeDETRClassification = Model3DETR
+
+class ThreeDETRClassification(Model3DETR):
+    """SPAD 训练管线入口: 内部用 ``build_3detr`` 工厂组装子模块, 再委托 ``Model3DETR``。
+
+    与其它 baseline 保持一致的构造契约: ``ThreeDETRClassification(num_classes=26)``,
+    避免直接暴露 ``Model3DETR`` 需要的 ``pre_encoder / encoder / decoder`` 三个位置参数。
+
+    Args:
+        num_classes: 分类类别数。
+        preenc_npoints: PointNet++ pre-encoder FPS 点数。
+        enc_dim / dec_dim: encoder / decoder 隐藏维度。
+        enc_nhead / dec_nhead: encoder / decoder 多头数。
+        enc_ffn_dim / dec_ffn_dim: FFN 中间层维度。
+        enc_dropout / dec_dropout: 注意力与 FFN 的 dropout 概率。
+        enc_activation: encoder 激活类型 (relu / gelu / leakyrelu)。
+        enc_nlayers / dec_nlayers: encoder / decoder 层数。
+        enc_type: ``vanilla`` 或 ``masked`` (官方两套配置)。
+        num_queries: decoder query 数量。
+        mlp_dropout: 预测头 MLP 的 dropout。
+        position_embedding: ``fourier`` 或 ``sine``。
+        dataset_config: 可选数据集配置 (SPAD 默认不需要)。
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 26,
+        preenc_npoints: int = 512,
+        enc_dim: int = 256,
+        dec_dim: int = 256,
+        enc_nhead: int = 4,
+        dec_nhead: int = 4,
+        enc_ffn_dim: int = 128,
+        dec_ffn_dim: int = 256,
+        enc_dropout: float = 0.1,
+        dec_dropout: float = 0.1,
+        enc_activation: str = "relu",
+        enc_nlayers: int = 3,
+        dec_nlayers: int = 3,
+        enc_type: str = "vanilla",
+        num_queries: int = 256,
+        mlp_dropout: float = 0.3,
+        position_embedding: str = "fourier",
+        dataset_config=None,
+        **kwargs,
+    ):
+        # 子模块按官方 build_* 顺序构造, 与直接走 ``build_3detr`` 工厂完全等价。
+        pre_encoder = build_preencoder(preenc_npoints, enc_dim)
+        encoder = build_encoder(
+            enc_dim, enc_nhead, enc_ffn_dim, enc_dropout,
+            enc_activation, enc_nlayers, enc_type, preenc_npoints,
+        )
+        decoder = build_decoder(
+            dec_dim, dec_nhead, dec_ffn_dim, dec_dropout, dec_nlayers,
+        )
+        super().__init__(
+            pre_encoder=pre_encoder,
+            encoder=encoder,
+            decoder=decoder,
+            dataset_config=dataset_config,
+            encoder_dim=enc_dim,
+            decoder_dim=dec_dim,
+            position_embedding=position_embedding,
+            mlp_dropout=mlp_dropout,
+            num_queries=num_queries,
+            num_classes=num_classes,
+        )
+
+
+# 兼容导入: 保留旧的 pre-encoder 别名
 PointNetPreEncoder = PointnetSAModuleVotes
 
 
