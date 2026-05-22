@@ -354,10 +354,12 @@ def evaluate(
 	"""
 	# 测试阶段把分类分数、类别标签、box IoU 都逐样本收集起来，后面统一算总体指标。
 	model.eval()
-	total_loss = 0.0
+	# 性能优化: loss / topk 累加保留在 device tensor 上, 避免每 batch .item() 同步;
+	# epoch 末 (函数末) 一次 .cpu().tolist() 批量取回。total_samples 是 Python int, 不涉及。
+	total_loss = torch.zeros((), device=device)
+	top1_hits = torch.zeros((), device=device, dtype=torch.long)
+	top3_hits = torch.zeros((), device=device, dtype=torch.long)
 	total_samples = 0
-	top1_hits = 0
-	top3_hits = 0
 
 	all_preds: List[int] = []
 	all_labels: List[int] = []
@@ -423,8 +425,10 @@ def evaluate(
 
 			batch_size = labels.size(0)
 			total_samples += batch_size
-			total_loss += float(loss.item()) * batch_size
+			# .detach() 切断计算图; 累加保持在 GPU 标量上, 避免 .item() 同步。
+			total_loss += loss.detach() * batch_size
 
+			# compute_topk_hits 现在返回 GPU 标量 tensor (训练/测试统一接口)
 			hits = compute_topk_hits(logits, labels, topk=(1, 3))
 			top1_hits += hits[1]
 			top3_hits += hits[3]
@@ -467,16 +471,32 @@ def evaluate(
 			elif box_preds is not None:
 				box_eval_skipped = True
 
-			avg_loss = total_loss / max(total_samples, 1)
-			top1 = top1_hits / max(total_samples, 1)
-			top3 = top3_hits / max(total_samples, 1)
+			# 进度条更新: total_loss / top*_hits 都是 GPU 标量, 一次 stack→cpu→tolist 同步 3 个值。
+			# (test 路径已有 box_ious.extend(...cpu().tolist()) 这种 per-batch sync, 这里多 1 次不影响。)
+			snap = torch.stack([
+				total_loss,
+				top1_hits.to(total_loss.dtype),
+				top3_hits.to(total_loss.dtype),
+			]).cpu().tolist()
+			s_loss, s_t1, s_t3 = snap
+			avg_loss = s_loss / max(total_samples, 1)
+			top1 = s_t1 / max(total_samples, 1)
+			top3 = s_t3 / max(total_samples, 1)
 			pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}")
+
+	# epoch 末单次同步, 把 loss + top1_hits + top3_hits 一次性搬到 CPU。
+	final_snap = torch.stack([
+		total_loss,
+		top1_hits.to(total_loss.dtype),
+		top3_hits.to(total_loss.dtype),
+	]).cpu().tolist()
+	f_loss, f_t1, f_t3 = final_snap
 
 	return {
 		# 这里返回的是整体验证/测试过程中逐样本拼接后的原始数据，后面的 compute_metrics 和 compute_box_ap_metrics 再做汇总。
-		"loss": total_loss / max(total_samples, 1),
-		"top1": top1_hits / max(total_samples, 1),
-		"top3": top3_hits / max(total_samples, 1),
+		"loss": f_loss / max(total_samples, 1),
+		"top1": f_t1 / max(total_samples, 1),
+		"top3": f_t3 / max(total_samples, 1),
 		"y_true": np.array(all_labels, dtype=np.int64),
 		"y_pred": np.array(all_preds, dtype=np.int64),
 		"pred_scores": np.array(all_pred_scores, dtype=np.float64),

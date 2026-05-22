@@ -118,7 +118,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae/upp。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -214,11 +214,6 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 		module = load_module_from_file(baseline_dir / "PointMAE.py", "baseline_point_mae")
 		return module.PointMAEClassification(num_classes=num_classes)
 
-	# === UPP (ICCV 2025): Point-MAE 之上的 point-level prompting PEFT 框架 ===
-	if name == "upp":
-		module = load_module_from_file(baseline_dir / "UPP.py", "baseline_upp")
-		return module.UPPClassification(num_classes=num_classes)
-
 	raise ValueError(f"Unsupported model name: {model_name}")
 
 
@@ -242,8 +237,8 @@ def prepare_model_inputs(points_xyzi: torch.Tensor) -> torch.Tensor:
 	raise ValueError(f"prepare_model_inputs expects shape (B,N,4) or (B,4,N), got {tuple(points_xyzi.shape)}")
 
 
-def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable[int] = (1, 3)) -> Dict[int, int]:
-	"""统计 top-k 命中数。
+def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable[int] = (1, 3)) -> Dict[int, torch.Tensor]:
+	"""统计 top-k 命中数 (返回 GPU 标量 tensor, 避免 hot loop 同步)。
 
 	Args:
 		logits: 分类输出，形状 [B, C]。
@@ -251,7 +246,9 @@ def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable
 		topk: 需要统计的 k 列表。
 
 	Returns:
-		{K: 命中数} 字典。
+		{K: 命中数 tensor (标量, dtype=long, 与 logits 同 device)} 字典。
+		注意: 原版返回 ``int`` 会触发 ``.item()`` GPU→CPU 同步; 这里返回 GPU tensor,
+		让上层累加器以 tensor 形式聚合, 仅在 epoch 末统一 sync 一次。数值完全一致。
 	"""
 	# top-k 命中数是从模型 logits 里直接统计的，不依赖 box 分支。
 	num_classes = logits.size(1)
@@ -260,10 +257,11 @@ def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable
 	pred = pred.t()
 	correct = pred.eq(labels.view(1, -1).expand_as(pred))
 
-	out: Dict[int, int] = {}
+	out: Dict[int, torch.Tensor] = {}
 	for k in topk:
 		kk = min(k, num_classes)
-		out[k] = int(correct[:kk].reshape(-1).float().sum().item())
+		# 不再 .item(), 保留为 GPU 上的标量 long tensor; 累加 / 比较都合法。
+		out[k] = correct[:kk].reshape(-1).sum()
 	return out
 
 
@@ -315,20 +313,27 @@ def run_epoch(
 	is_train = optimizer is not None
 	model.train(is_train)
 
-	total_loss = 0.0
+	# 性能优化: 累加器保留在 device 上 (GPU tensor), 避免每个 batch 多次 .item() 触发
+	# CPU-GPU 同步。仅样本计数 (total_samples / box_metric_samples) 是从 Python int
+	# (labels.size(0)) 直接累加的, 不涉及 GPU 同步。tqdm 进度条按 log_every 节流,
+	# 一次 .cpu().tolist() 把所有需要展示的标量批量搬到 CPU。
+	total_loss = torch.zeros((), device=device)
+	total_box_l1 = torch.zeros((), device=device)
+	total_box_iou_loss = torch.zeros((), device=device)
+	total_box_iou = torch.zeros((), device=device)
+	correct_top1 = torch.zeros((), device=device, dtype=torch.long)
+	correct_top3 = torch.zeros((), device=device, dtype=torch.long)
 	total_samples = 0
-	correct_top1 = 0
-	correct_top3 = 0
-	total_box_l1 = 0.0
-	total_box_iou_loss = 0.0
-	total_box_iou = 0.0
 	box_metric_samples = 0
 
 	pbar = tqdm(loader, desc=f"{phase} Epoch {epoch}", leave=False)
 	context = torch.enable_grad() if is_train else torch.no_grad()
+	# 进度条每 ~20 次更新一次 (但首/末 batch 一定更新), 避免每 batch 都触发同步与字符串格式化。
+	num_batches = len(loader) if hasattr(loader, "__len__") else None
+	log_every = max(1, (num_batches // 20)) if num_batches else 1
 
 	with context:
-		for batch in pbar:
+		for batch_step, batch in enumerate(pbar):
 			if len(batch) == 2:
 				points, targets = batch
 				batch_meta = None
@@ -404,38 +409,62 @@ def run_epoch(
 
 			batch_size = labels.size(0)
 			# 所有指标都按样本数加权累计，最后再除以总样本数，得到 epoch 级平均值。
-			total_loss += float(loss.item()) * batch_size
+			# .detach() 切断与计算图的连接, 累加器只用其数值, 避免占用反传内存。
+			total_loss += loss.detach() * batch_size
 			total_samples += batch_size
 
 			# top1 / top3 只来自分类 logits；这里只统计类别是否命中真实标签。
+			# 现在 compute_topk_hits 返回 GPU 标量 tensor, 累加保持在 GPU 上 (无同步)。
 			topk_hits = compute_topk_hits(logits, labels, topk=(1, 3))
 			correct_top1 += topk_hits[1]
 			correct_top3 += topk_hits[3]
 
 			if box_preds is not None and box_targets is not None:
 				# box 指标只有在预测框和目标框都能成功构造时才累计，避免缺失元信息污染统计。
-				total_box_l1 += float(loss_dict["box_l1_loss"].item()) * batch_size
-				total_box_iou_loss += float(loss_dict["box_iou_loss"].item()) * batch_size
-				total_box_iou += float(loss_dict["box_iou_mean"].item()) * batch_size
+				total_box_l1 += loss_dict["box_l1_loss"].detach() * batch_size
+				total_box_iou_loss += loss_dict["box_iou_loss"].detach() * batch_size
+				total_box_iou += loss_dict["box_iou_mean"].detach() * batch_size
 				box_metric_samples += batch_size
 
-			avg_loss = total_loss / max(total_samples, 1)
-			top1 = correct_top1 / max(total_samples, 1)
-			top3 = correct_top3 / max(total_samples, 1)
-			if box_metric_samples > 0:
-				box_iou = total_box_iou / box_metric_samples
-				pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}", box_iou=f"{box_iou:.4f}")
-			else:
-				pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}")
+			# 进度条节流: 只在间隔点 / 末 batch 更新一次, 把所有标量一次性 stack→cpu→tolist
+			# 来批量同步, 减少 GPU 等待。中间 batch 不显示瞬时值 (最终聚合数值不受影响)。
+			is_last = (num_batches is not None) and (batch_step + 1 == num_batches)
+			if (batch_step % log_every == 0) or is_last:
+				# 单次同步: 把 4 个 GPU 标量 stack 到一起再 .cpu().tolist(), 一次 sync 完成。
+				snap = torch.stack([
+					total_loss,
+					correct_top1.to(total_loss.dtype),
+					correct_top3.to(total_loss.dtype),
+					total_box_iou,
+				]).cpu().tolist()
+				s_loss, s_c1, s_c3, s_box_iou = snap
+				avg_loss = s_loss / max(total_samples, 1)
+				top1 = s_c1 / max(total_samples, 1)
+				top3 = s_c3 / max(total_samples, 1)
+				if box_metric_samples > 0:
+					box_iou = s_box_iou / box_metric_samples
+					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}", box_iou=f"{box_iou:.4f}")
+				else:
+					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}")
 
+	# epoch 末单次同步: 把 6 个累加器 stack 到一起搬到 CPU, 减少多次 .item() 的开销。
+	final_snap = torch.stack([
+		total_loss,
+		correct_top1.to(total_loss.dtype),
+		correct_top3.to(total_loss.dtype),
+		total_box_l1,
+		total_box_iou_loss,
+		total_box_iou,
+	]).cpu().tolist()
+	f_loss, f_c1, f_c3, f_bl1, f_bil, f_bi = final_snap
 	metrics = {
 		# loss/topk 是分类主指标；box_* 是 box 分支的监督损失和几何质量指标。
-		"loss": total_loss / max(total_samples, 1),
-		"top1": correct_top1 / max(total_samples, 1),
-		"top3": correct_top3 / max(total_samples, 1),
-		"box_l1": total_box_l1 / max(box_metric_samples, 1),
-		"box_iou_loss": total_box_iou_loss / max(box_metric_samples, 1),
-		"box_iou": total_box_iou / max(box_metric_samples, 1),
+		"loss": f_loss / max(total_samples, 1),
+		"top1": f_c1 / max(total_samples, 1),
+		"top3": f_c3 / max(total_samples, 1),
+		"box_l1": f_bl1 / max(box_metric_samples, 1),
+		"box_iou_loss": f_bil / max(box_metric_samples, 1),
+		"box_iou": f_bi / max(box_metric_samples, 1),
 		"box_samples": float(box_metric_samples),
 		"samples": float(total_samples),
 	}

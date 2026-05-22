@@ -685,6 +685,10 @@ def create_dataloaders(
     eval_generator.manual_seed(seed + 202)
 
     pin_memory = torch.cuda.is_available()
+    # 性能优化: num_workers>0 时启用 persistent_workers 避免每个 epoch 重启 worker 进程,
+    # 同时显式写出 prefetch_factor=2 (PyTorch 默认值)。两者只有 num_workers>0 时合法,
+    # num_workers=0 (主进程加载) 必须省略, 否则 DataLoader 会报错。
+    loader_extra = {"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}
 
     train_loader = DataLoader(
         train_dataset,
@@ -695,6 +699,7 @@ def create_dataloaders(
         worker_init_fn=_seed_worker,
         generator=train_generator,
         collate_fn=collate_fn,
+        **loader_extra,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -705,6 +710,7 @@ def create_dataloaders(
         worker_init_fn=_seed_worker,
         generator=eval_generator,
         collate_fn=collate_fn,
+        **loader_extra,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -715,6 +721,7 @@ def create_dataloaders(
         worker_init_fn=_seed_worker,
         generator=eval_generator,
         collate_fn=collate_fn,
+        **loader_extra,
     )
 
     return train_loader, val_loader, test_loader, class_to_idx
