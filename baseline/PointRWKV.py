@@ -523,10 +523,18 @@ class PointRWKVClassification(nn.Module):
 
     将 PointRWKV 多尺度特征聚合后进行全局池化，接分类和框回归头。
     输入: (B, N, 4) xyzi → 输出: (logits [B, C], box_pred [B, 6])
+
+    关于 ``num_points`` 默认值的说明:
+    官方 cfgs/cls_modelnet40.yaml 用 8192 点输入 + ``num_points=(2048, 1024, 512)``,
+    每个尺度都做一次有效的 FPS 下采样 (相对输入是 1/4, 1/2, 1/2)。SPAD 用 1024 点输入,
+    若沿用 ``(1024, 512, 256)`` 则第一阶段 FPS 1024→1024 实际是全采, 第一层
+    PRWKV 块退化为纯 KNN+graph 模块, 丢失了官方"层级下采样"的设计意图。
+    因此这里改为 ``(512, 256, 128)``: 三次 1/2 下采, 三个尺度都做真实下采样,
+    精神上与官方"每层都下采"对齐, 也跟 SPAD 其他 baseline 的 patch 尺度相称。
     """
     def __init__(self, num_classes: int = 26, embed_dim: int = 384,
                  depth: tuple = (4, 4, 4), num_heads: int = 8,
-                 num_points: tuple = (1024, 512, 256),
+                 num_points: tuple = (512, 256, 128),
                  group_sizes: tuple = (32, 32, 32),
                  k_neighbors: tuple = (16, 8, 8),
                  graph_iter: int = 3, drop_path_rate: float = 0.1,
