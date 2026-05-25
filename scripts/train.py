@@ -219,6 +219,14 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 		module = load_module_from_file(baseline_dir / "UPP.py", "baseline_upp")
 		return module.UPPClassification(num_classes=num_classes)
 
+	# === Graph Residual (本课题自研, model/readme.md 任务 1) ===
+	# 模型文件不在 baseline/ 而在 model/, 走 load_module_from_file 同样加载。
+	if name == "graph_residual":
+		model_module = load_module_from_file(
+			project_root / "model" / "graph_residual.py", "model_graph_residual"
+		)
+		return model_module.GraphResidualMultiTaskNet(num_classes=num_classes)
+
 	raise ValueError(f"Unsupported model name: {model_name}")
 
 
@@ -680,6 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"pointmlp",
 			"spt",
 			"upp",
+			"graph_residual",
 			"pointnext",
 			"tnpc",
 			"3detr",
