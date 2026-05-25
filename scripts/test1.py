@@ -42,9 +42,6 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 
-import matplotlib
-# 非交互后端: 防止远程/无头环境弹窗失败; 保存图像不需要 GUI。
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, Normalize  # noqa: F401  (Normalize 仅占位, 与 plot_pc 风格一致)
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (注册 3D projection)
@@ -356,6 +353,7 @@ def plot_points_with_boxes(
 
 	save_path.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(save_path, dpi=160, bbox_inches="tight")
+	plt.show()
 	plt.close(fig)
 
 
