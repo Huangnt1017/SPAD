@@ -1,50 +1,34 @@
 """
-单光子点云图残差多任务网络 (Graph Residual Multi-Task Network for SPAD)  v5
+单光子点云图残差多任务网络 (Graph Residual Multi-Task Network for SPAD)  v6
 
-v5 (标准 Q/K/V 图注意力 + 坐标门控残差)
+v6 (DGCNN 工程范式 + 双流图注意力 + 坐标门控)
 ==========================================================
+v5 → v6 关键改进:
+    1. Conv2d + BN2d 替代 Linear 做 EdgeConv (收敛速度大幅提升)。
+    2. 动态特征空间 KNN (每层从学到的特征重建图, 接近 DGCNN 的 "Dynamic Graph")。
+    3. DGCNN 风格的高效 GPU KNN 与图特征构建 (全局 flatten 索引, 一次 gather)。
+    4. LeakyReLU(0.2) + BN1d 替代 LayerNorm + ReLU。
+    5. 全程 (B, C, N) 布局 (Conv1d/Conv2d 原生, 省去逐点 Linear 的开销)。
+    6. 保留: 双流 GCN → Q/K/V 注意力 → 坐标门控残差 (v5 的结构设计)。
+
 Block 数据流:
-
-    Input (P[4D], Feature)
-       │           \      /
-       │            [ LN ]
-       │            /    \
-       │        [NGF]   [Linear]
-       │          |        |
-       │        [GCN]      |
-       │          ↓        ↓
-       │      Fk(B,N,k,C) F(B,N,C)       ← Flow_A / Flow_B
-       │          |        |
-       │        [W_k]    [W_q]
-       │        [W_v]      |
-       │          ↓        ↓
-       │         K,V       Q              ← 标准 Q/K/V
-       │           \      /
-       │     [Scaled Dot-Product Attn]    ← softmax(Q·K / √C) @ V
-       │              │
-       │           [Linear]
-       │              │
-       └──> [Coord Gate] ( ⊗ / ⊕ ) ───> Output
-                P(4D) → σ(W_gate)         ← gate·attn + (1-gate)·W_res(P)
-
-核心设计:
-    1. Flow_A: 保留 per-neighbor 边特征 Fk (不做 max-pool),
-       边特征包含完整 4D 坐标差 (含 intensity)。
-    2. Flow_B: 中心点特征投影 F (全通道, 含 intensity 信息)。
-    3. 标准自注意力: Q=W_q(F), K=W_k(Fk), V=W_v(Fk),
-       score=Q·K/√C, softmax over k neighbors。
-    4. 坐标门控跳跃: P(4D) 生成 sigmoid gate,
-       out = gate * attn_mapped + (1-gate) * coord_residual。
-       门控含义: gate→1 信任语义特征; gate→0 信任几何坐标。
-    5. 每层: 通道翻倍 + 点数减半 (1024→512→256→128→64)。
-
-通道阶梯: 4 → 32 → 64 → 128 → 256 → 512
-点数阶梯: 1024 → 512 → 256 → 128 → 64
-全局池化: max + avg → 1024 维
-双头: cls + box(3, center-only)
+    f(B,C,N) + p(B,4,N)
+        ↓
+    Dynamic KNN from f → idx(B,N,k)    ← 特征空间构图 (GPU)
+        ↓
+    ┌─ GCN_f: get_graph_feature(f) → Conv2d+BN2d → Fk(B,C_out,N,k)  ← V source
+    └─ GCN_p: get_graph_feature(p) → Conv2d+BN2d → Pk(B,C_out,N,k)  ← K source
+        ↓
+    Q = Conv1d(f‖p), K = Conv2d(Pk), V = Conv2d(Fk)
+    attn = softmax(Q·K/√C) @ V
+        ↓
+    gate·Conv1d(attn) + (1-gate)·Conv1d(p)    ← 坐标门控
+        ↓
+    LeakyReLU → weighted_downsample(N→N/2)
 
 References:
     - model/readme.md 任务 1
+    - baseline/DGCNN.py (knn, get_graph_feature, Conv2d+BN2d)
     - utils/loss.py split_cls_and_box_predictions
 """
 
@@ -67,127 +51,132 @@ except (ImportError, AttributeError):
 
 
 # ══════════════════════════════════════════════════
-# Intensity 加权 4D KNN (双向门控)
+# GPU KNN (DGCNN 风格: 特征空间, 负距离 topk)
 # ══════════════════════════════════════════════════
 
-def knn_4d(points: torch.Tensor, k: int, alpha: float = 0.3) -> torch.Tensor:
-    """intensity 加权的几何近邻搜索 (双向门控)。
+def knn_gpu(x: torch.Tensor, k: int) -> torch.Tensor:
+    """在特征空间做 KNN (与 DGCNN 一致)。
 
-    距离公式: dist = dist_xyz * (1 - alpha + 2 * alpha * dist_i_norm)
-        dist_i_norm = 0 (强度相同) → 乘数 = 1 - alpha → 拉近
-        dist_i_norm = 1 (差异最大) → 乘数 = 1 + alpha → 推远
+    用负平方距离 + topk 实现, 全程 GPU matmul, 无需排序。
 
     Args:
-        points: (B, N, 4) — x, y, z, intensity。
-        k: 近邻数 (不含自身)。
-        alpha: 门控系数, 建议 ∈ [0.1, 0.5]。
+        x: (B, C, N) — 任意维特征 (坐标 / 学到的特征均可)。
+        k: 近邻数 (不含自身, 由 get_graph_feature 的拼接隐式排除)。
 
     Returns:
-        knn_idx: (B, N, k), int64。
+        idx: (B, N, k), int64。
     """
-    B, N, _ = points.shape
-    xyz = points[..., :3]
-    intensity = points[..., 3:4]
-
-    xx = torch.sum(xyz ** 2, dim=2, keepdim=True)
-    dist_xyz = xx + xx.transpose(2, 1) - 2.0 * torch.bmm(xyz, xyz.transpose(2, 1))
-    dist_xyz = dist_xyz.clamp(min=0.0)
-
-    ii = torch.sum(intensity ** 2, dim=2, keepdim=True)
-    dist_i = ii + ii.transpose(2, 1) - 2.0 * torch.bmm(intensity, intensity.transpose(2, 1))
-    dist_i = dist_i.clamp(min=0.0)
-
-    dist_i_max = dist_i.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
-    dist_i_norm = dist_i / dist_i_max
-
-    dist = dist_xyz * (1.0 - alpha + 2.0 * alpha * dist_i_norm)
-
-    diag = torch.eye(N, device=points.device, dtype=torch.bool).unsqueeze(0).expand(B, -1, -1)
-    dist.masked_fill_(diag, float("inf"))
-
-    _, knn_idx = torch.topk(dist, k, dim=2, largest=False)
-    return knn_idx
+    # (B, N, N) 负平方距离: 越大越近
+    inner = -2.0 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x ** 2, dim=1, keepdim=True)
+    neg_dist = -xx - inner - xx.transpose(2, 1)
+    _, idx = neg_dist.topk(k=k, dim=-1)
+    return idx
 
 
 # ══════════════════════════════════════════════════
-# 加权随机下采样
+# 图特征构建 (DGCNN 风格: 全局 flatten 索引)
+# ══════════════════════════════════════════════════
+
+def get_graph_feature(x: torch.Tensor, k: int,
+                      idx: torch.Tensor | None = None) -> torch.Tensor:
+    """构造 EdgeConv 边特征 [x_j - x_i, x_i] (DGCNN 原版写法)。
+
+    Args:
+        x: (B, C, N)。
+        k: 近邻数。
+        idx: (B, N, k), 若 None 则内部调用 knn_gpu。
+
+    Returns:
+        (B, 2C, N, k) — 每点 k 个邻居的边特征。
+    """
+    B, C, N = x.size()
+    if idx is None:
+        idx = knn_gpu(x, k)
+
+    idx_base = torch.arange(0, B, device=x.device).view(-1, 1, 1) * N
+    idx_flat = (idx + idx_base).view(-1)
+
+    x_t = x.transpose(2, 1).contiguous()                   # (B, N, C)
+    nbr = x_t.view(B * N, C)[idx_flat].view(B, N, k, C)    # (B, N, k, C)
+    x_i = x_t.unsqueeze(2).expand_as(nbr)                  # (B, N, k, C)
+
+    # [x_j - x_i, x_i] → (B, 2C, N, k)
+    return torch.cat([nbr - x_i, x_i], dim=-1).permute(0, 3, 1, 2).contiguous()
+
+
+# ══════════════════════════════════════════════════
+# 加权下采样 (B, C, N) 布局
 # ══════════════════════════════════════════════════
 
 def weighted_downsample(
-    xyz: torch.Tensor,
-    feats: torch.Tensor,
+    p: torch.Tensor,
+    f: torch.Tensor,
     target_n: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """按特征 L2 范数作为重要性的无放回随机采样。
+    """按特征 L2 范数做无放回加权采样。
 
     Args:
-        xyz: (B, N, 4) 点坐标 + intensity。
-        feats: (B, N, C) 每点特征。
-        target_n: 目标采样点数。
+        p: (B, 4, N)。
+        f: (B, C, N)。
+        target_n: 目标点数。
 
     Returns:
-        xyz_down: (B, target_n, 4)
-        feats_down: (B, target_n, C)
+        (p_down, f_down): (B, 4, target_n), (B, C, target_n)。
     """
-    B, N, _ = feats.shape
+    B, C, N = f.shape
     if target_n >= N:
-        return xyz, feats
+        return p, f
 
-    scores = feats.norm(p=2, dim=-1).clamp(min=1e-8)
+    scores = f.norm(p=2, dim=1).clamp(min=1e-8)              # (B, N)
     probs = scores / scores.sum(dim=1, keepdim=True)
-    idx = torch.multinomial(probs, target_n, replacement=False)
-    batch_idx = torch.arange(B, device=feats.device).view(B, 1).expand(-1, target_n)
-    return xyz[batch_idx, idx, :], feats[batch_idx, idx, :]
+    idx = torch.multinomial(probs, target_n, replacement=False)  # (B, target_n)
+
+    # gather 沿 N 维采样
+    idx_f = idx.unsqueeze(1).expand(-1, C, -1)                # (B, C, target_n)
+    idx_p = idx.unsqueeze(1).expand(-1, 4, -1)                # (B, 4, target_n)
+    return torch.gather(p, 2, idx_p), torch.gather(f, 2, idx_f)
 
 
 # ══════════════════════════════════════════════════
-# Graph Residual Block v5 (Q/K/V 图注意力 + 坐标门控)
+# Graph Residual Block v6
 # ══════════════════════════════════════════════════
 
 class GraphResidualBlock(nn.Module):
-    """图残差模块 v5 (标准 Q/K/V 注意力 + 坐标门控残差)。
+    """图残差模块 v6 (Conv2d+BN2d EdgeConv + Q/K/V 注意力 + 坐标门控)。
 
-    数据流:
-        Input (P[4D], f)
+    数据流 (全程 (B, C, N) 布局):
+        f(B,C_in,N) + p(B,4,N)
             ↓
-          LN(f) → f_norm
-          /          \\
-       Flow_A       Flow_B
-     (NGF+GCN)     (Linear)
-         ↓            ↓
-       Fk(B,N,k,C)  F(B,N,C)
-         |            |
-       W_k, W_v     W_q                   ← Q/K/V 投影
-         ↓            ↓
-        K, V          Q
-         \\          //
-      softmax(Q·K/√C) @ V                 ← Scaled Dot-Product Attention
-             ↓
-          [Linear]  (特征映射)
-             ↓
-      gate·(mapped) + (1-gate)·W_res(P)   ← 坐标门控跳跃连接
-             ↓
-           ReLU → [downsample]
-
-    坐标门控: gate = σ(W_gate(P[4D]))
-        - gate → 1: 信任注意力聚合的语义特征
-        - gate → 0: 信任原始坐标 + 强度信息
-        物理含义: 在噪声区域模型可学习更多依赖语义;
-                  在几何清晰区域保留原始位置约束。
+        Dynamic KNN from f → idx(B,N,k)
+            ↓
+        ┌ GCN_f: get_graph_feature(f) → Conv2d+BN2d+LReLU → Fk(B,C_out,N,k)
+        └ GCN_p: get_graph_feature(p) → Conv2d+BN2d+LReLU → Pk(B,C_out,N,k)
+            ↓
+        Q = Conv1d+BN1d(f‖p)     (B, C_out, N)
+        K = Conv2d(Pk)            (B, C_out, N, k)
+        V = Conv2d(Fk)            (B, C_out, N, k)
+        attn = softmax(Q·K/√C) @ V  → (B, C_out, N)
+            ↓
+        mapped = Conv1d+BN1d(attn)
+        gate = σ(Conv1d+BN1d(p))
+        out = gate * mapped + (1-gate) * Conv1d+BN1d(p)
+            ↓
+        LeakyReLU → downsample(N→N/2)
 
     Args:
-        in_channels: 输入特征维度 C_in。
-        out_channels: 输出特征维度 C_out。
-        k: KNN 近邻数。
-        downsample: 是否 N → N/2。
-        use_checkpoint: 训练时梯度检查点。
+        in_channels: C_in。
+        out_channels: C_out。
+        k: 近邻数。
+        downsample: N→N/2。
+        use_checkpoint: 梯度检查点。
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        k: int = 12,
+        k: int = 20,
         downsample: bool = True,
         use_checkpoint: bool = True,
     ):
@@ -197,106 +186,118 @@ class GraphResidualBlock(nn.Module):
         self.use_checkpoint = use_checkpoint
         self._scale = out_channels ** -0.5
 
-        # 入口归一化
-        self.ln = nn.LayerNorm(in_channels)
-
-        # Flow_A: 边特征 MLP — 输入含完整 4D 坐标差 (xyzi)
-        # [f_i, f_j - f_i, p_j - p_i(4D)] → (2*C_in + 4)
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * in_channels + 4, out_channels),
-            nn.GELU(),
-            nn.Linear(out_channels, out_channels),
+        # GCN_f: 特征 EdgeConv — [f_j - f_i, f_i] → Conv2d+BN2d
+        self.conv_f = nn.Sequential(
+            nn.Conv2d(2 * in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2),
         )
 
-        # Flow_B: 中心点特征投影
-        self.flow_b = nn.Linear(in_channels, out_channels)
+        # GCN_p: 位置 EdgeConv — [p_j - p_i, p_i] (4D) → Conv2d+BN2d
+        self.conv_p = nn.Sequential(
+            nn.Conv2d(8, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2),
+        )
 
-        # Q/K/V 投影 (标准注意力)
-        self.W_q = nn.Linear(out_channels, out_channels)
-        self.W_k = nn.Linear(out_channels, out_channels)
-        self.W_v = nn.Linear(out_channels, out_channels)
+        # Q: 中心点 (f ‖ p) → Conv1d+BN1d
+        self.W_q = nn.Sequential(
+            nn.Conv1d(in_channels + 4, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+        )
+        # K: 从位置图卷积 Pk
+        self.W_k = nn.Conv2d(out_channels, out_channels, 1, bias=False)
+        # V: 从特征图卷积 Fk
+        self.W_v = nn.Conv2d(out_channels, out_channels, 1, bias=False)
 
         # 注意力输出映射
-        self.linear_out = nn.Linear(out_channels, out_channels)
+        self.out_conv = nn.Sequential(
+            nn.Conv1d(out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+        )
 
-        # 坐标门控 + 坐标残差 (全程使用 4D: x, y, z, intensity)
-        self.coord_gate = nn.Linear(4, out_channels)
-        self.coord_res = nn.Linear(4, out_channels)
+        # 坐标门控 + 坐标残差 (4D: x,y,z,i)
+        self.coord_gate = nn.Sequential(
+            nn.Conv1d(4, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+        )
+        self.coord_res = nn.Sequential(
+            nn.Conv1d(4, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+        )
 
-        self.act = nn.ReLU(inplace=True)
+        self.act = nn.LeakyReLU(0.2)
 
     def _forward_impl(
         self,
         p: torch.Tensor,
         f: torch.Tensor,
-        knn_idx: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """核心前向。"""
-        B, N, _ = f.shape
-        k = knn_idx.shape[-1]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """核心前向。
 
-        # ── 入口归一化 ──
-        f_norm = self.ln(f)                                      # (B, N, C_in)
+        Args:
+            p: (B, 4, N) 原始坐标+intensity。
+            f: (B, C_in, N) 当前层特征。
 
-        # ── Flow_A: 构图 → per-neighbor 边特征 Fk ──
-        batch_idx = torch.arange(B, device=f.device).view(B, 1, 1).expand(B, N, k)
-        # 收集邻居特征和 4D 坐标
-        f_nbr = f_norm[batch_idx, knn_idx]                       # (B, N, k, C_in)
-        p_nbr = p[batch_idx, knn_idx]                            # (B, N, k, 4) 含 intensity
+        Returns:
+            (p_out, f_out): 下采样后的坐标与特征。
+        """
+        B, C_in, N = f.shape
+        k = min(self.k, N - 1)
 
-        # 边特征: [f_i, f_j - f_i, p_j - p_i (4D含intensity)]
-        f_center = f_norm.unsqueeze(2).expand_as(f_nbr)          # (B, N, k, C_in)
-        p_center = p.unsqueeze(2).expand_as(p_nbr)               # (B, N, k, 4)
-        edge_feat = torch.cat(
-            [f_center, f_nbr - f_center, p_nbr - p_center],
-            dim=-1,
-        )                                                         # (B, N, k, 2*C_in+4)
-        Fk = self.edge_mlp(edge_feat)                             # (B, N, k, C_out)
+        # ── 双路 KNN (GPU) ──
+        # GCN_f: 特征空间 KNN (语义驱动, 类似 DGCNN dynamic graph)
+        knn_f = knn_gpu(f, k)                                   # (B, N, k)
+        # GCN_p: 坐标+intensity 空间 KNN (保留 SPAD 强度空间结构)
+        knn_p = knn_gpu(p, k)                                   # (B, N, k)
 
-        # ── Flow_B: 中心点特征 ──
-        F = self.flow_b(f_norm)                                   # (B, N, C_out)
+        # ── GCN_f: 特征 EdgeConv → Fk (V 来源) ──
+        f_graph = get_graph_feature(f, k, knn_f)               # (B, 2*C_in, N, k)
+        Fk = self.conv_f(f_graph)                               # (B, C_out, N, k)
 
-        # ── 标准 Q/K/V 注意力 ──
-        Q = self.W_q(F)                                           # (B, N, C_out)
-        K = self.W_k(Fk)                                          # (B, N, k, C_out)
-        V = self.W_v(Fk)                                          # (B, N, k, C_out)
+        # ── GCN_p: 位置 EdgeConv → Pk (K 来源, 基于 xyzi 空间邻居) ──
+        p_graph = get_graph_feature(p, k, knn_p)               # (B, 8, N, k)
+        Pk = self.conv_p(p_graph)                               # (B, C_out, N, k)
 
-        # Scaled dot-product: Q_i · K_ij / √C → softmax over k
-        score = (Q.unsqueeze(2) * K).sum(dim=-1) * self._scale    # (B, N, k)
-        weights = torch.softmax(score, dim=-1)                    # (B, N, k)
+        # ── Q/K/V 投影 ──
+        # Q: 中心点联合查询 (f ‖ p)
+        Q = self.W_q(torch.cat([f, p], dim=1))                 # (B, C_out, N)
+        # K: 位置图卷积 (几何驱动注意力权重)
+        K = self.W_k(Pk)                                        # (B, C_out, N, k)
+        # V: 特征图卷积 (语义内容被聚合)
+        V = self.W_v(Fk)                                        # (B, C_out, N, k)
 
-        # 加权聚合 Value
-        attn_out = (weights.unsqueeze(-1) * V).sum(dim=2)         # (B, N, C_out)
+        # ── Scaled Dot-Product Attention ──
+        # 转到 (B, N, ...) 做 softmax, 再转回
+        Q_t = Q.permute(0, 2, 1)                                # (B, N, C_out)
+        K_t = K.permute(0, 2, 3, 1)                             # (B, N, k, C_out)
+        V_t = V.permute(0, 2, 3, 1)                             # (B, N, k, C_out)
 
-        # ── 注意力输出映射 ──
-        mapped = self.linear_out(attn_out)                        # (B, N, C_out)
+        score = (Q_t.unsqueeze(2) * K_t).sum(dim=-1) * self._scale  # (B, N, k)
+        weights = torch.softmax(score, dim=-1)                       # (B, N, k)
+        attn = (weights.unsqueeze(-1) * V_t).sum(dim=2)             # (B, N, C_out)
+        attn = attn.permute(0, 2, 1).contiguous()                   # (B, C_out, N)
 
-        # ── 坐标门控跳跃连接 (P 为完整 4D: x, y, z, intensity) ──
-        # gate ∈ (0,1): 控制语义特征 vs 坐标信息的混合比
-        gate = torch.sigmoid(self.coord_gate(p))                  # (B, N, C_out)
-        coord_info = self.coord_res(p)                            # (B, N, C_out)
-        # gate·语义 + (1-gate)·坐标
-        out = gate * mapped + (1.0 - gate) * coord_info           # (B, N, C_out)
+        # ── 输出映射 + 坐标门控 ──
+        mapped = self.out_conv(attn)                             # (B, C_out, N)
+        gate = torch.sigmoid(self.coord_gate(p))                 # (B, C_out, N)
+        coord_info = self.coord_res(p)                           # (B, C_out, N)
+        out = gate * mapped + (1.0 - gate) * coord_info
         f_out = self.act(out)
 
-        # ── 层间下采样 (N → N/2) ──
+        # ── 层间下采样 ──
         if self.downsample:
-            target_n = N // 2
-            p_down, f_out = weighted_downsample(p, f_out, target_n)
-            knn_new = knn_4d(p_down, min(self.k, target_n - 1))
-            return f_out, p_down, knn_new
-        return f_out, p, knn_idx
+            p, f_out = weighted_downsample(p, f_out, N // 2)
+        return p, f_out
 
     def forward(
         self,
         p: torch.Tensor,
         f: torch.Tensor,
-        knn_idx: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """对外接口 (训练启用梯度检查点)。"""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.use_checkpoint and self.training and _HAS_CKPT:
-            return _ckpt(self._forward_impl, p, f, knn_idx, use_reentrant=False)
-        return self._forward_impl(p, f, knn_idx)
+            return _ckpt(self._forward_impl, p, f, use_reentrant=False)
+        return self._forward_impl(p, f)
 
 
 # ══════════════════════════════════════════════════
@@ -304,25 +305,23 @@ class GraphResidualBlock(nn.Module):
 # ══════════════════════════════════════════════════
 
 class GraphResidualMultiTaskNet(nn.Module):
-    """图残差多任务网络 v5。
+    """图残差多任务网络 v6。
 
-    通道阶梯: 4 → 32 → 64 → 128 → 256 → 512
-    点数阶梯: 1024 → 512 → 256 → 128 → 64
-    全局池化: max + avg → 1024 维
-    双头: cls (26) + box (3, center-only)
+    全程 (B, C, N) 布局, Conv+BN+LeakyReLU。
+    通道: 4→32→64→128→256→512, 点数: 1024→512→256→128→64。
 
     Args:
         num_classes: 分类数。
-        k: KNN 近邻数。
+        k: 近邻数 (默认 20, 对齐 DGCNN)。
         use_checkpoint: 梯度检查点。
-        dropout: 预测头 Dropout。
-        box_dim: bbox 维度 (默认 3)。
+        dropout: 头部 Dropout。
+        box_dim: bbox 维度。
     """
 
     def __init__(
         self,
         num_classes: int = 26,
-        k: int = 12,
+        k: int = 20,
         use_checkpoint: bool = True,
         dropout: float = 0.3,
         box_dim: int = 3,
@@ -331,36 +330,57 @@ class GraphResidualMultiTaskNet(nn.Module):
         self.k = k
         self.box_dim = box_dim
 
-        # Stem: (B, N, 4) → (B, N, 32)
+        # Stem: (B, 4, N) → (B, 32, N)
         self.stem = nn.Sequential(
-            nn.Linear(4, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 32),
+            nn.Conv1d(4, 32, 1, bias=False),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(32, 32, 1, bias=False),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.2),
         )
 
-        # 4 层 Graph Residual Block (通道翻倍 + 点数减半)
-        block_cfg = dict(k=k, downsample=True, use_checkpoint=use_checkpoint)
+        # 不下采样: 全部 1024 点跑完 4 层, 通道压缩到 DGCNN 级别避免 OOM
+        block_cfg = dict(k=k, downsample=False, use_checkpoint=use_checkpoint)
         self.block1 = GraphResidualBlock(32, 64, **block_cfg)
-        self.block2 = GraphResidualBlock(64, 128, **block_cfg)
-        self.block3 = GraphResidualBlock(128, 256, **block_cfg)
-        self.block4 = GraphResidualBlock(256, 512, **block_cfg)
+        self.block2 = GraphResidualBlock(64, 64, **block_cfg)
+        self.block3 = GraphResidualBlock(64, 128, **block_cfg)
+        self.block4 = GraphResidualBlock(128, 256, **block_cfg)
 
-        pooled_dim = 1024  # 512 * 2 (max + avg)
+        # 多尺度拼接 (类似 DGCNN): cat(b1, b2, b3, b4) → Conv1d 聚合
+        cat_dim = 64 + 64 + 128 + 256  # 512
+        self.agg_conv = nn.Sequential(
+            nn.Conv1d(cat_dim, 512, 1, bias=False),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.2),
+        )
+
+        pooled_dim = 1024  # 512 * 2
+        box_input_dim = pooled_dim + 8
 
         self.cls_head = nn.Sequential(
-            nn.Linear(pooled_dim, 256),
+            nn.Linear(pooled_dim, 512, bias=False),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
             nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
             nn.Linear(256, num_classes),
         )
 
+        # Box head: 拼接坐标均值+标准差 → 提供空间锚点
+        # p_mean 近似目标中心, p_std 反映空间尺度
         self.box_head = nn.Sequential(
-            nn.Linear(pooled_dim, 256),
+            nn.Linear(box_input_dim, 256, bias=False),
             nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
-            nn.Linear(256, box_dim),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, box_dim),
         )
 
     def forward(self, points: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -369,26 +389,34 @@ class GraphResidualMultiTaskNet(nn.Module):
             points: (B, N, 4) — x, y, z, intensity。
 
         Returns:
-            dict: 'logits' (B, num_classes), 'box_pred' (B, box_dim)。
+            dict: 'logits' (B, C), 'box_pred' (B, box_dim)。
         """
-        B, N, _ = points.shape
+        # (B, N, 4) → (B, 4, N) 全程 channel-first
+        p = points.transpose(1, 2).contiguous()                # (B, 4, N)
+        f = self.stem(p)                                        # (B, 32, N)
 
-        p = points.clone()                                        # (B, N, 4)
-        f = self.stem(points)                                     # (B, N, 32)
-        knn_idx = knn_4d(p, min(self.k, N - 1))                   # (B, N, k)
+        # 4 层无下采样, 全程 N=1024
+        p, f1 = self.block1(p, f)                               # 32→64
+        p, f2 = self.block2(p, f1)                              # 64→64
+        p, f3 = self.block3(p, f2)                              # 64→128
+        p, f4 = self.block4(p, f3)                              # 128→256
 
-        f, p, knn_idx = self.block1(p, f, knn_idx)                # 1024→512,  32→64
-        f, p, knn_idx = self.block2(p, f, knn_idx)                # 512→256,   64→128
-        f, p, knn_idx = self.block3(p, f, knn_idx)                # 256→128,  128→256
-        f, p, knn_idx = self.block4(p, f, knn_idx)                # 128→64,   256→512
+        # 多尺度拼接 + 聚合 (保留各层分辨率特征, 类似 DGCNN)
+        f = self.agg_conv(torch.cat([f1, f2, f3, f4], dim=1))  # (B, 512, N)
 
         # 全局池化: max + avg → (B, 1024)
-        f_max = f.max(dim=1)[0]
-        f_avg = f.mean(dim=1)
-        f_pooled = torch.cat([f_max, f_avg], dim=1)
+        f_max = f.max(dim=-1)[0]
+        f_avg = f.mean(dim=-1)
+        f_pooled = torch.cat([f_max, f_avg], dim=1)              # (B, 1024)
 
         logits = self.cls_head(f_pooled)
-        box_preds = self.box_head(f_pooled)
+
+        # Box head: 拼接最终点集的坐标统计量作为空间锚点
+        # p_mean ≈ 目标中心先验, p_std ≈ 空间尺度先验
+        p_mean = p.mean(dim=-1)                                   # (B, 4)
+        p_std = p.std(dim=-1)                                     # (B, 4)
+        box_input = torch.cat([f_pooled, p_mean, p_std], dim=1)  # (B, 1032)
+        box_preds = self.box_head(box_input)
 
         return {"logits": logits, "box_pred": box_preds}
 
@@ -399,12 +427,12 @@ class GraphResidualMultiTaskNet(nn.Module):
 
 if __name__ == "__main__":
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    print("=== GraphResidualMultiTaskNet v5 (Q/K/V 图注意力 + 坐标门控) ===\n")
+    print("=== GraphResidualMultiTaskNet v6 (DGCNN范式 + 图注意力 + 坐标门控) ===\n")
 
     B, N = 2, 1024
     dummy = torch.randn(B, N, 4)
 
-    model = GraphResidualMultiTaskNet(num_classes=26, k=12, use_checkpoint=False, box_dim=3)
+    model = GraphResidualMultiTaskNet(num_classes=26, k=20, use_checkpoint=False, box_dim=3)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"参数量: {n_params / 1e6:.2f} M")
 
@@ -418,13 +446,11 @@ if __name__ == "__main__":
     assert out["logits"].shape == (B, 26)
     assert out["box_pred"].shape == (B, 3)
 
-    for i, block in enumerate([model.block1, model.block2, model.block3, model.block4], 1):
-        c_in = block.flow_b.in_features
-        c_out = block.linear_out.out_features
-        ds = "Y" if block.downsample else "N"
-        print(f"  block{i}: C_in={c_in:3d} C_out={c_out:3d} downsample={ds}")
+    for i, blk in enumerate([model.block1, model.block2, model.block3, model.block4], 1):
+        c_out = blk.out_conv[0].out_channels
+        ds = "Y" if blk.downsample else "N"
+        print(f"  block{i}: C_out={c_out:3d} downsample={ds}")
 
-    # 与 utils.loss 接口兼容
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -434,18 +460,12 @@ if __name__ == "__main__":
     print(f"\n  split_cls_and_box_predictions: logits {logits_o.shape}, box {box_o.shape}")
     print("\nAll checks pass.")
 
-    # GPU 显存测试
     print("\n=== GPU 显存测试 ===")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         try:
             props = torch.cuda.get_device_properties(0)
-            if hasattr(props, "total_memory"):
-                total_gb = props.total_memory / 1024 ** 3
-            elif hasattr(props, "total_mem"):
-                total_gb = props.total_mem / 1024 ** 3
-            else:
-                total_gb = 0.0
+            total_gb = getattr(props, "total_memory", 0) / 1024 ** 3
             if total_gb > 0:
                 print(f"总显存: {total_gb:.1f} GB")
         except Exception:
@@ -455,7 +475,7 @@ if __name__ == "__main__":
         import gc
         for bs in [4, 8, 16, 32]:
             try:
-                m = GraphResidualMultiTaskNet(num_classes=26, k=12, use_checkpoint=True, box_dim=3).cuda()
+                m = GraphResidualMultiTaskNet(num_classes=26, k=20, use_checkpoint=True, box_dim=3).cuda()
                 pts = torch.randn(bs, N, 4).cuda()
                 torch.cuda.empty_cache()
                 gc.collect()

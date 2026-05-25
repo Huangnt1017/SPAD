@@ -24,53 +24,74 @@
 **方法与总体流程**：
 - **输入**：降采样点云矩阵 $(B, N, 4)$，$N{=}1024$，包含 $x, y, z$ 与反射强度 $i$。
 
-- **Stem 层**：两层线性映射将原始 4 维输入升维至 32 维初始特征：$(B, N, 4) \to (B, N, 32)$。
+- **Stem 层**：两层 `Conv1d + BN1d + LeakyReLU` 将原始 4 维输入升维至 32 维初始特征：$(B, 4, N) \to (B, 32, N)$。全程采用 channel-first $(B, C, N)$ 布局以适配卷积与批归一化。
 
-- **Intensity 加权 4D KNN 构图 (双向门控)**：
-  近邻搜索综合几何距离与 intensity 差异：
-  $$d_{ij} = \|\mathbf p_i - \mathbf p_j\|^2 \cdot (1 - \alpha + 2\alpha \cdot \hat d^{(i)}_{ij})$$
-  其中 $\hat d^{(i)}_{ij} \in [0,1]$ 为归一化的 intensity 距离，$\alpha{=}0.3$ 控制门控强度。效果：
-  - 强度相似的点对：几何距离被缩小 30%，更容易成为邻居（聚合同目标信号）；
-  - 强度差异最大的点对：几何距离被放大 30%，抑制噪点混入真实目标邻域。
+- **动态特征空间 KNN (GPU)**：
+  每个 Block 内部从**当前学到的特征** $\mathbf f \in \mathbb R^{B \times C \times N}$ 重新构建 $k{=}20$ 近邻图（DGCNN "Dynamic Graph" 范式），使图结构随网络学习动态演化。KNN 通过负平方距离 + topk 实现，全程 GPU matmul，无需 CPU 回传。
 
 - **主干网络：图残差模块 (Graph Residual Block) × 4**
-  核心思想是通过**标准 Q/K/V 图注意力**在提取深层语义的同时，用**坐标门控跳跃连接**显式保留几何约束。单个 Block 数据流如下：
-  1. **Flow_A (图分支)**：特征经层归一化 (`LN`) 后，通过 KNN 索引收集邻居，构造边特征 $[\mathbf f_i,\; \mathbf f_j{-}\mathbf f_i,\; \mathbf p_j{-}\mathbf p_i]$（坐标差为完整 4D 含 intensity），经共享 MLP 得到 **per-neighbor** 图特征 $\mathbf F^k \in \mathbb R^{B \times N \times k \times C}$。
-  2. **Flow_B (点分支)**：基于同一归一化特征，通过 `Linear` 投影得到中心点特征 $\mathbf F \in \mathbb R^{B \times N \times C}$。
-  3. **标准 Q/K/V 图注意力 (Scaled Dot-Product Graph Attention)**：
-     $$\mathbf Q_i = W_q(\mathbf F_i),\quad \mathbf K_{ij} = W_k(\mathbf F^k_{ij}),\quad \mathbf V_{ij} = W_v(\mathbf F^k_{ij})$$
-     $$\alpha_{ij} = \text{softmax}_j\left(\frac{\mathbf Q_i \cdot \mathbf K_{ij}}{\sqrt{C_{out}}}\right),\quad \mathbf{attn}_i = \sum_j \alpha_{ij} \cdot \mathbf V_{ij}$$
-     Q 来自中心点语义 (Flow_B)，K/V 来自图构建的邻域上下文 (Flow_A)，注意力在 k 个邻居上做 softmax，学习自适应聚合权重。
-  4. **坐标门控跳跃连接 (Coordinate-Gated Residual)**：
-     原始 4D 坐标 $\mathbf P = (x, y, z, i)$ 同时产生门控信号和坐标信息：
-     $$\mathbf g = \sigma(W_{gate}(\mathbf P)),\quad \mathbf c = W_{res}(\mathbf P)$$
-     $$\mathbf{out} = \mathbf g \odot W_{out}(\mathbf{attn}) + (1 - \mathbf g) \odot \mathbf c$$
-     门控含义：$\mathbf g \to 1$ 信任注意力聚合的语义特征；$\mathbf g \to 0$ 信任原始坐标+强度信息。该设计使模型在噪声区域可动态偏向语义特征，而在几何清晰区域保留位置约束。
-  5. **层间下采样**：基于特征 L2 范数的加权无放回随机采样将点数减半，新点集上重建 intensity 加权 4D KNN 图。
+  核心思想是通过**双流图卷积 + 标准 Q/K/V 注意力**提取语义，再用**坐标门控跳跃连接**显式保留几何约束。单个 Block 的数据流如下：
+
+  **Step 1: 动态构图**
+  从当前层特征 $\mathbf f$ 用 GPU KNN 构建 $k$ 近邻索引 $\text{idx} \in \mathbb Z^{B \times N \times k}$。
+
+  **Step 2: 双流 EdgeConv (Conv2d + BN2d + LeakyReLU)**
+  在同一 KNN 图上，分别对特征和坐标做 DGCNN 风格 EdgeConv：
+  - **GCN_f (特征 EdgeConv)**：`get_graph_feature(f)` → $[\mathbf f_j{-}\mathbf f_i, \mathbf f_i] \in \mathbb R^{2C_{in}}$, 经 `Conv2d(2C_in, C_out, 1) + BN2d + LeakyReLU` → $\mathbf F^k \in \mathbb R^{B \times C_{out} \times N \times k}$，编码邻域**语义关系**。
+  - **GCN_p (位置 EdgeConv)**：`get_graph_feature(p)` → $[\mathbf P_j{-}\mathbf P_i, \mathbf P_i] \in \mathbb R^{8}$ (完整 4D×2), 经 `Conv2d(8, C_out, 1) + BN2d + LeakyReLU` → $\mathbf P^k \in \mathbb R^{B \times C_{out} \times N \times k}$，编码邻域**几何关系**。
+
+  **Step 3: 标准 Q/K/V 注意力 (Scaled Dot-Product Graph Attention)**
+  三路分别投影后做标准注意力运算：
+  $$\mathbf Q_i = \text{Conv1d}_{q}([\mathbf f_i \| \mathbf P_i]) \quad \text{(中心点联合查询, Conv1d+BN1d)}$$
+  $$\mathbf K_{ij} = \text{Conv2d}_{k}(\mathbf P^k_{ij}) \quad \text{(位置 EdgeConv → Key)}$$
+  $$\mathbf V_{ij} = \text{Conv2d}_{v}(\mathbf F^k_{ij}) \quad \text{(特征 EdgeConv → Value)}$$
+  $$\alpha_{ij} = \text{softmax}_j\left(\frac{\mathbf Q_i \cdot \mathbf K_{ij}}{\sqrt{C_{out}}}\right),\quad \mathbf{attn}_i = \sum_j \alpha_{ij} \cdot \mathbf V_{ij}$$
+
+  > **注意力机制的物理含义**:
+  > - $\mathbf K$ 由位置 EdgeConv 产生 → 注意力分数**由几何关系主导**，空间相关邻居获高权重；
+  > - $\mathbf V$ 由特征 EdgeConv 产生 → 聚合内容为**邻域语义信息**；
+  > - $\mathbf Q$ 由中心点 $(\mathbf f \| \mathbf P)$ 经 `Conv1d + BN1d` 产生 → **联合查询身份**。
+  > 解耦设计: "关注谁"(K, 几何驱动) 与 "聚合什么"(V, 语义驱动) 分离。
+
+  **Step 4: 坐标门控跳跃连接 (Coordinate-Gated Residual)**
+  原始 4D 坐标 $\mathbf P = (x, y, z, i)$ 同时产生门控信号和坐标信息：
+  $$\mathbf g = \sigma(W_{gate}(\mathbf P)),\quad \mathbf c = W_{res}(\mathbf P)$$
+  $$\mathbf{out} = \mathbf g \odot W_{out}(\mathbf{attn}) + (1 - \mathbf g) \odot \mathbf c$$
+  经 LeakyReLU 激活。门控含义：$\mathbf g \to 1$ 信任语义；$\mathbf g \to 0$ 信任坐标。
+
+  **Step 5: 层间下采样**
+  基于特征 L2 范数的加权无放回随机采样 (`torch.gather`) 将点数减半。
   
   ```text
   [单 Block 数据流向]
-   Input (P[4D], Feature)
-    │           \      /
-    │            [ LN ]
-    │            /    \
-    │        [NGF]   [Linear]    ← Flow_A: 边特征 MLP (per-neighbor, 含 4D 坐标差)
-    │          |        |           Flow_B: 中心特征投影
-    │        [GCN]      |
-    │          ↓        ↓
-    │       Fk(B,N,k,C) F(B,N,C)
-    │          |        |
-    │        [W_k]    [W_q]      ← Q/K/V 投影
-    │        [W_v]      |
-    │          ↓        ↓
-    │         K,V       Q
-    │           \      /
-    │    softmax(Q·K/√C) @ V     ← Scaled Dot-Product Attention over k neighbors
-    │              │
-    │           [Linear]         ← 特征映射
-    │              │
-    └───> [Coord Gate] ⊗ / ⊕ ──> ReLU ──> [downsample] ──> Output
-           P(4D) → σ(W_gate)     gate·mapped + (1-gate)·W_res(P)
+   f(B,C,N) + p(B,4,N)
+    │
+    ├── Dynamic KNN from f (GPU) → idx(B,N,k)
+    │
+    ├── [GCN_f]                         [GCN_p]
+    │   get_graph_feature(f,idx)        get_graph_feature(p,idx)
+    │   → (B, 2C, N, k)                → (B, 8, N, k)
+    │   Conv2d+BN2d+LeakyReLU          Conv2d+BN2d+LeakyReLU
+    │       ↓                               ↓
+    │   Fk (B,C_out,N,k)               Pk (B,C_out,N,k)
+    │       |                               |
+    │   Conv2d [W_v]                    Conv2d [W_k]
+    │       ↓                               ↓
+    │       V                               K
+    │        \       Q = Conv1d+BN(f‖p)    /
+    │         \             |             /
+    │     ┌──────────────────────────────────┐
+    │     │       Attention Module            │
+    │     │                                   │
+    │     │  score = Q · K / √C_out           │
+    │     │  weights = softmax(score, dim=k)  │
+    │     │  attn = Σ weights · V             │
+    │     └──────────────────────────────────┘
+    │                 │
+    │          Conv1d+BN1d [out_conv]
+    │                 │
+    └──> gate · mapped + (1-gate) · coord_res ──> LeakyReLU ──> downsample
+          gate = σ(Conv1d+BN(P[4D]))                             N → N/2
   ```
   
   通道与点数阶梯（4 层 Block，每层通道翻倍、点数减半）：
@@ -87,7 +108,7 @@
   - **分类头**：$\text{Linear}(1024,256) \to \text{BN} \to \text{ReLU} \to \text{Dropout} \to \text{Linear}(256, C)$，输出分类 logits $\mathbb R^{B\times C}$。
   - **Box 头**：结构同分类头，输出 3 维中心坐标 $\mathbb R^{B\times 3}$（归一化空间下的 $\hat x, \hat y, \hat z$）。推理时由固定归一化半宽 `FIXED_BBOX_HALF_SIZE_NORMALIZED` 重建完整 3D 边界框。
 
-- **模型规模**：约 2.82 M 参数；RTX 4070 SUPER 上 $B{=}32$ 训练峰值显存约 859 MB。
+- **模型规模**：约 2.53 M 参数；RTX 4070 SUPER 上 $B{=}32$ 训练峰值显存约 2173 MB。
 
 ### 任务 2：面向特定领域（输电杆塔）的数据模拟与算法验证
 **目标与动机**：为了验证所提算法（任务1）在真实工程场景中的可用性与泛化能力，将研究目标投射到电网巡检领域的具体应用上。

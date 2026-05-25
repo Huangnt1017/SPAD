@@ -242,6 +242,52 @@ def box_iou_3d_aligned(pred_boxes: TensorLike, gt_boxes: TensorLike, eps: float 
 	return torch.where(union > 0, inter_vol / (union + eps), torch.zeros_like(union))
 
 
+def box_diou_3d_aligned(pred_boxes: TensorLike, gt_boxes: TensorLike, eps: float = 1e-8) -> torch.Tensor:
+	"""3D Distance-IoU: 当框不重叠 (IoU=0) 时仍有中心距离梯度。
+
+	DIoU = IoU - (center_dist² / enclosing_diagonal²)
+	- IoU > 0 时: 正常 IoU 梯度 + 中心对齐惩罚
+	- IoU = 0 时: 中心距离项仍推动预测框向 GT 靠拢
+	  (解决 SPAD z 轴极窄导致 IoU 长期为 0、梯度消失的问题)
+
+	Args:
+		pred_boxes: (..., 6)
+		gt_boxes:   (..., 6)
+		eps: 数值稳定项。
+
+	Returns:
+		DIoU 值 ∈ [-1, 1], 形状与前导维一致。
+	"""
+	pred = canonicalize_boxes_3d(pred_boxes)
+	gt = canonicalize_boxes_3d(gt_boxes, device=pred.device, dtype=pred.dtype)
+
+	if pred.shape != gt.shape:
+		raise ValueError(f"Shape mismatch for DIoU: pred={tuple(pred.shape)}, gt={tuple(gt.shape)}")
+
+	# 标准 IoU
+	inter_min = torch.maximum(pred[..., 0::2], gt[..., 0::2])
+	inter_max = torch.minimum(pred[..., 1::2], gt[..., 1::2])
+	inter_size = (inter_max - inter_min).clamp(min=0.0)
+	inter_vol = inter_size.prod(dim=-1)
+
+	pred_vol = (pred[..., 1::2] - pred[..., 0::2]).clamp(min=0.0).prod(dim=-1)
+	gt_vol = (gt[..., 1::2] - gt[..., 0::2]).clamp(min=0.0).prod(dim=-1)
+	union = pred_vol + gt_vol - inter_vol
+	iou = torch.where(union > 0, inter_vol / (union + eps), torch.zeros_like(union))
+
+	# 中心距离平方
+	pred_center = (pred[..., 0::2] + pred[..., 1::2]) * 0.5   # (..., 3)
+	gt_center = (gt[..., 0::2] + gt[..., 1::2]) * 0.5
+	center_dist_sq = ((pred_center - gt_center) ** 2).sum(dim=-1)
+
+	# 最小外接框对角线平方
+	enclose_min = torch.minimum(pred[..., 0::2], gt[..., 0::2])
+	enclose_max = torch.maximum(pred[..., 1::2], gt[..., 1::2])
+	diag_sq = ((enclose_max - enclose_min) ** 2).sum(dim=-1).clamp(min=eps)
+
+	return iou - center_dist_sq / diag_sq
+
+
 def split_cls_and_box_predictions(model_outputs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 	"""
 	Parse model outputs into classification logits and optional box predictions.
@@ -470,21 +516,34 @@ class PointCloudMultiTaskLoss(nn.Module):
 			pred_c_valid = pred_centers[valid_mask]
 			gt_c_valid = gt_centers[valid_mask]
 
-			# 损失项 1: 中心点 smooth-L1, 作主回归监督。
-			center_l1_loss = F.smooth_l1_loss(pred_c_valid, gt_c_valid, reduction="mean")
-
-			# 损失项 2: 用固定半宽从中心重建 6 维框, 与 GT 重建框算 3D 轴对齐 IoU。
-			# IoU 反传时 half_size 视为常量, 梯度仅作用于 pred_c_valid → 推 center 靠近 GT。
-			# 数据流: pred_c_valid (B,3) → center_to_corners → pred_box_recon (B,6) → IoU vs GT。
 			half_size = self._half_size.to(device=logits.device, dtype=logits.dtype)
+
+			# 损失项 1: 维度加权 smooth-L1。
+			# z 轴半宽仅 0.018, 是 x/y 的 1/6.5; 不加权时 z 误差被严重低估。
+			# 按 1/(2*half_size) 加权 → 误差单位变为 "几个框宽", 各维贡献均衡。
+			inv_box_width = 1.0 / (2.0 * half_size)                      # (3,)
+			inv_box_width = inv_box_width / inv_box_width.mean()          # 归一化使均值=1
+			center_diff_scaled = (pred_c_valid - gt_c_valid) * inv_box_width.unsqueeze(0)
+			center_l1_loss = F.smooth_l1_loss(
+				center_diff_scaled,
+				torch.zeros_like(center_diff_scaled),
+				beta=0.1,
+				reduction="mean",
+			)
+
+			# 损失项 2: DIoU loss (替代 IoU loss)。
+			# 当 z 方向不重叠 (IoU=0) 时, DIoU 的中心距离项仍提供梯度。
 			pred_box_recon = center_to_corners(pred_c_valid, half_size=half_size,
 			                                  device=logits.device, dtype=logits.dtype)
 			gt_box_recon = center_to_corners(gt_c_valid, half_size=half_size,
 			                                device=logits.device, dtype=logits.dtype)
-			iou_per_sample = box_iou_3d_aligned(pred_box_recon, gt_box_recon)
-			box_iou_loss = 1.0 - iou_per_sample.mean()
+			diou_per_sample = box_diou_3d_aligned(pred_box_recon, gt_box_recon)
+			box_iou_loss = 1.0 - diou_per_sample.mean()
 
-			# 三项加权合并: cls + L1 + (1 - IoU)。
+			# 仍计算标准 IoU 用于监控 (不参与反传)
+			with torch.no_grad():
+				iou_per_sample = box_iou_3d_aligned(pred_box_recon, gt_box_recon)
+
 			total_loss = (
 				total_loss
 				+ self.box_l1_weight * center_l1_loss
