@@ -331,8 +331,7 @@ def run_epoch(
 	# (labels.size(0)) 直接累加的, 不涉及 GPU 同步。tqdm 进度条按 log_every 节流,
 	# 一次 .cpu().tolist() 把所有需要展示的标量批量搬到 CPU。
 	total_loss = torch.zeros((), device=device)
-	total_box_l1 = torch.zeros((), device=device)
-	total_box_iou_loss = torch.zeros((), device=device)
+	total_box_gauss = torch.zeros((), device=device)
 	total_box_iou = torch.zeros((), device=device)
 	correct_top1 = torch.zeros((), device=device, dtype=torch.long)
 	correct_top3 = torch.zeros((), device=device, dtype=torch.long)
@@ -434,8 +433,7 @@ def run_epoch(
 
 			if box_preds is not None and box_targets is not None:
 				# box 指标只有在预测框和目标框都能成功构造时才累计，避免缺失元信息污染统计。
-				total_box_l1 += loss_dict["box_l1_loss"].detach() * batch_size
-				total_box_iou_loss += loss_dict["box_iou_loss"].detach() * batch_size
+				total_box_gauss += loss_dict["box_gauss_loss"].detach() * batch_size
 				total_box_iou += loss_dict["box_iou_mean"].detach() * batch_size
 				box_metric_samples += batch_size
 
@@ -465,18 +463,15 @@ def run_epoch(
 		total_loss,
 		correct_top1.to(total_loss.dtype),
 		correct_top3.to(total_loss.dtype),
-		total_box_l1,
-		total_box_iou_loss,
+		total_box_gauss,
 		total_box_iou,
 	]).cpu().tolist()
-	f_loss, f_c1, f_c3, f_bl1, f_bil, f_bi = final_snap
+	f_loss, f_c1, f_c3, f_bg, f_bi = final_snap
 	metrics = {
-		# loss/topk 是分类主指标；box_* 是 box 分支的监督损失和几何质量指标。
 		"loss": f_loss / max(total_samples, 1),
 		"top1": f_c1 / max(total_samples, 1),
 		"top3": f_c3 / max(total_samples, 1),
-		"box_l1": f_bl1 / max(box_metric_samples, 1),
-		"box_iou_loss": f_bil / max(box_metric_samples, 1),
+		"box_gauss": f_bg / max(box_metric_samples, 1),
 		"box_iou": f_bi / max(box_metric_samples, 1),
 		"box_samples": float(box_metric_samples),
 		"samples": float(total_samples),
@@ -539,11 +534,13 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	# 多任务损失的三个权重控制分类、box L1 和 box IoU 三部分对总损失的贡献。
 	criterion = PointCloudMultiTaskLoss(
 		cls_weight=args.cls_loss_weight,
-		box_l1_weight=args.box_l1_weight,
-		box_iou_weight=args.box_iou_weight,
 		label_smoothing=args.label_smoothing,
 	)
-	optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+	# 将 loss 中的可学习参数 (Kendall 不确定性权重) 一并加入 optimizer
+	optimizer = optim.AdamW(
+		list(model.parameters()) + list(criterion.parameters()),
+		lr=args.lr, weight_decay=args.weight_decay,
+	)
 	scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
 	save_dir.mkdir(parents=True, exist_ok=True)
@@ -617,16 +614,14 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		if train_metrics["box_samples"] > 0 or val_metrics["box_samples"] > 0:
 			# box 指标单独打印，方便区分分类收敛和几何框收敛是否一致。
 			logger.info(
-				"Epoch [%d/%d] | train_box_iou=%.4f train_box_l1=%.4f train_box_iou_loss=%.4f | "
-				"val_box_iou=%.4f val_box_l1=%.4f val_box_iou_loss=%.4f",
+				"Epoch [%d/%d] | train_box_iou=%.4f train_box_gauss=%.4f | "
+				"val_box_iou=%.4f val_box_gauss=%.4f",
 				epoch,
 				args.epochs,
 				train_metrics["box_iou"],
-				train_metrics["box_l1"],
-				train_metrics["box_iou_loss"],
+				train_metrics["box_gauss"],
 				val_metrics["box_iou"],
-				val_metrics["box_l1"],
-				val_metrics["box_iou_loss"],
+				val_metrics["box_gauss"],
 			)
 
 		if val_metrics["top1"] >= best_val_top1:

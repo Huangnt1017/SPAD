@@ -31,13 +31,18 @@ DEFAULT_SPAD_BOX_BOUNDS = ((1.0, 64.0), (1.0, 64.0), (60.0, 110.0))
 # tgt_z=(80,85) 决定; z 在 meta 里以 inclusive [80,84] 存储, 故 raw 宽度为 4)。
 # 既然尺寸固定, 模型只需回归中心点 (cx, cy, cz), 测试时用 ±half_size 重建 6 维 bbox。
 #
-# Raw 半宽: (7.5, 7.5, 2.0)
-# 归一化半宽: 用 SPAD_NORM_BOUNDS 的跨度 (63, 63, 109) 除原始半宽。
-FIXED_BBOX_RAW_HALF_SIZE: Tuple[float, float, float] = (7.5, 7.5, 2.0)
+# SPAD 数据集中目标框原始尺寸 (由 data_augment.py 中 tgt_x/y/z 定义):
+#   tgt_x = (20, 35)  upper-exclusive → 连续宽度 15, 半宽 7.5
+#   tgt_y = (5, 20)   upper-exclusive → 连续宽度 15, 半宽 7.5
+#   tgt_z = (80, 85)  upper-exclusive → 连续宽度  5, 半宽 2.5
+# 注: data_augment 中 meta 存储 z 为 inclusive [80, 84], 但在连续空间中
+#     对应 [80, 85), 宽度 = 5, 与 x/y 的 exclusive 语义一致。
+# 归一化分母: SPAD_NORM_BOUNDS 跨度 (63, 63, 109)。
+FIXED_BBOX_RAW_HALF_SIZE: Tuple[float, float, float] = (7.5, 7.5, 2.5)
 FIXED_BBOX_HALF_SIZE_NORMALIZED: Tuple[float, float, float] = (
     7.5 / 63.0,    # ≈ 0.11905
     7.5 / 63.0,    # ≈ 0.11905
-    2.0 / 109.0,   # ≈ 0.01835
+    2.5 / 109.0,   # ≈ 0.02294
 )
 
 
@@ -411,39 +416,49 @@ class PointCloudMultiTaskLoss(nn.Module):
 	GT 框尺寸固定 (见 FIXED_BBOX_HALF_SIZE_NORMALIZED), 模型只回归中心点 [cx,cy,cz];
 	测试/可视化时再用固定半宽重建 6 维 bbox。
 
-	Total loss:
-	  L = cls_weight     * L_cls
-	    + box_l1_weight  * smooth_l1(pred_center, gt_center)
-	    + box_iou_weight * (1 - IoU3D(reconstructed_pred_box, reconstructed_gt_box))
+	Total loss (2 项):
+	  L = w_cls * L_cls + w_box * L_gauss
 
-	IoU 监督仍走重建后的 6 维框 (用固定半宽 from center): 这样既能让"中心更靠近 GT"通过
-	IoU 链式回传额外的梯度压力, 又不会让模型偷预测尺寸 (尺寸完全由 FIXED_BBOX_HALF_SIZE_NORMALIZED 决定)。
-	纯 smooth_l1 在中心误差很小时梯度衰减, 加上 IoU 项可以维持精化压力。
+	其中 L_gauss 为 SPAD Soft-Gaussian Box Loss, 受启发于:
+	  Deng et al., "Histogram-free SPAD imaging via spatiotemporal multi-head LSTM"
+	  (Optics Letters, 2026) 中的 Soft-histogram depth loss。
+
+	核心思想: 将 GT 中心建模为 3D 高斯分布 (σ_d = h_d, 各维半宽作为测量不确定度),
+	loss = -log(exp(-Σ_d Δ_d² / (2h_d²)) + ε), 统一替代之前的 SmoothL1 + DIoU:
+	  - 自然维度加权 (z 轴 h=0.018, 误差被放大 ~43 倍)
+	  - 有界、类 IoU 行为 (衡量预测落在 GT 高斯包络内的似然)
+	  - log + ε 保证梯度永不消失 (解决旧 IoU loss 在框不重叠时梯度为零的问题)
 
 	输入约定:
-	- model_outputs 第二项 (box_preds / center_preds): [B, 3] 中心点 [cx,cy,cz];
-	- box_targets: [B, 6] 6 维角点框 [xmin,xmax,ymin,ymax,zmin,zmax] (与 dataloader 现有契约一致),
-	  内部用 corners_to_center 提取中心后再算 loss。
+	- model_outputs 第二项: [B, 3] 中心点 [cx,cy,cz]
+	- box_targets: [B, 6] 角点框 (内部转中心)
 	"""
 
 	def __init__(
 		self,
 		cls_weight: float = 1.0,
-		box_l1_weight: float = 1.0,
-		box_iou_weight: float = 1.0,
+		box_weight: float = 1.0,
 		label_smoothing: float = 0.0,
 		half_size: Sequence[float] = FIXED_BBOX_HALF_SIZE_NORMALIZED,
+		auto_balance: bool = True,
+		gauss_eps: float = 0.01,
 	):
 		super().__init__()
 		self.cls_weight = float(cls_weight)
-		self.box_l1_weight = float(box_l1_weight)
-		self.box_iou_weight = float(box_iou_weight)
+		self.box_weight = float(box_weight)
+		self.auto_balance = auto_balance
+		self.gauss_eps = gauss_eps
 		self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
 		self.register_buffer(
 			"_half_size",
 			torch.tensor(half_size, dtype=torch.float32),
 			persistent=False,
 		)
+
+		# Kendall et al. (CVPR 2018) 同方差不确定性自适应权重 (2 项: cls + box)
+		if auto_balance:
+			self.log_var_cls = nn.Parameter(torch.zeros(()))
+			self.log_var_box = nn.Parameter(torch.zeros(()))
 
 	def forward(
 		self,
@@ -469,13 +484,15 @@ class PointCloudMultiTaskLoss(nn.Module):
 		cls_targets = cls_targets.long().to(logits.device)
 
 		cls_loss = self.cls_criterion(logits, cls_targets)
-		total_loss = self.cls_weight * cls_loss
+		if self.auto_balance:
+			total_loss = torch.exp(-self.log_var_cls) * cls_loss + self.log_var_cls
+		else:
+			total_loss = self.cls_weight * cls_loss
 
 		out: Dict[str, torch.Tensor] = {
 			"total_loss": total_loss,
 			"cls_loss": cls_loss,
-			"box_l1_loss": torch.zeros((), device=logits.device),
-			"box_iou_loss": torch.zeros((), device=logits.device),
+			"box_gauss_loss": torch.zeros((), device=logits.device),
 			"box_iou_mean": torch.zeros((), device=logits.device),
 		}
 
@@ -518,40 +535,34 @@ class PointCloudMultiTaskLoss(nn.Module):
 
 			half_size = self._half_size.to(device=logits.device, dtype=logits.dtype)
 
-			# 损失项 1: 维度加权 smooth-L1。
-			# z 轴半宽仅 0.018, 是 x/y 的 1/6.5; 不加权时 z 误差被严重低估。
-			# 按 1/(2*half_size) 加权 → 误差单位变为 "几个框宽", 各维贡献均衡。
-			inv_box_width = 1.0 / (2.0 * half_size)                      # (3,)
-			inv_box_width = inv_box_width / inv_box_width.mean()          # 归一化使均值=1
-			center_diff_scaled = (pred_c_valid - gt_c_valid) * inv_box_width.unsqueeze(0)
-			center_l1_loss = F.smooth_l1_loss(
-				center_diff_scaled,
-				torch.zeros_like(center_diff_scaled),
-				beta=0.1,
-				reduction="mean",
-			)
+			# SPAD Log-Cauchy Box Loss
+			# 受 Deng et al. (Optics Letters 2026) Soft-histogram depth loss 启发:
+			# 将 GT 中心建模为具有 per-dim 不确定度 h_d 的分布。
+			# log(1 + Δ²/h²) 兼具:
+			#   - 小误差时 MSE 行为 (Δ²/h², 柔和精调)
+			#   - 大误差时对数增长 (2·log(|Δ|/h), 永不饱和, 梯度永不为零)
+			#   - 自然维度加权 (h_z=0.018 使 z 误差被放大 ~43 倍)
+			delta = pred_c_valid - gt_c_valid                              # (B_valid, 3)
+			norm_sq = (delta / half_size.unsqueeze(0)).pow(2)              # (B_valid, 3)
+			box_gauss_loss = torch.log1p(norm_sq).sum(dim=-1).mean()       # scalar
 
-			# 损失项 2: DIoU loss (替代 IoU loss)。
-			# 当 z 方向不重叠 (IoU=0) 时, DIoU 的中心距离项仍提供梯度。
-			pred_box_recon = center_to_corners(pred_c_valid, half_size=half_size,
-			                                  device=logits.device, dtype=logits.dtype)
-			gt_box_recon = center_to_corners(gt_c_valid, half_size=half_size,
-			                                device=logits.device, dtype=logits.dtype)
-			diou_per_sample = box_diou_3d_aligned(pred_box_recon, gt_box_recon)
-			box_iou_loss = 1.0 - diou_per_sample.mean()
-
-			# 仍计算标准 IoU 用于监控 (不参与反传)
+			# 标准 IoU 仅用于监控 (不参与反传)
 			with torch.no_grad():
+				pred_box_recon = center_to_corners(pred_c_valid, half_size=half_size,
+				                                  device=logits.device, dtype=logits.dtype)
+				gt_box_recon = center_to_corners(gt_c_valid, half_size=half_size,
+				                                device=logits.device, dtype=logits.dtype)
 				iou_per_sample = box_iou_3d_aligned(pred_box_recon, gt_box_recon)
 
-			total_loss = (
-				total_loss
-				+ self.box_l1_weight * center_l1_loss
-				+ self.box_iou_weight * box_iou_loss
-			)
+			if self.auto_balance:
+				total_loss = (
+					total_loss
+					+ torch.exp(-self.log_var_box) * box_gauss_loss + self.log_var_box
+				)
+			else:
+				total_loss = total_loss + self.box_weight * box_gauss_loss
 
-			out["box_l1_loss"] = center_l1_loss
-			out["box_iou_loss"] = box_iou_loss
+			out["box_gauss_loss"] = box_gauss_loss
 			out["box_iou_mean"] = iou_per_sample.mean()
 
 		out["total_loss"] = total_loss

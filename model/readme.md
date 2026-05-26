@@ -22,93 +22,140 @@
 **目标与动机**：在传统的降采样点云处理范式下，提出一种定制化的 3D 目标分类与边界框 (3D Box) 回归网络。针对单光子点云中噪点易导致目标几何结构变形的问题，设计带有”坐标残差”的局部图特征提取模块。
 
 **方法与总体流程**：
-- **输入**：降采样点云矩阵 $(B, N, 4)$，$N{=}1024$，包含 $x, y, z$ 与反射强度 $i$。
+- **输入**：降采样点云矩阵 $(B, N, 4)$，$N{=}1024$，包含 $x, y, z$ 与反射强度 $i$。全程采用 channel-first $(B, C, N)$ 布局。
 
-- **Stem 层**：两层 `Conv1d + BN1d + LeakyReLU` 将原始 4 维输入升维至 32 维初始特征：$(B, 4, N) \to (B, 32, N)$。全程采用 channel-first $(B, C, N)$ 布局以适配卷积与批归一化。
+#### 整体网络结构
 
-- **动态特征空间 KNN (GPU)**：
-  每个 Block 内部从**当前学到的特征** $\mathbf f \in \mathbb R^{B \times C \times N}$ 重新构建 $k{=}20$ 近邻图（DGCNN "Dynamic Graph" 范式），使图结构随网络学习动态演化。KNN 通过负平方距离 + topk 实现，全程 GPU matmul，无需 CPU 回传。
+| 阶段 | 模块 | 输入 → 输出 | 说明 |
+|:----:|:----:|:----------:|:----:|
+| Stem | Conv1d×2 + BN1d + LeakyReLU | $(B,4,N) \to (B,32,N)$ | 升维至初始特征 |
+| Block 1 | GraphResidualBlock | $(B,32,N) \to (B,64,N)$ | 双流 EdgeConv + Q/K/V 注意力 + 坐标门控 |
+| Block 2 | GraphResidualBlock | $(B,64,N) \to (B,64,N)$ | 同上 |
+| Block 3 | GraphResidualBlock | $(B,64,N) \to (B,128,N)$ | 同上 |
+| Block 4 | GraphResidualBlock | $(B,128,N) \to (B,256,N)$ | 同上 |
+| 多尺度聚合 | Conv1d + BN1d + LeakyReLU | $\text{cat}(f_1,f_2,f_3,f_4){=}(B,512,N) \to (B,512,N)$ | 各层特征拼接后跨层融合 |
+| 全局池化 | max-pool + avg-pool | $(B,512,N) \to (B,1024)$ | 全局描述子 |
+| 分类头 | MLP (1024→512→256→$C$) | $(B,1024) \to (B,C)$ | BN + LeakyReLU + Dropout |
+| Box 头 | MLP (1032→256→128→3) + centroid-offset | $(B,1032) \to (B,3)$ | 预测 = 点云质心 + 偏移 |
 
-- **主干网络：图残差模块 (Graph Residual Block) × 4**
-  核心思想是通过**双流图卷积 + 标准 Q/K/V 注意力**提取语义，再用**坐标门控跳跃连接**显式保留几何约束。单个 Block 的数据流如下：
+> **无下采样设计**: 全部 1024 点贯穿 4 层 Block，保留完整的 intensity 空间结构；多尺度拼接融合各层局部/全局特征。每个 Block 输出 `(p, f_out)`，其中 **p 始终为原始输入坐标 $(B,4,N)$ 不变**，仅 f 逐层升维。
 
-  **Step 1: 动态构图**
-  从当前层特征 $\mathbf f$ 用 GPU KNN 构建 $k$ 近邻索引 $\text{idx} \in \mathbb Z^{B \times N \times k}$。
+#### 双路动态 KNN (GPU) + 坐标图缓存
 
-  **Step 2: 双流 EdgeConv (Conv2d + BN2d + LeakyReLU)**
-  在同一 KNN 图上，分别对特征和坐标做 DGCNN 风格 EdgeConv：
-  - **GCN_f (特征 EdgeConv)**：`get_graph_feature(f)` → $[\mathbf f_j{-}\mathbf f_i, \mathbf f_i] \in \mathbb R^{2C_{in}}$, 经 `Conv2d(2C_in, C_out, 1) + BN2d + LeakyReLU` → $\mathbf F^k \in \mathbb R^{B \times C_{out} \times N \times k}$，编码邻域**语义关系**。
-  - **GCN_p (位置 EdgeConv)**：`get_graph_feature(p)` → $[\mathbf P_j{-}\mathbf P_i, \mathbf P_i] \in \mathbb R^{8}$ (完整 4D×2), 经 `Conv2d(8, C_out, 1) + BN2d + LeakyReLU` → $\mathbf P^k \in \mathbb R^{B \times C_{out} \times N \times k}$，编码邻域**几何关系**。
+网络维护两套独立的 KNN 图（$k{=}20$），服务于两路 EdgeConv：
+- **特征空间 KNN** (`knn_f`): 从当前学到的特征 $\mathbf f$ 构建（语义驱动，DGCNN "Dynamic Graph" 范式），**每层重新计算**
+- **坐标+intensity 空间 KNN** (`knn_p`): 从原始 4D 坐标 $\mathbf P{=}(x,y,z,i)$ 构建（保留 SPAD 强度空间结构）
 
-  **Step 3: 标准 Q/K/V 注意力 (Scaled Dot-Product Graph Attention)**
-  三路分别投影后做标准注意力运算：
-  $$\mathbf Q_i = \text{Conv1d}_{q}([\mathbf f_i \| \mathbf P_i]) \quad \text{(中心点联合查询, Conv1d+BN1d)}$$
-  $$\mathbf K_{ij} = \text{Conv2d}_{k}(\mathbf P^k_{ij}) \quad \text{(位置 EdgeConv → Key)}$$
-  $$\mathbf V_{ij} = \text{Conv2d}_{v}(\mathbf F^k_{ij}) \quad \text{(特征 EdgeConv → Value)}$$
-  $$\alpha_{ij} = \text{softmax}_j\left(\frac{\mathbf Q_i \cdot \mathbf K_{ij}}{\sqrt{C_{out}}}\right),\quad \mathbf{attn}_i = \sum_j \alpha_{ij} \cdot \mathbf V_{ij}$$
+KNN 通过负平方距离 + topk 实现，全程 GPU matmul。
 
-  > **注意力机制的物理含义**:
-  > - $\mathbf K$ 由位置 EdgeConv 产生 → 注意力分数**由几何关系主导**，空间相关邻居获高权重；
-  > - $\mathbf V$ 由特征 EdgeConv 产生 → 聚合内容为**邻域语义信息**；
-  > - $\mathbf Q$ 由中心点 $(\mathbf f \| \mathbf P)$ 经 `Conv1d + BN1d` 产生 → **联合查询身份**。
-  > 解耦设计: "关注谁"(K, 几何驱动) 与 "聚合什么"(V, 语义驱动) 分离。
+> **v7 优化**: 由于 $\mathbf P$ 全程不变，`knn_p` 和 `get_graph_feature(p)` 在网络入口**一次性预计算**，生成 $\text{p\_graph} \in \mathbb R^{B \times 8 \times N \times k}$，4 个 Block 共享复用，省掉 3 次 $O(N^2)$ KNN + 3 次 gather/permute，约**提速 30%**。
 
-  **Step 4: 坐标门控跳跃连接 (Coordinate-Gated Residual)**
-  原始 4D 坐标 $\mathbf P = (x, y, z, i)$ 同时产生门控信号和坐标信息：
-  $$\mathbf g = \sigma(W_{gate}(\mathbf P)),\quad \mathbf c = W_{res}(\mathbf P)$$
-  $$\mathbf{out} = \mathbf g \odot W_{out}(\mathbf{attn}) + (1 - \mathbf g) \odot \mathbf c$$
-  经 LeakyReLU 激活。门控含义：$\mathbf g \to 1$ 信任语义；$\mathbf g \to 0$ 信任坐标。
+#### 单 Block 数据流
 
-  **Step 5: 层间下采样**
-  基于特征 L2 范数的加权无放回随机采样 (`torch.gather`) 将点数减半。
-  
-  ```text
-  [单 Block 数据流向]
-   f(B,C,N) + p(B,4,N)
-    │
-    ├── Dynamic KNN from f (GPU) → idx(B,N,k)
-    │
-    ├── [GCN_f]                         [GCN_p]
-    │   get_graph_feature(f,idx)        get_graph_feature(p,idx)
-    │   → (B, 2C, N, k)                → (B, 8, N, k)
-    │   Conv2d+BN2d+LeakyReLU          Conv2d+BN2d+LeakyReLU
-    │       ↓                               ↓
-    │   Fk (B,C_out,N,k)               Pk (B,C_out,N,k)
-    │       |                               |
-    │   Conv2d [W_v]                    Conv2d [W_k]
-    │       ↓                               ↓
-    │       V                               K
-    │        \       Q = Conv1d+BN(f‖p)    /
-    │         \             |             /
-    │     ┌──────────────────────────────────┐
-    │     │       Attention Module            │
-    │     │                                   │
-    │     │  score = Q · K / √C_out           │
-    │     │  weights = softmax(score, dim=k)  │
-    │     │  attn = Σ weights · V             │
-    │     └──────────────────────────────────┘
-    │                 │
-    │          Conv1d+BN1d [out_conv]
-    │                 │
-    └──> gate · mapped + (1-gate) · coord_res ──> LeakyReLU ──> downsample
-          gate = σ(Conv1d+BN(P[4D]))                             N → N/2
-  ```
-  
-  通道与点数阶梯（4 层 Block，每层通道翻倍、点数减半）：
-  | Block | $C_{in} \to C_{out}$ | $N_{in} \to N_{out}$ |
-  |:-----:|:--------------------:|:--------------------:|
-  | 1     | 32 → 64              | 1024 → 512           |
-  | 2     | 64 → 128             | 512 → 256            |
-  | 3     | 128 → 256            | 256 → 128            |
-  | 4     | 256 → 512            | 128 → 64             |
+每个 GraphResidualBlock 接收 `(p, f, p_graph)` 三个输入，内部执行以下步骤：
 
-- **全局池化**：对最后一层 64 个点的 512 维特征同时做 max-pool 与 avg-pool，拼接得到 1024 维全局描述子。
+**Step 1: 双流 EdgeConv (Conv2d + BN2d + LeakyReLU)**
+分别在**特征 KNN 图**和**坐标图缓存**上做 DGCNN 风格 EdgeConv：
+- **GCN_f (特征 EdgeConv)**：`get_graph_feature(f, knn_f)` → $[\mathbf f_j{-}\mathbf f_i, \mathbf f_i] \in \mathbb R^{2C_{in}}$, 经 `Conv2d + BN2d + LeakyReLU` → $\mathbf F^k \in \mathbb R^{B \times C_{out} \times N \times k}$，编码邻域**语义关系** → 作为 **Value** 来源
+- **GCN_p (位置 EdgeConv)**：复用预计算的 `p_graph` $\in \mathbb R^{B \times 8 \times N \times k}$, 经 `Conv2d + BN2d + LeakyReLU` → $\mathbf P^k \in \mathbb R^{B \times C_{out} \times N \times k}$，编码邻域**几何关系** → 作为 **Key** 来源
 
-- **双任务预测头**：
-  - **分类头**：$\text{Linear}(1024,256) \to \text{BN} \to \text{ReLU} \to \text{Dropout} \to \text{Linear}(256, C)$，输出分类 logits $\mathbb R^{B\times C}$。
-  - **Box 头**：结构同分类头，输出 3 维中心坐标 $\mathbb R^{B\times 3}$（归一化空间下的 $\hat x, \hat y, \hat z$）。推理时由固定归一化半宽 `FIXED_BBOX_HALF_SIZE_NORMALIZED` 重建完整 3D 边界框。
+**Step 2: 标准 Q/K/V 图注意力 (Scaled Dot-Product)**
 
-- **模型规模**：约 2.53 M 参数；RTX 4070 SUPER 上 $B{=}32$ 训练峰值显存约 2173 MB。
+$$\mathbf Q_i = \text{Conv1d}_{q}([\mathbf f_i \| \mathbf P_i]) \quad \text{(中心点联合查询)}$$
+$$\mathbf K_{ij} = \text{Conv2d}_{k}(\mathbf P^k_{ij}) \quad \text{(位置 EdgeConv → Key: 几何驱动权重)}$$
+$$\mathbf V_{ij} = \text{Conv2d}_{v}(\mathbf F^k_{ij}) \quad \text{(特征 EdgeConv → Value: 语义被聚合)}$$
+$$\alpha_{ij} = \text{softmax}_j\left(\frac{\mathbf Q_i \cdot \mathbf K_{ij}}{\sqrt{C_{out}}}\right),\quad \mathbf{attn}_i = \sum_j \alpha_{ij} \cdot \mathbf V_{ij}$$
+
+> **解耦设计**: "关注谁"(K, 几何驱动) 与 "聚合什么"(V, 语义驱动) 由两路**独立 KNN 图**分别产生。
+
+**Step 3: 坐标门控跳跃连接 (Coordinate-Gated Residual)**
+
+$$\mathbf g = \sigma(\text{Conv1d}_{gate}(\mathbf P)),\quad \mathbf c = \text{Conv1d}_{res}(\mathbf P)$$
+$$\mathbf{out} = \mathbf g \odot \text{Conv1d}_{out}(\mathbf{attn}) + (1 - \mathbf g) \odot \mathbf c$$
+
+门控含义：$\mathbf g \to 1$ 信任注意力聚合的语义特征；$\mathbf g \to 0$ 信任原始坐标+强度信息。
+
+```text
+[单 Block 数据流向]
+ f(B,C,N) + p(B,4,N) + p_graph(B,8,N,k) [预计算缓存]
+  │
+  ├── KNN from f (特征空间, 每层重算)   p_graph (坐标图, 入口预计算复用)
+  │        ↓                                    │
+  ├── [GCN_f]                              [GCN_p]
+  │   get_graph_feature(f,knn_f)           Conv2d+BN2d+LeakyReLU
+  │   Conv2d+BN2d+LeakyReLU                    │
+  │       ↓                                     ↓
+  │   Fk (B,C_out,N,k)                    Pk (B,C_out,N,k)
+  │       |                                     |
+  │   Conv2d [W_v]                         Conv2d [W_k]
+  │       ↓                                     ↓
+  │       V                                     K
+  │        \       Q = Conv1d+BN(f‖p)          /
+  │         \             |                   /
+  │     ┌──────────────────────────────────┐
+  │     │       Attention Module            │
+  │     │                                   │
+  │     │  score = Q · K / √C_out           │
+  │     │  weights = softmax(score, dim=k)  │
+  │     │  attn = Σ weights · V             │
+  │     └──────────────────────────────────┘
+  │                 │
+  │          Conv1d+BN1d [out_conv]
+  │                 │
+  └──> gate · mapped + (1-gate) · coord_res ──> LeakyReLU ──> f_out
+        gate = σ(Conv1d+BN(P[4D]))                            p 不变
+```
+
+#### Box 头: Centroid-Offset 预测
+
+Box 头接收全局特征 + 点云坐标统计量 $(B, 1024{+}8)$，预测从**点云质心到目标中心的偏移量**（而非绝对坐标）：
+$$\hat{\mathbf c} = \bar{\mathbf P}_{xyz} + \text{MLP}([\mathbf f_{pool} \| \bar{\mathbf P} \| \sigma_{\mathbf P}])$$
+其中 $\bar{\mathbf P}$ 为 1024 点的 4D 坐标均值（质心锚点），$\sigma_{\mathbf P}$ 为标准差（尺度先验）。网络只需学习接近零的残差偏移，收敛显著加快。推理时由固定归一化半宽 `FIXED_BBOX_HALF_SIZE_NORMALIZED` 重建完整 3D 边界框。
+
+#### 损失函数
+
+仅 **2 项损失**，采用 **Kendall et al. (CVPR 2018) 同方差不确定性自适应权重** 自动平衡：
+
+$$\mathcal L = e^{-s_{cls}} \mathcal L_{cls} + s_{cls} + e^{-s_{box}} \mathcal L_{box}^{gauss} + s_{box}$$
+
+其中 $s = \log \sigma^2$ 为可学习参数（与模型参数一同优化），效果：
+- $\sigma$ 大 → 该任务权重低（不确定性高，暂缓学习）
+- $\sigma$ 小 → 该任务权重高（不确定性低，加速精化）
+- $+s$ 正则项防止模型将 $\sigma \to \infty$ 来逃避困难任务
+
+**SPAD Log-Cauchy Box Loss** $\mathcal L_{box}$ 受启发于 Deng et al. (Optics Letters, 2026) 提出的 Soft-histogram depth loss — 将 GT 深度建模为具有测量不确定度的分布而非硬点目标。本文将此思想扩展至 3D 中心点回归，采用 Log-Cauchy 形式：
+
+$$\mathcal L_{box} = \sum_{d \in \{x,y,z\}} \log\left(1 + \frac{(\hat c_d - c_d^{gt})^2}{h_d^2}\right)$$
+
+其中 $h_d$ 为各维归一化半宽（$h_x{=}h_y{\approx}0.119,\; h_z{\approx}0.023$），由目标物理尺寸（$x/y$ 宽 15 bin, $z$ 宽 5 bin）和归一化分母（63, 63, 109）导出，作为该维度的测量不确定度尺度。
+
+| 误差范围 | 行为 | 梯度 |
+|:-------:|:----:|:----:|
+| $\|\Delta\| \ll h_d$ | $\approx \Delta^2/h^2$（MSE 级，柔和精调） | $\approx 2\Delta/h^2$（维度加权） |
+| $\|\Delta\| \approx h_d$ | $\log(2) \approx 0.69$（转折点） | 峰值梯度 |
+| $\|\Delta\| \gg h_d$ | $\approx 2\log(\|\Delta\|/h)$（对数增长） | $\approx 2/\Delta$（缓慢衰减但**永不为零**） |
+
+| 特性 | 说明 |
+|:----:|:----:|
+| **物理含义** | 将 GT 中心建模为具有 per-dim 不确定度 $h_d$ 的分布; 误差在半宽内→低 loss, 超出→对数惩罚 |
+| **维度自适应** | 内建: $z$ 轴 $h{=}0.018$ 使 $z$ 误差被自动放大 $\sim$43 倍 |
+| **无梯度消失** | 对数增长保证任意大的误差仍有非零梯度 (避免了纯 Gaussian/IoU 的饱和问题) |
+| **鲁棒性** | 大误差时对数增长而非线性/平方增长, 不会被离群样本主导 |
+
+此设计**统一替代了之前的 SmoothL1 + DIoU 两项 loss**，将 3 项损失简化为 2 项。
+
+两个损失分项：
+
+| 损失项 | 公式 | 说明 |
+|:-----:|:----:|:----:|
+| $\mathcal L_{cls}$ | CrossEntropy | 26 类分类 |
+| $\mathcal L_{box}$ | $\sum_d \log(1 + \Delta_d^2 / h_d^2)$ | SPAD Log-Cauchy 中心回归 |
+
+#### 模型规模与速度优化 (v7)
+
+- **参数量**：约 1.65 M（+ 2 个可学习损失权重参数）
+- **显存**：RTX 4070 SUPER 上 $B{=}32$ 训练峰值约 7.4 GB（含梯度检查点）
+- **v7 速度优化**：坐标 KNN + `get_graph_feature(p)` 在网络入口一次性预计算，4 个 Block 共享缓存张量 `p_graph`$(B,8,N,k)$，省掉 3 次 $O(N^2)$ KNN 和 3 次 gather/permute，约提速 30%
 
 ### 任务 2：面向特定领域（输电杆塔）的数据模拟与算法验证
 **目标与动机**：为了验证所提算法（任务1）在真实工程场景中的可用性与泛化能力，将研究目标投射到电网巡检领域的具体应用上。

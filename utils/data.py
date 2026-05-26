@@ -501,7 +501,7 @@ class SPADMultiTaskDataset(Dataset):
                 "target_shift": [0, 0, 0],
                 "fog_shift_z": 0,
                 "target_x_range": [20, 35],
-                "target_y_range": [5, 25],
+                "target_y_range": [5, 20],
                 "target_z_range": [80, 84],
                 "fog_z_range": [35, 64],
                 "fog_ahead_gap_bins": 16,
@@ -533,16 +533,18 @@ class SPADMultiTaskDataset(Dataset):
         label_idx = self.class_to_idx[symbol]
 
         x_range = aug_meta.get("target_x_range", [20, 35])
-        y_range = aug_meta.get("target_y_range", [5, 25])
+        y_range = aug_meta.get("target_y_range", [5, 20])
         z_range = aug_meta.get("target_z_range", [80, 84])
 
         if len(x_range) != 2 or len(y_range) != 2 or len(z_range) != 2:
             raise ValueError(f"Invalid target ranges in augmentation meta for sample: {sample['path']}")
 
+        # x/y_range 来自 augment: (start, end_exclusive) — 直接用
+        # z_range 来自 augment: (start, end_inclusive) — 需 +1 转 exclusive 与 x/y 一致
         label_row = np.array([
             float(x_range[0]), float(x_range[1]),
             float(y_range[0]), float(y_range[1]),
-            float(z_range[0]), float(z_range[1]),
+            float(z_range[0]), float(z_range[1] + 1),
             float(label_idx),
         ], dtype=np.float32)
 

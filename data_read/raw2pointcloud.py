@@ -444,7 +444,7 @@ if __name__ == '__main__':
     # indices = np.random.choice(pc.shape[0], 4096*20, p=weights1, replace=False)
     # pc_rd = pc[indices, :]
     # plot_pc(pc_rd,'all')
-    pc = read_pc(r"D:\PYproject\SPADdata\2025-04-30-dpc\D\2025-04-30_18-51-28_Delay-0_Width-200-6-8.txt")
+    pc = read_pc(r"D:\PYproject\SPADdata\2025-04-30-dpc\G\2025-04-30_18-53-59_Delay-0_Width-200-5-7.txt")
     # pc_d = pc_down_sample_intensity_topk(pc,1024)
     # plot_pc2d(pc)
     mask1 = pc[:, 3] >= 50

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import utils.data; print\\('OK'\\)\")"
+      "Bash(python -c \"import utils.data; print\\('OK'\\)\")",
+      "Bash(D:\\\\anaconda3\\\\envs\\\\pytorch\\\\python.exe *)"
     ]
   }
 }
