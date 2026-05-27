@@ -18,3 +18,5 @@ logs/*.log
 logs/*.png
 logs/*.json
 logs/test1/
+
+*.csv

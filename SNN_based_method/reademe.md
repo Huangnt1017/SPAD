@@ -426,13 +426,251 @@ cfg.save("experiment_01.json")
 from SNN_config import SINUSOIDAL_DEFAULT, LUT_RBF_16, LUT_SIN_16, LUT_RBF_32
 ```
 
-## 8. 文件说明
+## 8. SNN_new.py — activation_based API 版本
+
+`SNN_new.py` 是 `SNN.py` 的新版实现，将 SpikingJelly 后端从旧版 `clock_driven` 迁移到 `activation_based`（新版官方 API）。对外接口（输入/输出形状、参数名）与 `SNN.py` 完全一致，可直接替换。
+
+### 8.1 API 差异对照
+
+| 维度 | SNN.py (clock_driven) | SNN_new.py (activation_based) |
+|------|----------------------|-------------------------------|
+| 导入 | `from spikingjelly1.clock_driven.neuron import MultiStepParametricLIFNode` | `from spikingjelly.activation_based import neuron, functional` |
+| 神经元构造 | `MultiStepParametricLIFNode(timestep=T, ...)` | `neuron.ParametricLIFNode(step_mode='m', ...)` |
+| 时间步参数 | 构造时传入 `timestep`，神经元内部展开 | 无 `timestep`，`step_mode='m'` 表示多步模式 |
+| 输入形状 | `[T*B, C, H, W]`（时间批次展平） | `[T, B, C, H, W]`（时间维独立） |
+| ANN 子模块 | 直接调用（已展平） | `functional.seq_to_ann_forward(x, module)` 展开时间维 |
+| chunk 间截断 | 手动遍历 `m.v = m.v.detach()` | `functional.detach_net(self)` |
+| 网络重置 | `functional.reset_net(self)` | `functional.reset_net(self)`（接口不变） |
+
+### 8.2 结构变化
+
+新版将 Stem 和 GateHead 提取为独立模块 `_Stem` / `_GateHead`，内部通过 `seq_to_ann_forward` 正确处理时间维：
+
+```
+SNN.py:
+  stem = nn.Sequential(Conv, BN, MultiStepPLIF, Conv, BN)
+  # 输入 [T*B, C, H, W]，PLIF 内部按 timestep 展开
+
+SNN_new.py:
+  _Stem.forward(x: [T, B, C_enc, H, W]):
+    x = seq_to_ann_forward(x, Conv+BN)   # [T, B, C, H, W]
+    x = spike(x)                          # PLIF step_mode='m'
+    x = seq_to_ann_forward(x, Conv+BN)   # [T, B, C, H, W]
+```
+
+`SpikeBlock` 同理：ANN 子模块（DSConv、BN、PW）均通过 `seq_to_ann_forward` 包装，脉冲神经元直接接收 `[T, B, C, H, W]`。
+
+### 8.3 使用方式
+
+```python
+# 与 SNN.py 接口完全一致，直接替换导入即可
+from SNN_based_method.SNN_new import SPADSpikeNet
+
+model = SPADSpikeNet(C=32, chunk_size=128, spike_mode="plif")
+model = SPADSpikeNet(encoding_mode="lut", embed_dim=16, lut_init="rbf")
+
+out = model(raw_data)   # raw_data: [B, 4096, P]
+# out["output"]: [B, 2, 64, 64]
+```
+
+### 8.4 环境要求
+
+```
+SNN.py      → spikingjelly1 (项目本地 clock_driven 副本, conda env: pytorch)
+SNN_new.py  → spikingjelly  (activation_based, conda env: torchnew)
+```
+
+两个文件可在各自环境下独立运行，不互相依赖。
+
+### 8.5 cupy backend 自动检测
+
+`SNN_new.py` 在模块加载时自动探测 cupy backend 是否可用，无需手动配置：
+
+```python
+# 模块加载时自动运行, 结果缓存到 _CUPY_AVAILABLE
+# True  → 所有神经元使用 backend='cupy' (GPU 加速脉冲计算)
+# False → 回退到 backend='torch'
+```
+
+探测逻辑：构造一个 `IFNode(backend='cupy')` 并实际跑一次前向，确认端到端可用后才返回 `True`。仅 `import cupy` 不够，因为 cupy 在缺少 CUDA headers 时 import 可能成功但运算会失败。
+
+#### 环境配置 (torchnew)
+
+| 依赖 | 版本 | 说明 |
+|------|------|------|
+| cupy-cuda12x | 14.1.0 | `pip install cupy-cuda12x` |
+| pytest | ≥9.0 | cupy.testing 依赖, `pip install pytest` |
+| CUDA Toolkit | 12.8 | 安装路径: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8` |
+
+**CUDA_PATH 说明**: `conda run` 子进程可能未继承系统新增的环境变量。`_probe_cupy_backend()` 内部会在 `CUDA_PATH` 缺失时自动兜底设置默认路径，无需手动传入。
+
+#### spikingjelly 开发版兼容性修复
+
+若使用 spikingjelly 开发版（非 pip 稳定版），需手动修复以下两处：
+
+```
+文件: spikingjelly/activation_based
+问题: 缩进没对齐
+修复: 从错误跳转后对齐即可
+
+文件: spikingjelly/activation_based/neuron/base_node.py
+问题: abstractmethod 未导入
+修复: 文件头加 from abc import abstractmethod
+```
+
+---
+
+## 9. 文件说明
 
 ```
 SNN_based_method/
   reademe.md              本文档
   SNN_config.py           统一配置管理 (SNNConfig dataclass + 预置配置 + JSON 序列化)
-  SNN.py                  模型实现 (正弦编码/LUT编码 + 等宽SpikeBlock + Chunked处理 + 空间精修)
+  SNN.py                  模型实现 — clock_driven API (旧版 spikingjelly, env: pytorch)
+  SNN_new.py              模型实现 — activation_based API (新版 spikingjelly, env: torchnew)
   loss.py                 训练损失 (L_GT + L_SSIM + L_var + L_sparse + L_smooth + LUT正则) + 评估指标
   visualize_encoding.py   编码可视化工具 (频率响应、多帧聚合、雾/目标区分度分析)
+```
+
+## 10. 显存占用测试
+SNN_new v1 使用run_5d_memory_benchmark进行：
+```
+Total memory: 12.0 GB
+cupy backend: available (backend=cupy)
+Benchmark input: [T, B, C, 64, 64]
+Network path: stem -> SpikeBlocks -> gate_head -> temporal aggregation -> refine
+Mode: forward + backward
+Stop rule: peak_allocated > 12 GB, skip larger T for current B/C
+
+=== C= 4, B= 4, H=W=64 ===
+T= 50  input=    12.5 MB  peak_alloc=    578.1 MB  peak_reserved=    688.0 MB  PASS
+T=100  input=    25.0 MB  peak_alloc=   1182.4 MB  peak_reserved=   1344.0 MB  PASS
+T=150  input=    37.5 MB  peak_alloc=   1734.8 MB  peak_reserved=   1970.0 MB  PASS
+T=200  input=    50.0 MB  peak_alloc=   2299.1 MB  peak_reserved=   2604.0 MB  PASS
+T=250  input=    62.5 MB  peak_alloc=   2870.7 MB  peak_reserved=   3286.0 MB  PASS
+T=300  input=    75.0 MB  peak_alloc=   3473.3 MB  peak_reserved=   3912.0 MB  PASS
+T=350  input=    87.5 MB  peak_alloc=   4023.9 MB  peak_reserved=   4538.0 MB  PASS
+T=400  input=   100.0 MB  peak_alloc=   4579.7 MB  peak_reserved=   5174.0 MB  PASS
+T=450  input=   112.5 MB  peak_alloc=   5153.1 MB  peak_reserved=   5868.0 MB  PASS
+T=500  input=   125.0 MB  peak_alloc=   5757.4 MB  peak_reserved=   6494.0 MB  PASS
+
+=== C= 4, B= 8, H=W=64 ===
+T= 50  input=    25.0 MB  peak_alloc=   1185.1 MB  peak_reserved=   1348.0 MB  PASS
+T=100  input=    50.0 MB  peak_alloc=   2303.6 MB  peak_reserved=   2608.0 MB  PASS
+T=150  input=    75.0 MB  peak_alloc=   3475.8 MB  peak_reserved=   3916.0 MB  PASS
+T=200  input=   100.0 MB  peak_alloc=   4584.3 MB  peak_reserved=   5178.0 MB  PASS
+T=250  input=   125.0 MB  peak_alloc=   5760.1 MB  peak_reserved=   6498.0 MB  PASS
+T=300  input=   150.0 MB  peak_alloc=   6878.6 MB  peak_reserved=   7758.0 MB  PASS
+T=350  input=   175.0 MB  peak_alloc=   8050.8 MB  peak_reserved=   9066.0 MB  PASS
+T=400  input=   200.0 MB  peak_alloc=   9159.3 MB  peak_reserved=  10328.0 MB  PASS
+T=450  input=   225.0 MB  peak_alloc=  10335.1 MB  peak_reserved=  11648.0 MB  PASS
+T=500  input=   250.0 MB  peak_alloc=  11453.6 MB  peak_reserved=  12908.0 MB  PASS
+
+=== C= 4, B=16, H=W=64 ===
+T= 50  input=    50.0 MB  peak_alloc=   2320.6 MB  peak_reserved=   2610.0 MB  PASS
+T=100  input=   100.0 MB  peak_alloc=   4601.6 MB  peak_reserved=   5180.0 MB  PASS
+T=150  input=   150.0 MB  peak_alloc=   6895.6 MB  peak_reserved=   7760.0 MB  PASS
+T=200  input=   200.0 MB  peak_alloc=   9176.6 MB  peak_reserved=  10330.0 MB  PASS
+T=250  input=   250.0 MB  peak_alloc=  11470.6 MB  peak_reserved=  12910.0 MB  PASS
+T=300  input=   300.0 MB  peak_alloc=  13751.6 MB  peak_reserved=  15480.0 MB  OVER_12GB
+T=300  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C= 4, B=32, H=W=64 ===
+T= 50  input=   100.0 MB  peak_alloc=   4613.1 MB  peak_reserved=   5196.0 MB  PASS
+T=100  input=   200.0 MB  peak_alloc=   9188.1 MB  peak_reserved=  10346.0 MB  PASS
+T=150  input=   300.0 MB  peak_alloc=  13763.1 MB  peak_reserved=  15496.0 MB  OVER_12GB
+T=150  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C= 8, B= 4, H=W=64 ===
+T= 50  input=    25.0 MB  peak_alloc=   1182.7 MB  peak_reserved=   1332.0 MB  PASS
+T=100  input=    50.0 MB  peak_alloc=   2295.1 MB  peak_reserved=   2580.0 MB  PASS
+T=150  input=    75.0 MB  peak_alloc=   3466.2 MB  peak_reserved=   3876.0 MB  PASS
+T=200  input=   100.0 MB  peak_alloc=   4571.6 MB  peak_reserved=   5126.0 MB  PASS
+T=250  input=   125.0 MB  peak_alloc=   5745.2 MB  peak_reserved=   6432.0 MB  PASS
+T=300  input=   150.0 MB  peak_alloc=   6857.6 MB  peak_reserved=   7680.0 MB  PASS
+T=350  input=   175.0 MB  peak_alloc=   8028.7 MB  peak_reserved=   8976.0 MB  PASS
+T=400  input=   200.0 MB  peak_alloc=   9134.1 MB  peak_reserved=  10226.0 MB  PASS
+T=450  input=   225.0 MB  peak_alloc=  10307.7 MB  peak_reserved=  11532.0 MB  PASS
+T=500  input=   250.0 MB  peak_alloc=  11420.1 MB  peak_reserved=  12780.0 MB  PASS
+
+=== C= 8, B= 8, H=W=64 ===
+T= 50  input=    50.0 MB  peak_alloc=   2311.8 MB  peak_reserved=   2586.0 MB  PASS
+T=100  input=   100.0 MB  peak_alloc=   4588.6 MB  peak_reserved=   5132.0 MB  PASS
+T=150  input=   150.0 MB  peak_alloc=   6874.3 MB  peak_reserved=   7686.0 MB  PASS
+T=200  input=   200.0 MB  peak_alloc=   9151.1 MB  peak_reserved=  10232.0 MB  PASS
+T=250  input=   250.0 MB  peak_alloc=  11436.8 MB  peak_reserved=  12786.0 MB  PASS
+T=300  input=   300.0 MB  peak_alloc=  13713.6 MB  peak_reserved=  15332.0 MB  OVER_12GB
+T=300  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C= 8, B=16, H=W=64 ===
+T= 50  input=   100.0 MB  peak_alloc=   4599.6 MB  peak_reserved=   5144.0 MB  PASS
+T=100  input=   200.0 MB  peak_alloc=   9162.1 MB  peak_reserved=  10244.0 MB  PASS
+T=150  input=   300.0 MB  peak_alloc=  13724.6 MB  peak_reserved=  15344.0 MB  OVER_12GB
+T=150  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C= 8, B=32, H=W=64 ===
+T= 50  input=   200.0 MB  peak_alloc=   9197.1 MB  peak_reserved=  10282.0 MB  PASS
+T=100  input=   400.0 MB  peak_alloc=  18322.1 MB  peak_reserved=  20482.0 MB  OVER_12GB
+T=100  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=16, B= 4, H=W=64 ===
+T= 50  input=    50.0 MB  peak_alloc=   2308.5 MB  peak_reserved=   2584.0 MB  PASS
+T=100  input=   100.0 MB  peak_alloc=   4582.1 MB  peak_reserved=   5130.0 MB  PASS
+T=150  input=   150.0 MB  peak_alloc=   6864.7 MB  peak_reserved=   7684.0 MB  PASS
+T=200  input=   200.0 MB  peak_alloc=   9138.4 MB  peak_reserved=  10230.0 MB  PASS
+T=250  input=   250.0 MB  peak_alloc=  11421.0 MB  peak_reserved=  12784.0 MB  PASS
+T=300  input=   300.0 MB  peak_alloc=  13694.6 MB  peak_reserved=  15330.0 MB  OVER_12GB
+T=300  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=16, B= 8, H=W=64 ===
+T= 50  input=   100.0 MB  peak_alloc=   4592.9 MB  peak_reserved=   5146.0 MB  PASS
+T=100  input=   200.0 MB  peak_alloc=   9149.1 MB  peak_reserved=  10246.0 MB  PASS
+T=150  input=   300.0 MB  peak_alloc=  13705.4 MB  peak_reserved=  15346.0 MB  OVER_12GB
+T=150  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=16, B=16, H=W=64 ===
+T= 50  input=   200.0 MB  peak_alloc=   9183.6 MB  peak_reserved=  10278.0 MB  PASS
+T=100  input=   400.0 MB  peak_alloc=  18296.1 MB  peak_reserved=  20478.0 MB  OVER_12GB
+T=100  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=16, B=32, H=W=64 ===
+T= 50  input=   400.0 MB  peak_alloc=  18367.1 MB  peak_reserved=  20576.0 MB  OVER_12GB
+T= 50  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=24, B= 4, H=W=64 ===
+T= 50  input=    75.0 MB  peak_alloc=   3473.3 MB  peak_reserved=   3874.0 MB  PASS
+T=100  input=   150.0 MB  peak_alloc=   6866.2 MB  peak_reserved=   7698.0 MB  PASS
+T=150  input=   225.0 MB  peak_alloc=  10303.3 MB  peak_reserved=  11452.0 MB  PASS
+T=200  input=   300.0 MB  peak_alloc=  13693.2 MB  peak_reserved=  15344.0 MB  OVER_12GB
+T=200  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=24, B= 8, H=W=64 ===
+T= 50  input=   150.0 MB  peak_alloc=   6896.9 MB  peak_reserved=   7736.0 MB  PASS
+T=100  input=   300.0 MB  peak_alloc=  13724.2 MB  peak_reserved=  15380.0 MB  OVER_12GB
+T=100  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=24, B=16, H=W=64 ===
+T= 50  input=   300.0 MB  peak_alloc=  13769.7 MB  peak_reserved=  15416.0 MB  OVER_12GB
+T= 50  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=24, B=32, H=W=64 ===
+T= 50  OOM, skip larger T for this B/C
+
+=== C=32, B= 4, H=W=64 ===
+T= 50  input=   100.0 MB  peak_alloc=   4589.6 MB  peak_reserved=   5144.0 MB  PASS
+T=100  input=   200.0 MB  peak_alloc=   9142.7 MB  peak_reserved=  10244.0 MB  PASS
+T=150  input=   300.0 MB  peak_alloc=  13695.8 MB  peak_reserved=  15344.0 MB  OVER_12GB
+T=150  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=32, B= 8, H=W=64 ===
+T= 50  input=   200.0 MB  peak_alloc=   9177.0 MB  peak_reserved=  10280.0 MB  PASS
+T=100  input=   400.0 MB  peak_alloc=  18283.2 MB  peak_reserved=  20480.0 MB  OVER_12GB
+T=100  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=32, B=16, H=W=64 ===
+T= 50  input=   400.0 MB  peak_alloc=  18353.7 MB  peak_reserved=  20572.0 MB  OVER_12GB
+T= 50  peak_allocated exceeds 12 GB, skip larger T for this B/C
+
+=== C=32, B=32, H=W=64 ===
+T= 50  OOM, skip larger T for this B/C
 ```
