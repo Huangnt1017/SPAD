@@ -16,7 +16,6 @@ import json
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-
 @dataclass
 class SNNConfig:
     """SPAD SNN 全局配置, 按逻辑分组.

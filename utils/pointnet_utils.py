@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import math
 
 try:
-    from spikingjelly.clock_driven.neuron import (
+    from spikingjelly1.clock_driven.neuron import (
         MultiStepLIFNode, MultiStepEIFNode,
         MultiStepParametricLIFNode, MultiStepIFNode
     )

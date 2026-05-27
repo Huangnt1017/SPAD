@@ -16,12 +16,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import torch
 import torch.nn as nn
-from spikingjelly.clock_driven import functional
-from spikingjelly.clock_driven.neuron import (
+from spikingjelly1.clock_driven import functional
+from spikingjelly1.clock_driven.neuron import (
     MultiStepLIFNode,
     MultiStepParametricLIFNode,
     MultiStepIFNode,
 )
+
+from spikingjelly.activation_based import neuron
 
 try:
     from utils.pointnet_utils import build_spike_node as _build_spike_node_cupy
