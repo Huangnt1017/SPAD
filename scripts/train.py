@@ -639,18 +639,19 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			)
 			logger.info("Saved new best checkpoint to %s", best_ckpt)
 
-	save_checkpoint(
-		path=last_ckpt,
-		model=model,
-		optimizer=optimizer,
-		scheduler=scheduler,
-		epoch=args.epochs,
-		best_val_top1=best_val_top1,
-		class_to_idx=class_to_idx,
-		args=args,
-	)
-	# last checkpoint 记录的是最终 epoch 的完整状态，便于后续继续训练或直接测试。
-	logger.info("Saved last checkpoint to %s", last_ckpt)
+		# last checkpoint 每个 epoch 覆盖保存一次，确保中断后能从最近完整 epoch 继续。
+		save_checkpoint(
+			path=last_ckpt,
+			model=model,
+			optimizer=optimizer,
+			scheduler=scheduler,
+			epoch=epoch,
+			best_val_top1=best_val_top1,
+			class_to_idx=class_to_idx,
+			args=args,
+		)
+		logger.info("Saved last checkpoint to %s", last_ckpt)
+
 	logger.info("Training finished. Best val top1=%.4f", best_val_top1)
 
 	return {
@@ -668,7 +669,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="dgcnn",
+		default="pointtransformer",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -691,8 +692,8 @@ def build_parser() -> argparse.ArgumentParser:
 		],
 		help="Backbone model",
 	)
-	parser.add_argument("--epochs", type=int, default=80)
-	parser.add_argument("--batch-size", type=int, default=16)
+	parser.add_argument("--epochs", type=int, default=100)
+	parser.add_argument("--batch-size", type=int, default=32)
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
 	parser.add_argument("--lr", type=float, default=1e-3)
 	parser.add_argument("--min-lr", type=float, default=1e-5)
@@ -728,9 +729,8 @@ def main(argv=None) -> None:
 
 if __name__ == "__main__":
 	# 用法示例 (PowerShell, conda env 路径见 memory/reference_train_env.md):
-	#   $env:PYTHONPATH = "D:\PYproject\SPAD"
-	#   & "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\train.py" `
-	#       --model pointnet --batch-size 32 --epochs 100
+	#   $env:PYTHONPATH = "D:\PYproject\SPAD"  # 不需要输入到命令行（如果是vscode打开的
+	#   & "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\train.py" --model pointnet --batch-size 32 --epochs 100
 	#
 	# 常用参数 (完整列表见 build_parser):
 	#   --model <name>          模型, 支持: dgcnn / pointnet / pointnet2 / pointnet2msg /

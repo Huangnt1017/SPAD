@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import utils.data; print\\('OK'\\)\")",
-      "Bash(D:\\\\anaconda3\\\\envs\\\\pytorch\\\\python.exe *)"
+      "Bash(D:\\\\anaconda3\\\\envs\\\\pytorch\\\\python.exe *)",
+      "Bash(python auto_train_monitor.py)",
+      "Bash(python scripts/train.py --model pointtransformer --batch_size 32 --epochs 100)",
+      "Bash(python scripts/train.py --model pointtransformer --batch-size 32 --epochs 100)"
     ]
   }
 }
