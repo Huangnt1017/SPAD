@@ -409,7 +409,9 @@ class PointTransformerCls(nn.Module):
         ]
         self.in_planes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.in_planes, self.in_planes, share_planes, nsample=nsample))
+            layers.append(
+                block(self.in_planes, self.in_planes, share_planes, nsample=nsample)
+            )
         return nn.Sequential(*layers)
 
     def forward(self, data_dict: dict) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -467,7 +469,7 @@ class PointTransformerClassification(PointTransformerCls):
     单个 Bottleneck/阶段; 若需更深可换成 ``(1, 2, 2, 2, 2)`` 或 ``(1, 2, 3, 5, 2)``。
     """
 
-    def __init__(self, num_classes: int = 26, block_config: Tuple[int, ...] = (1, 1, 1, 1, 1),
+    def __init__(self, num_classes: int = 26, block_config: Tuple[int, ...] = (1, 2, 2, 2, 2),
                  in_channels: int = 4, center_dim: int = 3):
         super().__init__(
             Bottleneck, list(block_config),

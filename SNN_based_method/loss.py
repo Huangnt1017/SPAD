@@ -98,12 +98,14 @@ def _compute_ssim(pred, target, mask=None, kernel_size=11, sigma=1.5,
 
 
 class WeakGTLoss(nn.Module):
-    """L1 loss against noisy GT depth and intensity."""
+    """L1 loss against noisy GT after normalizing channels to comparable ranges."""
 
-    def __init__(self, w_depth=1.0, w_intensity=1.0):
+    def __init__(self, w_depth=1.0, w_intensity=1.0, depth_range=150.0, intensity_range=1.0):
         super().__init__()
         self.w_depth = w_depth
         self.w_intensity = w_intensity
+        self.depth_range = float(depth_range)
+        self.intensity_range = float(intensity_range)
 
     def forward(self, result, gt):
         """
@@ -111,10 +113,10 @@ class WeakGTLoss(nn.Module):
             result: model output dict with 'output' [B,2,H,W] (refined)
             gt:     [B, 2, H, W] where ch0=depth_gt, ch1=intensity_gt
         """
-        d_pred = result["output"][:, 0:1]
-        i_pred = result["output"][:, 1:2]
-        d_gt = gt[:, 0:1]
-        i_gt = gt[:, 1:2]
+        d_pred = (result["output"][:, 0:1] / self.depth_range).clamp(0.0, 1.0)
+        i_pred = (result["output"][:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
+        d_gt = (gt[:, 0:1] / self.depth_range).clamp(0.0, 1.0)
+        i_gt = (gt[:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
 
         mask = (d_gt > 0).float()
 
@@ -131,9 +133,10 @@ class GatedMomentVarianceLoss(nn.Module):
     timestamps around predicted depth is large, the gate is selecting wrong photons.
     """
 
-    def __init__(self, sigma_target=4.0):
+    def __init__(self, sigma_target=4.0, depth_range=150.0):
         super().__init__()
-        self.sigma2 = sigma_target ** 2
+        self.sigma2 = (float(sigma_target) / float(depth_range)) ** 2
+        self.depth_range = float(depth_range)
 
     def forward(self, result):
         gate = result["gate"]             # [P, B, 1, H, W]
@@ -141,11 +144,12 @@ class GatedMomentVarianceLoss(nn.Module):
         valid = result["valid"]           # [P, B, H, W]
         depth = result["depth_coarse"]    # [B, 1, H, W]  use coarse for variance
 
-        depth_exp = depth.squeeze(1).unsqueeze(0)                # [1, B, H, W]
+        depth_exp = depth.squeeze(1).unsqueeze(0) / self.depth_range  # [1, B, H, W]
+        tof_norm = tof / self.depth_range
         gate_sq = gate.squeeze(2)                                # [T, B, H, W]
 
         gv = gate_sq * valid                                     # [T, B, H, W]
-        residual2 = (tof - depth_exp) ** 2                       # [T, B, H, W]
+        residual2 = (tof_norm - depth_exp) ** 2                  # [T, B, H, W]
 
         weighted_var = (gv * residual2).sum(0) / (gv.sum(0) + 1e-6)  # [B, H, W]
         excess = F.relu(weighted_var - self.sigma2)
@@ -202,19 +206,19 @@ class SSIMLoss(nn.Module):
         Returns:
             (1 - SSIM) 加权合并的标量 loss
         """
-        d_pred = result["output"][:, 0:1]       # [B, 1, H, W]
-        i_pred = result["output"][:, 1:2]       # [B, 1, H, W]
-        d_gt = gt[:, 0:1]
-        i_gt = gt[:, 1:2]
+        d_pred = (result["output"][:, 0:1] / self.depth_range).clamp(0.0, 1.0)
+        i_pred = (result["output"][:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
+        d_gt = (gt[:, 0:1] / self.depth_range).clamp(0.0, 1.0)
+        i_gt = (gt[:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
 
         mask = (d_gt > 0).float()               # [B, 1, H, W]
 
         ssim_d = _compute_ssim(d_pred, d_gt, mask=mask,
                                kernel_size=self.kernel_size,
-                               data_range=self.depth_range)
+                               data_range=1.0)
         ssim_i = _compute_ssim(i_pred, i_gt, mask=mask,
                                kernel_size=self.kernel_size,
-                               data_range=self.intensity_range)
+                               data_range=1.0)
 
         loss = self.w_depth * (1.0 - ssim_d) + self.w_intensity * (1.0 - ssim_i)
         return loss
@@ -227,13 +231,15 @@ class IntensityAwareSmoothnessLoss(nn.Module):
     and can have discontinuities where intensity jumps (target boundary).
     """
 
-    def __init__(self, beta=5.0):
+    def __init__(self, beta=5.0, depth_range=150.0, intensity_range=1.0):
         super().__init__()
         self.beta = beta
+        self.depth_range = float(depth_range)
+        self.intensity_range = float(intensity_range)
 
     def forward(self, result):
-        depth = result["output"][:, 0:1]       # [B, 1, H, W]  refined
-        intensity = result["output"][:, 1:2]   # [B, 1, H, W]  refined
+        depth = (result["output"][:, 0:1] / self.depth_range).clamp(0.0, 1.0)
+        intensity = (result["output"][:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
 
         grad_d = _spatial_gradient(depth)
         grad_i = _spatial_gradient(intensity)
@@ -261,6 +267,7 @@ class SPADImagingLoss(nn.Module):
         beta_smooth: 平滑 loss 的边缘衰减系数
         ssim_kernel_size: SSIM 高斯窗口大小
         depth_range: depth 动态范围, 用于 SSIM 计算
+        intensity_range: intensity 动态范围, 默认为归一化占比 1.0
     """
 
     def __init__(
@@ -277,6 +284,7 @@ class SPADImagingLoss(nn.Module):
         beta_smooth=5.0,
         ssim_kernel_size=7,
         depth_range=150.0,
+        intensity_range=1.0,
     ):
         super().__init__()
         self.w_gt = w_gt
@@ -287,11 +295,22 @@ class SPADImagingLoss(nn.Module):
         self.w_lut_smooth = w_lut_smooth
         self.w_lut_norm = w_lut_norm
 
-        self.gt_loss = WeakGTLoss()
-        self.ssim_loss = SSIMLoss(kernel_size=ssim_kernel_size, depth_range=depth_range)
-        self.var_loss = GatedMomentVarianceLoss(sigma_target=sigma_target)
+        self.gt_loss = WeakGTLoss(depth_range=depth_range, intensity_range=intensity_range)
+        self.ssim_loss = SSIMLoss(
+            kernel_size=ssim_kernel_size,
+            depth_range=depth_range,
+            intensity_range=intensity_range,
+        )
+        self.var_loss = GatedMomentVarianceLoss(
+            sigma_target=sigma_target,
+            depth_range=depth_range,
+        )
         self.sparse_loss = SpikeSparsityLoss(rho_target=rho_target)
-        self.smooth_loss = IntensityAwareSmoothnessLoss(beta=beta_smooth)
+        self.smooth_loss = IntensityAwareSmoothnessLoss(
+            beta=beta_smooth,
+            depth_range=depth_range,
+            intensity_range=intensity_range,
+        )
 
     def forward(self, result, gt=None):
         """

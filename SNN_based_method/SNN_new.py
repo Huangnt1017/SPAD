@@ -1,3 +1,4 @@
+
 """SPAD Dense-Fog SNN Imaging Model (activation_based API)
 
 Input:  [B, 4096, P]   raw ToF timestamps (0 = invalid/untriggered)
@@ -241,6 +242,9 @@ class LearnableTofEmbedding(nn.Module):
 class MultiScaleDSConv(nn.Module):
     """多尺度深度可分离卷积: 三路膨胀卷积 (dilation=1/2/4) 拼接后 1×1 融合.
 
+    dilation 只改变 3×3 卷积核在空间维的采样间隔, padding 与 dilation
+    保持一致, 因此输出仍为原始 H×W 分辨率; 它不会下采样, 也不会跳过 P 维帧。
+
     Args:
         C: 输入/输出通道数
     """
@@ -304,30 +308,51 @@ class SpikeBlock(nn.Module):
 
 
 class SpatialRefineHead(nn.Module):
-    """轻量 CNN 平滑逐像素 gate 噪声. 残差结构: 只学习修正量.
+    """置信度调制的轻量 CNN 精修头, 并将输出约束到物理有效范围.
 
     Args:
         mid: 中间通道数
+        depth_range: depth 输出最大 ToF bin
     """
 
-    def __init__(self, mid: int = 8):
+    def __init__(self, mid: int = 8, depth_range: float = 150.0):
         super().__init__()
+        self.depth_range = float(depth_range)
         self.net = nn.Sequential(
-            nn.Conv2d(2, mid, 3, padding=1, bias=False),
+            nn.Conv2d(3, mid, 3, padding=1, bias=False),
             nn.BatchNorm2d(mid),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid, 2, 3, padding=1, bias=False),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        coarse: torch.Tensor,
+        confidence: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         Args:
-            x: [B, 2, H, W]
+            coarse: [B, 2, H, W], ch0=depth, ch1=intensity
+            confidence: [B, 1, H, W], 置信度越高允许越大的残差修正
 
         Returns:
             [B, 2, H, W]
         """
-        return x + self.net(x)
+        if confidence is None:
+            confidence = torch.ones_like(coarse[:, 0:1])
+        confidence = confidence.clamp(0.0, 1.0)
+        coarse_norm = torch.cat(
+            [
+                (coarse[:, 0:1] / self.depth_range).clamp(0.0, 1.0),
+                coarse[:, 1:2].clamp(0.0, 1.0),
+            ],
+            dim=1,
+        )
+        residual = self.net(torch.cat([coarse_norm, confidence], dim=1))
+        output_norm = (coarse_norm + residual * confidence).clamp(0.0, 1.0)
+        depth = output_norm[:, 0:1] * self.depth_range
+        intensity = output_norm[:, 1:2]
+        return torch.cat([depth, intensity], dim=1)
 
 
 # ─── Stem (ANN-only, 在 chunk 展开后调用) ─────────────────
@@ -458,7 +483,7 @@ class SPADSpikeNet(nn.Module):
             [SpikeBlock(C, spike_mode) for _ in range(num_blocks)]
         )
         self.gate_head = _GateHead(C, spike_mode)
-        self.refine = SpatialRefineHead()
+        self.refine = SpatialRefineHead(depth_range=t_max)
 
     def _encode_chunk(
         self, chunk: torch.Tensor
@@ -566,10 +591,11 @@ class SPADSpikeNet(nn.Module):
 
         depth = weighted_sum / (weight_sum + 1e-6)      # [B, 1, H, W]
         intensity = weight_sum / P                      # [B, 1, H, W]
+        confidence = (weight_sum / (weight_sum + 1.0)).clamp(0.0, 1.0)
 
         # [B, 1, H, W] × 2 → [B, 2, H, W]
         coarse = torch.cat([depth, intensity], dim=1)
-        output = self.refine(coarse)                    # [B, 2, H, W]
+        output = self.refine(coarse, confidence)        # [B, 2, H, W]
 
         functional.reset_net(self)
 
@@ -579,6 +605,7 @@ class SPADSpikeNet(nn.Module):
             "intensity": output[:, 1:2],
             "depth_coarse": depth,
             "intensity_coarse": intensity,
+            "confidence": confidence,
             "gate": torch.cat(all_gates, dim=0),        # [P, B, 1, H, W]
             "tof": torch.cat(all_tofs, dim=0),          # [P, B, H, W]
             "valid": torch.cat(all_valids, dim=0),      # [P, B, H, W]
@@ -615,12 +642,14 @@ def _benchmark_forward_5d_full_network(
     weight_sum = gate.sum(0)  # [B, 1, H, W]
     depth = (gate * time_bins).sum(0) / (weight_sum + 1e-6)
     intensity = weight_sum / T
-    output = model.refine(torch.cat([depth, intensity], dim=1))
+    confidence = (weight_sum / (weight_sum + 1.0)).clamp(0.0, 1.0)
+    output = model.refine(torch.cat([depth, intensity], dim=1), confidence)
 
     return {
         "output": output,
         "depth_coarse": depth,
         "intensity_coarse": intensity,
+        "confidence": confidence,
         "gate": gate,
     }
 

@@ -118,7 +118,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointnext/spt/tnpc/3detr/dct/pointrwkv/pointbert/pointmae/upp。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/spt/3detr/pointrwkv/pointbert/pointmae/upp。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -170,21 +170,9 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 		cfg.num_classes = num_classes
 		return module.SPTNet(cfg)
 
-	if name == "pointnext":
-		module = load_module_from_file(baseline_dir / "PointNeXt.py", "baseline_pointnext")
-		return module.PointNeXtClassification(num_classes=num_classes)
-
-	if name == "tnpc":
-		module = load_module_from_file(baseline_dir / "TNPC.py", "baseline_tnpc")
-		return module.TNPCClassification(num_classes=num_classes)
-
 	if name == "3detr":
 		module = load_module_from_file(baseline_dir / "3DETR.py", "baseline_3detr")
 		return module.ThreeDETRClassification(num_classes=num_classes)
-
-	if name == "dct":
-		module = load_module_from_file(baseline_dir / "DCT.py", "baseline_dct")
-		return module.DCTClassification(num_classes=num_classes)
 
 	# === Point Transformer 系列 (Pointcept 复现) ===
 	if name == "pointtransformer":
@@ -669,7 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="pointtransformer",
+		default="pointnet2",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -685,10 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"spt",
 			"upp",
 			"graph_residual",
-			"pointnext",
-			"tnpc",
 			"3detr",
-			"dct",
 		],
 		help="Backbone model",
 	)

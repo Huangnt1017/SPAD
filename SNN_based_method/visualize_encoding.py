@@ -8,12 +8,16 @@
 
 用法:
     python visualize_encoding.py --data_path <txt文件路径> [--n_freq 8] [--t_max 150]
+    python visualize_encoding.py --raw_path <raw文件路径> --pages_per_group 500 \
+        --time_threshold 150 --plot_group_num 1
 """
 
 import argparse
 import math
 import os
 import sys
+import re
+from typing import List, Optional
 
 import numpy as np
 
@@ -28,10 +32,18 @@ import matplotlib
 matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-from SNN import encode_tof
 
 
-# ─── 数据加载 ─────────────────────────────────────────────────
+FREQ_PRESETS = {
+    "A": [1, 2, 3, 4, 5, 6, 7, 8],
+    "B": [1, 2, 4, 6, 8, 12, 16, 24],
+    "C": [1, 2, 3, 4, 6, 8, 12, 16],
+    "D": [1, 2, 3, 4, 5, 6, 8, 12],
+    "E": [1, 2, 3, 5, 8, 12, 16, 24],
+}
+
+
+# ─── 数据加载 ───────
 
 def load_raw_data(data_path: str) -> np.ndarray:
     """从 raw.txt 文件加载 SPAD 数据.
@@ -55,6 +67,104 @@ def load_raw_data(data_path: str) -> np.ndarray:
     return data
 
 
+def load_raw_group_from_binary(
+    raw_path: str,
+    pages_per_group: int,
+    time_threshold: int,
+    plot_group_num: int,
+    total_pages: Optional[int] = None,
+) -> np.ndarray:
+    """直接读取 raw 文件中的某一组, 返回 [4096, P] 数据.
+
+    Args:
+        raw_path: 原始 raw 文件路径
+        pages_per_group: 每组页数
+        time_threshold: 有效 ToF 上限 (超过置 0)
+        plot_group_num: 要读取的组号 (从 1 开始)
+        total_pages: 可选, 限制读取的总页数
+    """
+    if not os.path.exists(raw_path):
+        raise FileNotFoundError(f"raw 文件不存在: {raw_path}")
+    if pages_per_group <= 0:
+        raise ValueError("pages_per_group must be a positive integer")
+    if time_threshold <= 0:
+        raise ValueError("time_threshold must be a positive integer")
+    if plot_group_num <= 0:
+        raise ValueError("plot_group_num must be a positive integer")
+
+    num_pixels = 64 * 64
+    file_size = os.path.getsize(raw_path)
+    total_values = file_size // 2
+    max_pages = total_values // num_pixels
+    if max_pages == 0:
+        return np.empty((0, 4096), dtype=np.int32)
+
+    if total_pages is None:
+        total_pages = max_pages - (max_pages % pages_per_group)
+
+    if total_pages <= 0:
+        raise ValueError("No complete groups are available in this raw file")
+    if total_pages > max_pages:
+        raise ValueError(f"total_pages {total_pages} exceeds file pages {max_pages}")
+    if total_pages % pages_per_group != 0:
+        raise ValueError("total_pages must be divisible by pages_per_group")
+
+    num_groups = total_pages // pages_per_group
+    if plot_group_num > num_groups:
+        raise IndexError(f"plot_group_num {plot_group_num} exceeds available groups {num_groups}")
+
+    values_per_group = pages_per_group * num_pixels
+    byte_offset = (plot_group_num - 1) * values_per_group * 2
+    data = np.fromfile(raw_path, dtype=np.uint16, count=values_per_group, offset=byte_offset)
+    if data.size != values_per_group:
+        raise IOError(
+            f"File too short: expected {values_per_group} values, got {data.size}"
+        )
+
+    frames = data.reshape((pages_per_group, 64, 64))
+    flat_frames = frames.reshape((pages_per_group, num_pixels))
+    flat_frames[flat_frames > time_threshold] = 0
+    grouped = flat_frames.T.astype(np.int32, copy=False)
+    print(
+        f"加载 raw 组: group={plot_group_num}/{num_groups}, "
+        f"shape={grouped.shape} (P={grouped.shape[1]})"
+    )
+    return grouped
+
+
+def parse_freqs_arg(freqs_arg: Optional[str], n_freq: int) -> List[int]:
+    """Parse frequency list or preset name into a list of ints."""
+    if not freqs_arg:
+        return list(range(1, n_freq + 1))
+
+    key = freqs_arg.strip().upper()
+    if key in FREQ_PRESETS:
+        return list(FREQ_PRESETS[key])
+
+    tokens = [t for t in re.split(r"[\s,]+", freqs_arg.strip()) if t]
+    freqs = [int(t) for t in tokens]
+    if not freqs:
+        raise ValueError("freqs_arg is empty")
+    return freqs
+
+
+def encode_tof_with_freqs(
+    tof: torch.Tensor,
+    valid: torch.Tensor,
+    freqs: List[int],
+    t_max: int,
+) -> torch.Tensor:
+    """Encode a single frame using an explicit frequency list."""
+    v = valid.float()
+    t = tof.float() / float(t_max)
+    channels = [v]
+    for freq in freqs:
+        phase = math.pi * float(freq) * t
+        channels.append(torch.sin(phase) * v)
+        channels.append(torch.cos(phase) * v)
+    return torch.stack(channels, dim=0)
+
+
 def data_to_frames(data: np.ndarray, h: int = 64, w: int = 64) -> torch.Tensor:
     """将 [4096, P] 数据转为 [P, H, W] 帧序列.
 
@@ -73,8 +183,12 @@ def data_to_frames(data: np.ndarray, h: int = 64, w: int = 64) -> torch.Tensor:
 
 # ─── 可视化函数 ─────────────────────────────────────────────────
 
-def plot_single_frame_raw(frame: torch.Tensor, frame_idx: int, save_dir: str,
-                          target_bin: int = 60):
+def plot_single_frame_raw(
+    frame: torch.Tensor,
+    frame_idx: int,
+    save_dir: Optional[str],
+    target_bin: int = 60,
+):
     """可视化单帧原始 tof 热力图.
 
     Args:
@@ -114,34 +228,39 @@ def plot_single_frame_raw(frame: torch.Tensor, frame_idx: int, save_dir: str,
     axes[2].set_title("有效 ToF 分布 (雾 vs 目标)")
 
     plt.tight_layout()
-    path = os.path.join(save_dir, f"01_raw_frame_{frame_idx}.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  保存: {path}")
+    if save_dir:
+        path = os.path.join(save_dir, f"01_raw_frame_{frame_idx}.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  保存: {path}")
 
 
-def plot_encoded_channels(frame: torch.Tensor, frame_idx: int, n_freq: int,
-                          t_max: int, save_dir: str):
+def plot_encoded_channels(
+    frame: torch.Tensor,
+    frame_idx: int,
+    freqs: List[int],
+    t_max: int,
+    save_dir: Optional[str],
+):
     """可视化单帧编码后的全部 2*n_freq+1 通道.
 
     Args:
         frame: [H, W] raw tof
-        n_freq: 频率对数
+        freqs: 频率列表
         t_max: 最大 bin
         save_dir: 保存目录
     """
     valid = ((frame >= 1) & (frame <= t_max)).float()      # [H, W]
     tof = frame.float() * valid
 
-    # encode_tof 期望 [*, H, W], 输出 [*, 17, H, W]
-    encoded = encode_tof(tof, valid, n_freq=n_freq, t_max=t_max)  # [17, H, W]
+    encoded = encode_tof_with_freqs(tof, valid, freqs=freqs, t_max=t_max)  # [C, H, W]
     n_channels = encoded.shape[0]
 
     # 通道名称
     names = ["valid"]
-    for i in range(n_freq):
-        names.append(f"sin({i+1}π·t)")
-        names.append(f"cos({i+1}π·t)")
+    for freq in freqs:
+        names.append(f"sin({freq}π·t)")
+        names.append(f"cos({freq}π·t)")
 
     # 布局: 3行6列 = 18格, 前17有内容
     n_cols = 6
@@ -164,15 +283,19 @@ def plot_encoded_channels(frame: torch.Tensor, frame_idx: int, n_freq: int,
     for idx in range(n_channels, len(axes)):
         axes[idx].axis("off")
 
-    fig.suptitle(f"正弦编码 {n_channels} 通道 (帧 #{frame_idx}, n_freq={n_freq})", fontsize=13)
+    fig.suptitle(
+        f"正弦编码 {n_channels} 通道 (帧 #{frame_idx}, freqs={freqs})",
+        fontsize=13,
+    )
     plt.tight_layout()
-    path = os.path.join(save_dir, f"02_encoded_channels_frame_{frame_idx}.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  保存: {path}")
+    if save_dir:
+        path = os.path.join(save_dir, f"02_encoded_channels_frame_{frame_idx}.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  保存: {path}")
 
 
-def plot_frequency_response(n_freq: int, t_max: int, save_dir: str):
+def plot_frequency_response(freqs: List[int], t_max: int, save_dir: Optional[str]):
     """展示不同 tof 值经正弦编码后的频谱响应曲线.
 
     横轴: tof bin [1, t_max], 纵轴: 各频率通道输出值.
@@ -189,10 +312,9 @@ def plot_frequency_response(n_freq: int, t_max: int, save_dir: str):
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
 
     # sin 通道
-    for i in range(n_freq):
-        freq = (i + 1) * math.pi
-        y = torch.sin(freq * t_norm).numpy()
-        axes[0].plot(tof_vals.numpy(), y, label=f"sin({i+1}π·t)", alpha=0.8)
+    for freq in freqs:
+        y = torch.sin(math.pi * float(freq) * t_norm).numpy()
+        axes[0].plot(tof_vals.numpy(), y, label=f"sin({freq}π·t)", alpha=0.8)
     axes[0].set_ylabel("输出值")
     axes[0].set_title("sin 通道频率响应")
     axes[0].legend(loc="upper right", fontsize=7, ncol=4)
@@ -200,10 +322,9 @@ def plot_frequency_response(n_freq: int, t_max: int, save_dir: str):
     axes[0].set_ylim(-1.1, 1.1)
 
     # cos 通道
-    for i in range(n_freq):
-        freq = (i + 1) * math.pi
-        y = torch.cos(freq * t_norm).numpy()
-        axes[1].plot(tof_vals.numpy(), y, label=f"cos({i+1}π·t)", alpha=0.8)
+    for freq in freqs:
+        y = torch.cos(math.pi * float(freq) * t_norm).numpy()
+        axes[1].plot(tof_vals.numpy(), y, label=f"cos({freq}π·t)", alpha=0.8)
     axes[1].set_xlabel("ToF bin")
     axes[1].set_ylabel("输出值")
     axes[1].set_title("cos 通道频率响应")
@@ -212,14 +333,20 @@ def plot_frequency_response(n_freq: int, t_max: int, save_dir: str):
     axes[1].set_ylim(-1.1, 1.1)
 
     plt.tight_layout()
-    path = os.path.join(save_dir, "03_frequency_response.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  保存: {path}")
+    if save_dir:
+        path = os.path.join(save_dir, "03_frequency_response.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  保存: {path}")
 
 
-def plot_multi_frame_aggregation(frames: torch.Tensor, t_max: int, save_dir: str,
-                                 target_bin: int = 60, fog_range: tuple = (30, 50)):
+def plot_multi_frame_aggregation(
+    frames: torch.Tensor,
+    t_max: int,
+    save_dir: Optional[str],
+    target_bin: int = 60,
+    fog_range: tuple = (30, 50),
+):
     """可视化多帧聚合效果: 随帧数递增, depth 和 intensity 如何收敛.
 
     模拟 Gated Moment 中 gate=valid 的简化版 (无模型权重, 仅用有效性加权),
@@ -315,10 +442,11 @@ def plot_multi_frame_aggregation(frames: torch.Tensor, t_max: int, save_dir: str
 
     fig.suptitle("多帧聚合 (无模型, 纯统计加权 → depth 被雾后向散射拉偏)", fontsize=12)
     plt.tight_layout()
-    path = os.path.join(save_dir, "04_multi_frame_aggregation.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  保存: {path}")
+    if save_dir:
+        path = os.path.join(save_dir, "04_multi_frame_aggregation.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  保存: {path}")
 
     # ─── 图2: 雾/目标光子占比随帧数变化 ──
     frame_axes = np.array(frame_axes)
@@ -347,13 +475,64 @@ def plot_multi_frame_aggregation(frames: torch.Tensor, t_max: int, save_dir: str
     ax_right.legend(loc="upper right", fontsize=9)
 
     plt.tight_layout()
-    path2 = os.path.join(save_dir, "04b_fog_vs_target_ratio.png")
-    fig2.savefig(path2, dpi=150, bbox_inches="tight")
-    plt.close(fig2)
-    print(f"  保存: {path2}")
+    if save_dir:
+        path2 = os.path.join(save_dir, "04b_fog_vs_target_ratio.png")
+        fig2.savefig(path2, dpi=150, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"  保存: {path2}")
 
 
-def plot_encoding_discrimination(n_freq: int, t_max: int, save_dir: str):
+def plot_target_bin_intensity(
+    frames: torch.Tensor,
+    target_bin: int,
+    save_dir: Optional[str],
+):
+    """按帧比例聚合指定深度 bin 的强度图 (其余置零)."""
+    if target_bin <= 0:
+        raise ValueError("target_bin must be a positive integer")
+
+    total_frames = frames.shape[0]
+    if total_frames == 0:
+        return
+
+    percent_points = [1, 5, 10, 20, 30, 50, 75, 100]
+    frame_counts = [max(1, int(round(total_frames * p / 100.0))) for p in percent_points]
+    frame_counts = sorted(set(min(total_frames, c) for c in frame_counts))
+
+    n_cols = 4
+    n_rows = math.ceil(len(frame_counts) / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.2, n_rows * 3.2))
+    axes = np.array(axes).reshape(n_rows, n_cols)
+
+    for idx, frame_count in enumerate(frame_counts):
+        row = idx // n_cols
+        col = idx % n_cols
+        subset = frames[:frame_count]
+        intensity_map = (subset == float(target_bin)).sum(dim=0).float()
+        ax = axes[row, col]
+        im = ax.imshow(intensity_map.numpy(), cmap="inferno", vmin=0)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        percent = frame_count / total_frames * 100.0
+        ax.set_title(f"{percent:.0f}% (P={frame_count})", fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    for idx in range(len(frame_counts), n_rows * n_cols):
+        row = idx // n_cols
+        col = idx % n_cols
+        axes[row, col].axis("off")
+
+    fig.suptitle(f"Target-bin Intensity (bin={target_bin})", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    if save_dir:
+        path = os.path.join(save_dir, f"07_target_bin_intensity_{target_bin}.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  保存: {path}")
+
+
+def plot_encoding_discrimination(freqs: List[int], t_max: int, save_dir: Optional[str]):
     """展示编码的距离区分能力: 不同 tof 对应的编码向量之间的余弦相似度.
 
     理想情况下相近 tof 相似度高, 差距大的 tof 相似度低 → 编码区分度好.
@@ -369,10 +548,10 @@ def plot_encoding_discrimination(n_freq: int, t_max: int, save_dir: str):
 
     # 构建编码矩阵 [t_max, 2*n_freq+1]
     vectors = [torch.ones(t_max)]                               # valid 通道恒为 1
-    for i in range(n_freq):
-        freq = (i + 1) * math.pi
-        vectors.append(torch.sin(freq * t_norm))
-        vectors.append(torch.cos(freq * t_norm))
+    for freq in freqs:
+        phase = math.pi * float(freq) * t_norm
+        vectors.append(torch.sin(phase))
+        vectors.append(torch.cos(phase))
     enc_matrix = torch.stack(vectors, dim=1)                    # [t_max, 17]
 
     # 归一化后计算余弦相似度矩阵
@@ -403,14 +582,20 @@ def plot_encoding_discrimination(n_freq: int, t_max: int, save_dir: str):
     axes[1].set_ylim(-1.05, 1.05)
 
     plt.tight_layout()
-    path = os.path.join(save_dir, "05_encoding_discrimination.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  保存: {path}")
+    if save_dir:
+        path = os.path.join(save_dir, "05_encoding_discrimination.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  保存: {path}")
 
 
-def plot_fog_vs_target_encoding(n_freq: int, t_max: int, target_bin: int,
-                                save_dir: str, fog_bin: int = 40):
+def plot_fog_vs_target_encoding(
+    freqs: List[int],
+    t_max: int,
+    target_bin: int,
+    save_dir: Optional[str],
+    fog_bin: int = 40,
+):
     """对比雾 (bin≈40) 和目标 (bin≈60) 的编码向量, 展示编码如何区分两者.
 
     左图: 两个 bin 的 17 维编码向量条形图对比
@@ -430,12 +615,12 @@ def plot_fog_vs_target_encoding(n_freq: int, t_max: int, target_bin: int,
     names = ["valid"]
     fog_vec = [1.0]
     target_vec = [1.0]
-    for i in range(n_freq):
-        freq = (i + 1) * math.pi
-        names.append(f"sin({i+1}π)")
-        names.append(f"cos({i+1}π)")
-        fog_vec.extend([math.sin(freq * t_fog), math.cos(freq * t_fog)])
-        target_vec.extend([math.sin(freq * t_target), math.cos(freq * t_target)])
+    for freq in freqs:
+        names.append(f"sin({freq}π)")
+        names.append(f"cos({freq}π)")
+        phase = math.pi * float(freq)
+        fog_vec.extend([math.sin(phase * t_fog), math.cos(phase * t_fog)])
+        target_vec.extend([math.sin(phase * t_target), math.cos(phase * t_target)])
 
     fog_vec = np.array(fog_vec)
     target_vec = np.array(target_vec)
@@ -477,20 +662,68 @@ def plot_fog_vs_target_encoding(n_freq: int, t_max: int, target_bin: int,
                  fontsize=10, bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
 
     plt.tight_layout()
-    path = os.path.join(save_dir, "06_fog_vs_target_encoding.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  保存: {path}")
+    if save_dir:
+        path = os.path.join(save_dir, "06_fog_vs_target_encoding.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  保存: {path}")
 
 
 # ─── 主程序 ──────────────────────────────────────────────────
+def demo_without_cli() -> None:
+    """Run a no-CLI demo with explicit parameters and keep plots open."""
+    raw_path = r"E:\essay\硕士\研一\SPAD数据\0825\2025-08-25_16-50-11_Delay-0_Width-200.raw"
+    pages_per_group = 2000
+    time_threshold = 150
+    plot_group_num = 20
+    total_pages = 48000
+
+    freqs = FREQ_PRESETS["C"]
+    t_max = 150
+    target_bin = 60
+    frame_idx = 0
+    save_dir = None
+
+    data = load_raw_group_from_binary(
+        raw_path=raw_path,
+        pages_per_group=pages_per_group,
+        time_threshold=time_threshold,
+        plot_group_num=plot_group_num,
+        total_pages=total_pages,
+    )
+    frames = data_to_frames(data)
+    frame_idx = min(frame_idx, frames.shape[0] - 1)
+    frame = frames[frame_idx]
+
+    # plot_single_frame_raw(frame, frame_idx, save_dir, target_bin=target_bin)
+    # plot_encoded_channels(frame, frame_idx, freqs, t_max, save_dir)
+    # plot_frequency_response(freqs, t_max, save_dir)
+    # plot_multi_frame_aggregation(frames, t_max, save_dir, target_bin=target_bin)
+    # plot_encoding_discrimination(freqs, t_max, save_dir)
+    # plot_fog_vs_target_encoding(freqs, t_max, target_bin, save_dir)
+    plot_target_bin_intensity(frames, target_bin, save_dir)
+
+    plt.show(block=True)
+
 
 def main():
     parser = argparse.ArgumentParser(description="SPAD 正弦编码可视化")
     parser.add_argument("--data_path", type=str,
                         default=r"D:\PYproject\SPADdata\0825\frame\2025-08-25_16-50-14_Delay-0_Width-200.raw.txt",
                         help="raw.txt 数据文件路径")
+    parser.add_argument("--raw_path", type=str, default=None,
+                        help="raw 原始文件路径 (提供后将忽略 data_path)")
+    parser.add_argument("--pages_per_group", type=int, default=500,
+                        help="每组页数 (用于 raw 读取)")
+    parser.add_argument("--time_threshold", type=int, default=150,
+                        help="有效 ToF 上限 (用于 raw 读取)")
+    parser.add_argument("--total_pages", type=int, default=None,
+                        help="raw 读取的总页数 (默认自动对齐)")
+    parser.add_argument("--plot_group_num", type=int, default=1,
+                        help="绘制第几组 (从 1 开始, 仅对 raw 生效)")
     parser.add_argument("--n_freq", type=int, default=8, help="频率对数 (默认 8)")
+    parser.add_argument("--freqs", type=str, default=None,
+                        help="频率列表或预设(A/B/C/D/E), 例如 '1,2,4,6,8,12,16,24'")
     parser.add_argument("--t_max", type=int, default=150, help="最大有效 bin (默认 150)")
     parser.add_argument("--target_bin", type=int, default=60,
                         help="目标真实距离对应的 tof bin (默认 60)")
@@ -500,13 +733,24 @@ def main():
     args = parser.parse_args()
 
     if args.save_dir is None:
-        args.save_dir = os.path.join(os.path.dirname(args.data_path), "vis_encoding")
+        base_path = args.raw_path if args.raw_path else args.data_path
+        args.save_dir = os.path.join(os.path.dirname(base_path), "vis_encoding")
     os.makedirs(args.save_dir, exist_ok=True)
     print(f"输出目录: {args.save_dir}")
-    print(f"参数: n_freq={args.n_freq}, t_max={args.t_max}, target_bin={args.target_bin}\n")
+    freqs = parse_freqs_arg(args.freqs, args.n_freq)
+    print(f"参数: t_max={args.t_max}, target_bin={args.target_bin}, freqs={freqs}\n")
 
     # 加载数据
-    data = load_raw_data(args.data_path)
+    if args.raw_path:
+        data = load_raw_group_from_binary(
+            raw_path=args.raw_path,
+            pages_per_group=args.pages_per_group,
+            time_threshold=args.time_threshold,
+            plot_group_num=args.plot_group_num,
+            total_pages=args.total_pages,
+        )
+    else:
+        data = load_raw_data(args.data_path)
     frames = data_to_frames(data)                               # [P, H, W]
     P = frames.shape[0]
 
@@ -519,11 +763,11 @@ def main():
 
     # 2. 编码后各通道
     print("[2/6] 编码后 17 通道可视化...")
-    plot_encoded_channels(frame, frame_idx, args.n_freq, args.t_max, args.save_dir)
+    plot_encoded_channels(frame, frame_idx, freqs, args.t_max, args.save_dir)
 
     # 3. 频率响应曲线
     print("[3/6] 频率响应分析...")
-    plot_frequency_response(args.n_freq, args.t_max, args.save_dir)
+    plot_frequency_response(freqs, args.t_max, args.save_dir)
 
     # 4. 多帧聚合 + 雾/目标光子占比趋势
     print("[4/6] 多帧聚合效果 + 雾/目标光子统计...")
@@ -532,14 +776,21 @@ def main():
 
     # 5. 编码区分度分析
     print("[5/6] 编码区分度分析...")
-    plot_encoding_discrimination(args.n_freq, args.t_max, args.save_dir)
+    plot_encoding_discrimination(freqs, args.t_max, args.save_dir)
 
     # 6. 雾 bin=40 vs 目标 bin=60 的编码向量对比
     print("[6/6] 雾/目标编码向量对比...")
-    plot_fog_vs_target_encoding(args.n_freq, args.t_max, args.target_bin, args.save_dir)
+    plot_fog_vs_target_encoding(freqs, args.t_max, args.target_bin, args.save_dir)
+
+    # 7. 只聚合指定深度 bin 的强度图
+    print("[7/7] 指定深度 bin 的聚合强度图...")
+    plot_target_bin_intensity(frames, args.target_bin, args.save_dir)
 
     print(f"\n完成! 共生成 7 张图, 保存在: {args.save_dir}")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        main()
+    else:
+        demo_without_cli()

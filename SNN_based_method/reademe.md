@@ -12,6 +12,7 @@ SPAD 时间戳 [B, 4096, P=500]
   → 空间精修头 (残差 CNN, 消除逐像素 gate 噪声)
   → [B, 2, 64, 64]
 
+
 [1] Mildenhall B, et al. NeRF. Communications of the ACM, 2022, 65(1): 99-106.
 [2] Tancik M, et al. Fourier Features. NeurIPS, 2020.
 ```
@@ -20,11 +21,18 @@ SPAD 时间戳 [B, 4096, P=500]
 
 ```
 输入:  [B, 4096, P]     P=500 帧, 每元素为 ToF 整数 (0=无效, 1~150=有效)
+编码： [P, B, C, 64, 64] P可调，C是编码后的timebin维度
 输出:  [B, 2, 64, 64]   ch0=深度(timebin), ch1=强度(目标光子占比)
 GT:    [B, 2, 64, 64]   fog_level=0 末段直方图峰值, 含噪 → 弱监督
 ```
+P维非时序，相互之间可交换，因为是独立采样，需要避免学习到“序列顺序偏置”。可以考虑：
 
-## 3. 编码方案：正弦位置编码
+1. 训练时随机打乱 P 维顺序，强迫模型学习 permutation-invariant 表征。
+2. 加一个 histogram 分支：把每个像素的 ToF 统计成 [B, 150, 64, 64]，和 SNN 分支融合。
+3. 用 DeepSets / Set Transformer / pooling-based aggregation 替代纯因果 PLIF。
+4. 如果保留 PLIF，可考虑 forward + backward 双向 PLIF，降低“只看过去帧”的偏置。
+
+## 3. 编码方案：位置编码
 
 ### 3.1 为什么不用标量 tof/150
 
@@ -236,39 +244,57 @@ model_lut = SPADSpikeNet(encoding_mode="lut", embed_dim=8,  lut_init="random")  
 ### 4.1 结构图
 
 ```
-输入 [B, 4096, P=500]
-     │
-     ▼ reshape + 正弦编码
-[T*B, 17, 64, 64]          T=chunk_size (128~500), 超出则分 chunk
-     │
-     ▼ Stem: Conv(17→C,1)+BN+PLIF + Conv(C→C,3)+BN
-[T*B, C, 64, 64]
-     │
-     ▼ SpikeBlock ×3 (残差 + 多尺度膨胀 DSConv)
-     │
-     │   每个 block:
-     │     identity = x
-     │     → PLIF → [DW 3×3 d=1,2,4 并行] → cat → PW → BN
-     │     → PLIF → PW → BN
-     │     → + identity
-     │
-[T*B, C, 64, 64]           T, C, 64×64 全程不变
-     │
-     ▼ EchoGate: PLIF → Conv(C→1) → sigmoid
-[T, B, 1, 64, 64]          gate ∈ [0,1], 逐帧逐像素
-     │
-     ▼ Gated Moment (用原始 tof, 不用编码值)
-     │   depth     = Σ(gate × tof × valid) / Σ(gate × valid)
-     │   intensity = Σ(gate × valid) / T
-     │
-[B, 2, 64, 64]  粗估计（逐像素独立, 可能有椒盐噪声）
-     │
-     ▼ 空间精修头 (普通 CNN, 不是 SNN)
-     │   Conv(2→8, 3×3, pad=1) + BN + ReLU
-     │   Conv(8→2, 3×3, pad=1)
-     │   + 残差 (粗估计直接加回来, 精修头只学修正量)
-     │
-[B, 2, 64, 64]  精修输出
+raw pages
+[B, 4096, P]  P 可以是训练 P=120, 也可以是测试 P=60/240/500
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ reshape                                                      │
+│ [B, 4096, P] -> [P, B, 64, 64]                               │
+└───────────────┬─────────────────────────────────────────────┘
+                │ split by chunk_size
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│ per chunk: [T, B, 64, 64]                                    │
+│ valid mask: tof in [1, t_max]                                │
+│ encode: sinusoidal [T,B,17,H,W] or LUT [T,B,D,H,W]            │
+└───────────────┬─────────────────────────────────────────────┘
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Stem                                                        │
+│ Conv 1x1 -> BN -> PLIF -> Conv 3x3 -> BN                     │
+│ output: [T, B, C, 64, 64]                                   │
+└───────────────┬─────────────────────────────────────────────┘
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│ SpikeBlock x num_blocks                                     │
+│ residual path:                                               │
+│   PLIF -> MultiScale DSConv -> PLIF -> Conv 1x1 -> BN -> +id  │
+│ output: [T, B, C, 64, 64]                                   │
+└───────────────┬─────────────────────────────────────────────┘
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│ EchoGate                                                    │
+│ PLIF -> Conv C/2 -> BN -> PLIF -> Conv 1 -> sigmoid          │
+│ gate: [T, B, 1, 64, 64] in [0, 1]                            │
+└───────────────┬─────────────────────────────────────────────┘
+                │ all chunks share weights and accumulate below
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Gated Moment on original ToF                                │
+│ depth_coarse     = sum(gate * tof * valid) / sum(gate*valid) │
+│ intensity_coarse = sum(gate * valid) / P                    │
+│ confidence       = weight_sum / (weight_sum + 1)             │
+└───────────────┬─────────────────────────────────────────────┘
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Confidence-gated refinement head                            │
+│ normalize [depth/t_max, intensity] -> concat confidence      │
+│ Conv 3x3 -> BN -> ReLU -> Conv 3x3 -> residual * confidence  │
+│ clamp: depth in [0,t_max], intensity in [0,1]                │
+└───────────────┬─────────────────────────────────────────────┘
+                ▼
+           output [B, 2, 64, 64]
 ```
 
 精修头的作用:
@@ -276,15 +302,18 @@ model_lut = SPADSpikeNet(encoding_mode="lut", embed_dim=8,  lut_init="random")  
 - 精修头利用 3×3 邻域平滑 gate 误差, 同时保留目标边缘
 - 残差连接: 深度值仍以 Gated Moment 为基础, 精修头只做微调
 - 极小: 两层 Conv, 参数 < 1K, 不增加显存负担
+- 当前实现已加入 `confidence = weight_sum / (weight_sum + 1)`。置信度越低, 精修残差越小, 避免在有效光子太少的位置过度平滑或凭空补结构。
+- 精修头内部先把 depth 归一化到 `[0,1]`, 与 intensity、confidence 同量纲建模; 输出后将 depth 还原到 `[0,t_max]`, intensity 保持 `[0,1]`。
+- 可继续扩展的置信度特征:
+  - `selected_count = sum(gate * valid)`
+  - `selected_var = selected ToF variance`
+  - `valid_count = sum(valid)`
+  - `gate_entropy`
 
-### 4.2 为什么不用时间 U-Net
+### 4.2 存在问题
+SNN 部分需要监控 firing rate，否则可能只是“带 PLIF 的 ANN”，因为输入 Fourier 特征有负值
 
-```
-任务是 64×64 → 64×64, 输入输出同分辨率, P 帧之间是独立采样
-PLIF 膜电位天然沿帧轴积累光子证据, 不需要人为压缩/恢复时间维
-fp16 + checkpoint 可将 chunk 开到 128~500, 无需靠 U-Net 扩展时间窗口
-等宽结构: gate 在完整 T 分辨率下输出, 无上采样信息损失
-```
+
 
 ### 4.3 关键组件
 
@@ -293,6 +322,8 @@ fp16 + checkpoint 可将 chunk 开到 128~500, 无需靠 U-Net 扩展时间窗�
 三路并行 DW-Conv 3×3 (dilation=1,2,4) → cat(3C) → PW-Conv(3C→C) → BN
 感受野: 3×3 / 5×5 / 9×9, 全程 64×64 不变
 ```
+
+注意: dilation 是空间维的空洞率, 不是时间维 P 的抽样间隔。`dilation=2` 表示 3×3 kernel 在 H/W 平面每隔 2 个像素采样, 配合 `padding=2` 后输出仍是 64×64; `dilation=4` 同理得到等效 9×9 感受野。它不会减少帧数, 不会跳过 SPAD pages, 也不会改变 chunk 内 PLIF 的时间步。
 
 **Chunked 处理** (P > chunk_size 时):
 ```
@@ -326,17 +357,47 @@ EchoGate                  [1024,  1, 64, 64]      64×64
 
 ### 5.1 训练损失
 
+当前实现要求各项 loss 先进入可比较量纲, 再进行加权求和。标准化规则:
+
 ```
-L = 0.3  × L_GT       |depth-GT| + |intensity-GT|       弱标签锚点 (L1/MAE)
-  + 0.1  × L_SSIM     1 - SSIM(pred, GT)                结构相似性 (局部亮度/对比度/结构)
-  + 1.0  × L_var      gate 选中光子的 tof 方差 (须聚集)   核心物理约束
-  + 0.05 × L_sparse   mean(gate×valid), 浓雾下应稀疏      先验
-  + 0.1  × L_smooth   |∇d|·exp(-β|∇I|)                  边缘保持平滑
+depth_norm     = clamp(depth / depth_range, 0, 1), depth_range = t_max = 150
+intensity_norm = clamp(intensity / intensity_range, 0, 1), intensity_range = 1
+tof_norm       = tof / depth_range
 ```
 
-L_SSIM 使用 7×7 高斯窗口 (适配 64×64 分辨率), 对 depth 和 intensity 分别计算后加权合并。
-depth 的 data_range=150 (tof bin 范围), intensity 的 data_range=1.0。
-SSIM 捕获局部结构信息, 弥补纯像素级 L1 对边缘和纹理的盲区。
+注意: 这里说的是 loss/refine 内部的量纲统一, 不是把模型输入改成归一化 ToF。模型编码仍应接收原始 ToF bin, 因为 valid mask、LUT index 和 Gated Moment 都依赖整数 bin 语义。
+
+```
+L = w_gt     * L_GT
+  + w_ssim   * L_SSIM
+  + w_var    * L_var
+  + w_sparse * L_sparse
+  + w_smooth * L_smooth
+  + w_lut_smooth * L_lut_smooth
+  + w_lut_norm   * L_lut_norm
+```
+
+各项含义:
+
+| loss | 当前量纲 | 目的 |
+|------|----------|------|
+| `L_GT` | 在 `[0,1]` 上计算 depth/intensity L1 | 弱标签锚点 |
+| `L_SSIM` | 在 `[0,1]` 上计算, `data_range=1` | 局部结构相似性 |
+| `L_var` | 在归一化 ToF 上计算方差超额 `relu(var - (sigma/depth_range)^2)` | gate 选中的光子应集中 |
+| `L_sparse` | `mean(gate * valid)` | 目标光子在浓雾中应稀疏 |
+| `L_smooth` | 在归一化 depth 上计算 `|grad d| * exp(-beta |grad I|)` | 边缘保持平滑 |
+| `L_lut_*` | embedding 正则 | LUT 编码稳定性 |
+
+**loss 系数之和不需要等于 1。** 这些系数不是概率权重, 而是拉格朗日乘子/优化偏好, 只控制不同约束对梯度的相对贡献。更重要的是: 每个原始 loss 的数值尺度应稳定、可解释, 然后根据验证集表现调系数。把系数强行归一到和为 1 反而可能削弱关键物理约束, 例如 `L_var`。
+
+默认系数:
+
+```
+w_gt=0.3, w_ssim=0.1, w_var=1.0, w_sparse=0.05, w_smooth=0.1
+w_lut_smooth=0.01, w_lut_norm=0.005
+```
+
+`L_var` 仍需重点监控。它约束 gate 选中的 ToF 分布要窄, 但如果权重过大, 模型可能只选择目标回波最尖锐的一小段, 而不是完整回波。建议记录 `selected_count`、`weighted_var` 分布和 `mean(gate*valid)` 来判断是否出现过度稀疏。
 
 ### 5.2 评估指标
 
@@ -351,15 +412,96 @@ SSIM  = 结构相似性 (7×7 高斯窗口)       局部结构质量
 PSNR  = 10 × log10(1 / MSE)  (dB)       信噪比, 归一化后 data_range=1.0
 ```
 
+### 5.3 存在问题
+```
+L_var：选中 photon 的 ToF 方差要小
+L_sparse：gate × valid 要稀疏
+```
+gate 全部接近 0，或者每个像素只选 1 个 photon → 方差接近 0 → sparse 也很小 → L_var 和 L_sparse 都满意
+
+可以考虑监控参数：
+```
+mean(gate)
+mean(gate * valid)
+每像素选中 photon 数
+gate 直方图
+有效像素 denominator = sum(gate * valid)
+```
+
+### 5.4 P 维 shuffle 对比实验
+
+SPAD 的 P 维来自独立采样帧, 本质上更接近无序集合, 而不是严格时间序列。PLIF 会沿 P 维累计膜电位, 如果原始 raw 文件的 page 顺序带有采集系统偏置, 模型可能学到不该学的顺序模式。因此需要做 P shuffle 对比。
+
+实验设置:
+
+| 组别 | 训练 | 验证/测试 | 目的 |
+|------|------|-----------|------|
+| A | `shuffle_pages=False` | 原始顺序 | 当前基线 |
+| B | `shuffle_pages=True` | 原始顺序 | 训练时强制顺序不敏感 |
+| C | `shuffle_pages=True` | 测试也 shuffle 多次取均值/方差 | 测量输出对 P 排列的敏感性 |
+
+命令示例:
+
+```powershell
+python .\SNN\train.py --data-paths data\raw --pages-per-group 120 --run-name p120_no_shuffle
+python .\SNN\train.py --data-paths data\raw --pages-per-group 120 --shuffle-pages --run-name p120_shuffle
+
+python .\SNN\test.py --data-paths data\raw --pages-per-group 120 --checkpoint SNN\artifacts\p120_shuffle\best.pth
+```
+
+判断标准:
+
+```
+1. B 组在正常测试集上不应明显劣于 A。
+2. 同一个样本不同 P 排列下, output 的 MAE/RMSE 或像素方差应更低。
+3. 若 B 明显更稳, 说明当前任务更接近 independent SPAD frame set, 训练应默认开启 --shuffle-pages。
+4. 若 A 明显更好, 说明采样顺序里可能有物理或系统信息, 需要谨慎解释并考虑双向 PLIF/Set 分支。
+```
+
+注意: 当前 DataLoader 的 `shuffle_pages=True` 只打乱输入 frames, 弱标签仍由未打乱的 group 统计生成, 因此标签不受影响。
 ## 6. 参数与显存
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | C | 32 | 通道数 (全程不变) |
 | chunk_size | 128 | 每 chunk 帧数 |
+| pages_per_group | 500 | 每个样本使用的 SPAD pages 数 P; 可改为 120 训练 |
 | n_freq | 8 | 正弦编码频率数 → 17 输入通道 |
 | spike_mode | "plif" | 神经元类型 |
 | t_max | 150 | 最大有效 ToF bin |
+
+### 6.1 训练 P=120, 测试可变 P
+
+可以。模型本身不把 P 写死在网络参数里: `forward(raw_data)` 读取输入的实际 `P`, 按 `chunk_size` 切块, 对所有 chunk 累加 Gated Moment。因此只要 checkpoint 的网络结构参数一致, 测试时可以使用不同的 `pages_per_group`。
+
+推荐配置:
+
+```
+训练: pages_per_group=120, chunk_size=120 或 60/120
+测试: pages_per_group=60 / 120 / 240 / 500 均可
+```
+
+命令示例:
+
+```powershell
+# 训练只用 P=120
+python .\SNN\train.py --data-paths data\raw --pages-per-group 120 --chunk-size 120 --run-name train_p120
+
+# 测试用 P=500。checkpoint 中的 config 会被命令行 --pages-per-group 覆盖。
+python .\SNN\test.py --data-paths data\raw --pages-per-group 500 --chunk-size 120 --checkpoint SNN\artifacts\train_p120\best.pth --run-name test_p500
+
+# 单文件单组测试也可以换 P
+python .\SNN\test1.py --raw-path data\raw\sample.raw --pages-per-group 240 --checkpoint SNN\artifacts\train_p120\best.pth
+```
+
+需要注意:
+
+1. `pages_per_group` 决定数据集如何把 raw pages 切成样本组; 测试 P 改大时, 每个样本会聚合更多独立 SPAD 帧, 噪声通常更低, 但样本数量会变少。
+2. `chunk_size` 只决定一次进入 SNN 的时间步长度和显存, 不要求等于 P。若训练 `chunk_size=120`, 测试 `P=500` 时会自动分成多个 chunk。
+3. PLIF 的膜电位会跨 chunk 延续, 但梯度在 chunk 间截断; 测试无梯度时主要影响状态累计路径。
+4. 训练 P=120、测试 P=500 属于分布变化, 建议报告 P=60/120/240/500 的曲线, 而不是只报一个测试点。
+
+### 6.2 显存估计
 
 **显存** (fp16 + gradient checkpoint):
 
@@ -412,7 +554,8 @@ cfg.save("experiment_01.json")
 ```
 分组            参数                                 sinusoidal  lut
 ───────────────────────────────────────────────────────────────────────
-数据            t_max                                生效        生效
+数据            pages_per_group, shuffle_pages       生效        生效
+数据            t_max / time_threshold               生效        生效
 编码 (公共)     encoding_mode, n_freq                生效        生效
 编码 (LUT)      embed_dim, lut_init, lut_max_norm    忽略        生效
 网络            C, chunk_size, spike_mode, num_blocks 生效        生效
@@ -424,6 +567,14 @@ cfg.save("experiment_01.json")
 预置配置:
 ```python
 from SNN_config import SINUSOIDAL_DEFAULT, LUT_RBF_16, LUT_SIN_16, LUT_RBF_32
+```
+
+标准入口:
+
+```powershell
+python .\SNN\train.py --config experiment.json
+python .\SNN\test.py --checkpoint SNN\artifacts\train_xxx\best.pth --data-paths data\raw
+python .\SNN\test1.py --checkpoint SNN\artifacts\train_xxx\best.pth --raw-path data\raw\one.raw --group-index 0
 ```
 
 ## 8. SNN_new.py — activation_based API 版本
@@ -674,3 +825,18 @@ T= 50  peak_allocated exceeds 12 GB, skip larger T for this B/C
 === C=32, B=32, H=W=64 ===
 T= 50  OOM, skip larger T for this B/C
 ```
+
+
+## 11. baseline对比
+
+1. 传统 histogram peak / matched filter
+2. 2D CNN on histogram [150,64,64]
+3. 3D CNN / 1D ToF Conv + 2D spatial Conv
+4. 同结构但 PLIF 换 ReLU/GELU 的 ANN 版本
+5. scalar tof/150 编码
+6. one-hot / histogram 编码
+7. sinusoidal vs LUT
+8. 有无 confidence-gated refine head, 以及 refine 前后是否 clamp
+9. 有无 L_var / L_sparse / L_smooth
+10. P shuffle 训练 vs 不 shuffle
+11. train P=120, test P=60/120/240/500 的可变 P 泛化曲线

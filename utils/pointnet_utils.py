@@ -81,8 +81,12 @@ def fps_points(xyz, npoint):
 
 
 def knn_point(k, xyz, new_xyz):
-    """kNN 搜索: xyz[B,N,C] new_xyz[B,S,C] → idx[B,S,k]"""
+    """kNN 搜索: xyz[B,N,C] new_xyz[B,S,C] → idx[B,S,k]
+
+    k 大于可用点数时自动 clamp, 避免深层下采样后点数不足导致 topk 报错。
+    """
     dist = square_distance(new_xyz, xyz)
+    k = min(k, dist.shape[-1])
     _, idx = dist.topk(k, dim=-1, largest=False, sorted=False)
     return idx
 
@@ -147,6 +151,23 @@ def farthest_point_sample_varlen(xyz, offset, new_offset):
     """变长点云的 FPS。"""
     device = xyz.device
     npoints_new = new_offset[-1].item()
+
+    counts = torch.diff(offset, prepend=offset.new_zeros(1))
+    new_counts = torch.diff(new_offset, prepend=new_offset.new_zeros(1))
+    if (
+        counts.numel() > 0
+        and bool((counts == counts[0]).all().item())
+        and bool((new_counts == new_counts[0]).all().item())
+    ):
+        batch_size = counts.numel()
+        src_count = int(counts[0].item())
+        dst_count = int(new_counts[0].item())
+        if src_count > 0 and dst_count > 0:
+            batch_xyz = xyz.reshape(batch_size, src_count, xyz.shape[-1])
+            batch_idx = farthest_point_sample(batch_xyz, dst_count)
+            base = torch.arange(batch_size, dtype=torch.long, device=device).view(-1, 1) * src_count
+            return (batch_idx + base).reshape(-1)
+
     new_xyz_idx = torch.zeros(npoints_new, dtype=torch.long, device=device)
     for i in range(len(offset)):
         s_i = 0 if i == 0 else offset[i - 1].item()
@@ -163,8 +184,35 @@ def farthest_point_sample_varlen(xyz, offset, new_offset):
 
 
 def knn_point_varlen(k, xyz, offset, new_xyz, new_offset):
-    """变长点云的 kNN。"""
+    """变长点云的 kNN。
+
+    k 大于当前 batch 内可用源点数时自动 clamp, 避免深层下采样后 topk 越界。
+    """
     device = xyz.device
+    counts = torch.diff(offset, prepend=offset.new_zeros(1))
+    new_counts = torch.diff(new_offset, prepend=new_offset.new_zeros(1))
+    if (
+        counts.numel() > 0
+        and bool((counts == counts[0]).all().item())
+        and bool((new_counts == new_counts[0]).all().item())
+    ):
+        batch_size = counts.numel()
+        src_count = int(counts[0].item())
+        dst_count = int(new_counts[0].item())
+        if src_count > 0 and dst_count > 0:
+            k = min(k, src_count)
+            batch_xyz = xyz.reshape(batch_size, src_count, xyz.shape[-1])
+            batch_new_xyz = new_xyz.reshape(batch_size, dst_count, new_xyz.shape[-1])
+            batch_idx = knn_point(k, batch_xyz, batch_new_xyz)
+            base = torch.arange(batch_size, dtype=torch.long, device=device).view(-1, 1, 1) * src_count
+            return (batch_idx + base).reshape(-1, k)
+
+    # 取各 batch 中最少的源点数作为安全的 k 上限, 保证预分配 shape 一致。
+    min_src = min(
+        int(offset[i].item()) - (0 if i == 0 else int(offset[i - 1].item()))
+        for i in range(len(offset))
+    )
+    k = min(k, min_src)
     M = new_xyz.shape[0]
     idx = torch.zeros(M, k, dtype=torch.long, device=device)
     for i in range(len(offset)):
@@ -177,7 +225,7 @@ def knn_point_varlen(k, xyz, offset, new_xyz, new_offset):
         batch_xyz = xyz[s_i:e_i, :].unsqueeze(0)
         batch_new_xyz = new_xyz[s_new:e_new, :].unsqueeze(0)
         batch_idx = knn_point(k, batch_xyz, batch_new_xyz)
-        idx[s_new:e_new, :] = batch_idx[0]
+        idx[s_new:e_new, :] = batch_idx[0] + s_i
     return idx
 
 
