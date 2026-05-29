@@ -1,16 +1,16 @@
-"""Loss functions for SPAD dense-fog SNN imaging model.
+"""SPAD 浓雾场景 SNN 成像模型的损失函数与评估指标。
 
-All losses operate on single-window data (no cross-scene pairing required).
-Compatible with noisy GT from histogram-peak extraction.
+这些损失只依赖单个时间窗口的数据，不需要跨场景配对。弱标签可来自
+histogram peak 或重复点计数生成的噪声 GT。
 
 包含:
-- WeakGTLoss: L1 loss (MAE)
-- SSIMLoss: 结构相似性 loss (1 - SSIM), 捕获局部结构质量
-- GatedMomentVarianceLoss: gate 选中光子的时间方差惩罚
-- SpikeSparsityLoss: gate 稀疏性正则
-- IntensityAwareSmoothnessLoss: 强度引导的边缘保持平滑
-- SPADImagingLoss: 组合训练 loss
-- ImageMetrics: 评估工具 (MAE / RMSE / SSIM / PSNR), 不参与梯度
+- ``WeakGTLoss``: 对弱 GT 的 L1/MAE 约束。
+- ``SSIMLoss``: 结构相似性损失 ``1 - SSIM``。
+- ``GatedMomentVarianceLoss``: 约束 gate 选中光子的 ToF 方差。
+- ``SpikeSparsityLoss``: gate 稀疏性正则。
+- ``IntensityAwareSmoothnessLoss``: 强度引导的边缘保持平滑项。
+- ``SPADImagingLoss``: 组合训练损失。
+- ``ImageMetrics``: MAE / RMSE / SSIM / PSNR 评估工具，不参与梯度。
 """
 
 import math

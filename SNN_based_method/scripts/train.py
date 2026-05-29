@@ -1,53 +1,35 @@
-"""Standard training entrypoint for the SPAD SNN model."""
+"""SPAD SNN 模型的标准训练入口。"""
 
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-
-CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 try:
-    from SNN.SNN_config import SNNConfig
-    from SNN.data import seed_everything
-    from SNN.runtime import (
-        add_config_arguments,
-        append_jsonl,
-        config_from_args,
-        divide_average,
-        load_checkpoint,
-        make_run_dir,
-        prepare_model_input,
-        reduce_loss_dict,
-        reset_spiking_state,
-        save_checkpoint,
-        update_average,
-    )
-except ModuleNotFoundError:
-    from SNN_config import SNNConfig
-    from data import seed_everything
-    from runtime import (
-        add_config_arguments,
-        append_jsonl,
-        config_from_args,
-        divide_average,
-        load_checkpoint,
-        make_run_dir,
-        prepare_model_input,
-        reduce_loss_dict,
-        reset_spiking_state,
-        save_checkpoint,
-        update_average,
-    )
+    from ._bootstrap import ensure_project_root_on_path
+except ImportError:
+    from _bootstrap import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
+from SNN_based_method.SNN_config import SNNConfig
+from SNN_based_method.scripts.data import seed_everything
+from SNN_based_method.scripts.runtime import (
+    add_config_arguments,
+    append_jsonl,
+    config_from_args,
+    divide_average,
+    load_checkpoint,
+    make_run_dir,
+    prepare_model_input,
+    reduce_loss_dict,
+    reset_spiking_state,
+    save_checkpoint,
+    update_average,
+)
 
 
 def train_one_epoch(
@@ -59,7 +41,7 @@ def train_one_epoch(
     cfg: SNNConfig,
     epoch: int,
 ) -> tuple[float, dict[str, float]]:
-    """Train for one epoch."""
+    """训练一个 epoch, 返回平均总 loss 与各子 loss。"""
     model.train()
     total_loss = 0.0
     loss_sums: dict[str, float] = {}
@@ -110,7 +92,7 @@ def validate_one_epoch(
     device: torch.device,
     epoch: int,
 ) -> tuple[float, dict[str, float], dict[str, float]]:
-    """Run validation for one epoch."""
+    """验证一个 epoch, 返回 loss、子 loss 和图像指标。"""
     model.eval()
     total_loss = 0.0
     loss_sums: dict[str, float] = {}
@@ -145,15 +127,15 @@ def validate_one_epoch(
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Build CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Train SPAD SNN model")
+    """构建命令行参数解析器。"""
+    parser = argparse.ArgumentParser(description="训练 SPAD SNN 成像模型")
     add_config_arguments(parser)
-    parser.add_argument("--save-every", type=int, default=None, help="Save checkpoint every N epochs")
+    parser.add_argument("--save-every", type=int, default=None, help="每 N 个 epoch 额外保存一次 checkpoint")
     return parser
 
 
 def main() -> None:
-    """Run standard training."""
+    """执行标准训练流程。"""
     args = build_argparser().parse_args()
     cfg = config_from_args(args)
     if args.save_every is not None:

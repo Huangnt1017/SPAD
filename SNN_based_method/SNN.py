@@ -1,18 +1,24 @@
-"""SPAD Dense-Fog SNN Imaging Model
+"""SPAD 浓雾场景 SNN 成像模型（clock_driven 旧版后端）。
 
-Input:  [B, 4096, P]   raw ToF timestamps (0 = invalid/untriggered)
-Output: [B, 2, 64, 64] (depth, intensity)
+输入:
+    ``raw_data`` 形状为 ``[B, 4096, P]``，其中 0 表示无效或未触发 ToF。
 
-Architecture: sinusoidal positional encoding → equal-width SpikeBlocks
-              → EchoGate → Gated Moment → spatial refinement head
-Supports chunked processing for large P (e.g., P=500).
+输出:
+    字典形式结果，核心输出 ``output`` 形状为 ``[B, 2, 64, 64]``，
+    通道 0 为深度，通道 1 为强度。
+
+网络结构:
+    正弦 / LUT ToF 编码 -> 等宽 SpikeBlock -> EchoGate -> Gated Moment
+    -> 空间精修头。支持按 ``chunk_size`` 分块处理较大的 P（例如 P=500）。
 """
 
 import sys
-import os
 import math
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import torch
 import torch.nn as nn
@@ -23,8 +29,6 @@ from spikingjelly1.clock_driven.neuron import (
     MultiStepIFNode,
 )
 
-from spikingjelly.activation_based import neuron
-
 try:
     from utils.pointnet_utils import build_spike_node as _build_spike_node_cupy
     _HAS_CUPY_BUILDER = True
@@ -33,6 +37,7 @@ except Exception:
 
 
 def build_node(timestep, spike_mode="plif", tau=2.0, v_threshold=0.5):
+    """构建 clock_driven 多步脉冲神经元。"""
     if _HAS_CUPY_BUILDER and torch.cuda.is_available():
         try:
             return _build_spike_node_cupy(timestep, spike_mode, tau=tau, v_threshold=v_threshold)
@@ -54,7 +59,7 @@ def build_node(timestep, spike_mode="plif", tau=2.0, v_threshold=0.5):
             detach_reset=True, backend="torch",
         )
     else:
-        raise ValueError(f"Unsupported spike_mode: {spike_mode}")
+        raise ValueError(f"不支持的 spike_mode: {spike_mode}, 可选 plif/lif/if")
 
 
 # ─── Encoding ────────────────────────────────────────────

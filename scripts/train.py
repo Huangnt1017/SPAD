@@ -657,7 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="pointnet2",
+		default="pointmlp",
 		choices=[
 			"dgcnn",
 			"pointnet",

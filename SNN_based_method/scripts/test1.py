@@ -1,48 +1,36 @@
-"""Single-sample smoke/inference test for the SPAD SNN model."""
+"""SPAD SNN 模型的单样本冒烟测试与推理入口。"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-
-CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 try:
-    from SNN.SNN_config import SNNConfig
-    from SNN.data import (
-        RawGroupSample,
-        SpadRawGroupDataset,
-        seed_everything,
-        spad_time_first_collate,
-    )
-    from SNN.runtime import (
-        add_config_arguments,
-        config_from_checkpoint_and_args,
-        load_checkpoint,
-        make_run_dir,
-        prepare_model_input,
-        reset_spiking_state,
-    )
-except ModuleNotFoundError:
-    from SNN_config import SNNConfig
-    from data import RawGroupSample, SpadRawGroupDataset, seed_everything, spad_time_first_collate
-    from runtime import (
-        add_config_arguments,
-        config_from_checkpoint_and_args,
-        load_checkpoint,
-        make_run_dir,
-        prepare_model_input,
-        reset_spiking_state,
-    )
+    from ._bootstrap import ensure_project_root_on_path
+except ImportError:
+    from _bootstrap import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
+from SNN_based_method.SNN_config import SNNConfig
+from SNN_based_method.scripts.data import (
+    RawGroupSample,
+    SpadRawGroupDataset,
+    seed_everything,
+    spad_time_first_collate,
+)
+from SNN_based_method.scripts.runtime import (
+    add_config_arguments,
+    config_from_checkpoint_and_args,
+    load_checkpoint,
+    make_run_dir,
+    prepare_model_input,
+    reset_spiking_state,
+)
 
 
 def build_single_sample_dataset(
@@ -50,12 +38,12 @@ def build_single_sample_dataset(
     raw_path: str | Path,
     group_index: int,
 ) -> SpadRawGroupDataset:
-    """Build a one-sample dataset for a specific raw group."""
+    """为指定 raw 文件和组号构建只含一个样本的数据集。"""
     raw_path = Path(raw_path).resolve()
     if not raw_path.is_file():
         raise FileNotFoundError(f"raw file not found: {raw_path}")
 
-    # Reuse the Dataset's page inference by creating the full sample table once.
+    # 先让 Dataset 推断完整组列表, 再从中选出目标组, 避免重复实现 page 数推断逻辑。
     full_dataset = SpadRawGroupDataset(
         raw_paths=[raw_path],
         pages_per_group=cfg.pages_per_group,
@@ -101,7 +89,7 @@ def run_single_test(
     group_index: int = 0,
     save_prediction: bool = False,
 ) -> dict[str, object]:
-    """Run one raw group through the configured model."""
+    """把一个 raw 分组送入当前配置的模型并返回基本统计。"""
     seed_everything(cfg.seed)
     dataset = build_single_sample_dataset(cfg, raw_path, group_index)
     batch = spad_time_first_collate([dataset[0]])
@@ -149,17 +137,17 @@ def run_single_test(
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Build CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Test one raw group with SPAD SNN")
+    """构建命令行参数解析器。"""
+    parser = argparse.ArgumentParser(description="使用 SPAD SNN 测试一个 raw 分组")
     add_config_arguments(parser)
-    parser.add_argument("--raw-path", required=True, help="Single .raw file path")
-    parser.add_argument("--group-index", type=int, default=0, help="0-based group index")
-    parser.add_argument("--save-prediction", action="store_true", help="Save output.npy and summary.json")
+    parser.add_argument("--raw-path", required=True, help="单个 .raw 文件路径")
+    parser.add_argument("--group-index", type=int, default=0, help="从 0 开始的分组索引")
+    parser.add_argument("--save-prediction", action="store_true", help="保存 output.npy 和 summary.json")
     return parser
 
 
 def main() -> None:
-    """Run single-sample inference."""
+    """执行单样本推理。"""
     args = build_argparser().parse_args()
     cfg = config_from_checkpoint_and_args(args)
     run_single_test(

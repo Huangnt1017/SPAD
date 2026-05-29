@@ -443,10 +443,10 @@ SPAD 的 P 维来自独立采样帧, 本质上更接近无序集合, 而不是�
 命令示例:
 
 ```powershell
-python .\SNN\train.py --data-paths data\raw --pages-per-group 120 --run-name p120_no_shuffle
-python .\SNN\train.py --data-paths data\raw --pages-per-group 120 --shuffle-pages --run-name p120_shuffle
+python -m SNN_based_method.scripts.train --data-paths data\raw --pages-per-group 120 --run-name p120_no_shuffle
+python -m SNN_based_method.scripts.train --data-paths data\raw --pages-per-group 120 --shuffle-pages --run-name p120_shuffle
 
-python .\SNN\test.py --data-paths data\raw --pages-per-group 120 --checkpoint SNN\artifacts\p120_shuffle\best.pth
+python -m SNN_based_method.scripts.test --data-paths data\raw --pages-per-group 120 --checkpoint SNN_based_method\artifacts\p120_shuffle\best.pth
 ```
 
 判断标准:
@@ -485,13 +485,13 @@ python .\SNN\test.py --data-paths data\raw --pages-per-group 120 --checkpoint SN
 
 ```powershell
 # 训练只用 P=120
-python .\SNN\train.py --data-paths data\raw --pages-per-group 120 --chunk-size 120 --run-name train_p120
+python -m SNN_based_method.scripts.train --data-paths data\raw --pages-per-group 120 --chunk-size 120 --run-name train_p120
 
 # 测试用 P=500。checkpoint 中的 config 会被命令行 --pages-per-group 覆盖。
-python .\SNN\test.py --data-paths data\raw --pages-per-group 500 --chunk-size 120 --checkpoint SNN\artifacts\train_p120\best.pth --run-name test_p500
+python -m SNN_based_method.scripts.test --data-paths data\raw --pages-per-group 500 --chunk-size 120 --checkpoint SNN_based_method\artifacts\train_p120\best.pth --run-name test_p500
 
 # 单文件单组测试也可以换 P
-python .\SNN\test1.py --raw-path data\raw\sample.raw --pages-per-group 240 --checkpoint SNN\artifacts\train_p120\best.pth
+python -m SNN_based_method.scripts.test1 --raw-path data\raw\sample.raw --pages-per-group 240 --checkpoint SNN_based_method\artifacts\train_p120\best.pth
 ```
 
 需要注意:
@@ -523,7 +523,7 @@ chunk  B=4     B=8     B=16    B=32
 所有可调参数统一由 `SNN_config.py` 中的 `SNNConfig` dataclass 管理，模型、损失函数、评估指标均通过 config 构建:
 
 ```python
-from SNN_config import SNNConfig
+from SNN_based_method.SNN_config import SNNConfig
 
 # 方式 1: 默认正弦编码
 cfg = SNNConfig()
@@ -566,15 +566,15 @@ cfg.save("experiment_01.json")
 
 预置配置:
 ```python
-from SNN_config import SINUSOIDAL_DEFAULT, LUT_RBF_16, LUT_SIN_16, LUT_RBF_32
+from SNN_based_method.SNN_config import SINUSOIDAL_DEFAULT, LUT_RBF_16, LUT_SIN_16, LUT_RBF_32
 ```
 
 标准入口:
 
 ```powershell
-python .\SNN\train.py --config experiment.json
-python .\SNN\test.py --checkpoint SNN\artifacts\train_xxx\best.pth --data-paths data\raw
-python .\SNN\test1.py --checkpoint SNN\artifacts\train_xxx\best.pth --raw-path data\raw\one.raw --group-index 0
+python -m SNN_based_method.scripts.train --config experiment.json
+python -m SNN_based_method.scripts.test --checkpoint SNN_based_method\artifacts\train_xxx\best.pth --data-paths data\raw
+python -m SNN_based_method.scripts.test1 --checkpoint SNN_based_method\artifacts\train_xxx\best.pth --raw-path data\raw\one.raw --group-index 0
 ```
 
 ## 8. SNN_new.py — activation_based API 版本

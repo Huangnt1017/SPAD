@@ -1,50 +1,34 @@
-"""Standard batch testing entrypoint for the SPAD SNN model."""
+"""SPAD SNN 模型的批量测试入口。"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
-from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-
-CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 try:
-    from SNN.SNN_config import SNNConfig
-    from SNN.data import seed_everything
-    from SNN.runtime import (
-        add_config_arguments,
-        config_from_checkpoint_and_args,
-        divide_average,
-        load_checkpoint,
-        make_run_dir,
-        prepare_model_input,
-        reduce_loss_dict,
-        reset_spiking_state,
-        update_average,
-    )
-except ModuleNotFoundError:
-    from SNN_config import SNNConfig
-    from data import seed_everything
-    from runtime import (
-        add_config_arguments,
-        config_from_checkpoint_and_args,
-        divide_average,
-        load_checkpoint,
-        make_run_dir,
-        prepare_model_input,
-        reduce_loss_dict,
-        reset_spiking_state,
-        update_average,
-    )
+    from ._bootstrap import ensure_project_root_on_path
+except ImportError:
+    from _bootstrap import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
+from SNN_based_method.SNN_config import SNNConfig
+from SNN_based_method.scripts.data import seed_everything
+from SNN_based_method.scripts.runtime import (
+    add_config_arguments,
+    config_from_checkpoint_and_args,
+    divide_average,
+    load_checkpoint,
+    make_run_dir,
+    prepare_model_input,
+    reduce_loss_dict,
+    reset_spiking_state,
+    update_average,
+)
 
 
 @torch.no_grad()
@@ -53,7 +37,7 @@ def run_test(
     *,
     save_predictions: bool = False,
 ) -> dict[str, object]:
-    """Run batch test and return summary statistics."""
+    """执行批量测试并返回汇总统计。"""
     if not cfg.checkpoint_path:
         raise ValueError("checkpoint_path is required for testing")
 
@@ -116,15 +100,15 @@ def run_test(
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Build CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Test SPAD SNN model")
+    """构建命令行参数解析器。"""
+    parser = argparse.ArgumentParser(description="测试 SPAD SNN 成像模型")
     add_config_arguments(parser)
-    parser.add_argument("--save-predictions", action="store_true", help="Save output maps as .npy files")
+    parser.add_argument("--save-predictions", action="store_true", help="把每个 batch 的输出图保存为 .npy")
     return parser
 
 
 def main() -> None:
-    """Run standard batch testing."""
+    """执行标准批量测试流程。"""
     args = build_argparser().parse_args()
     cfg = config_from_checkpoint_and_args(args)
     run_test(cfg, save_predictions=args.save_predictions)

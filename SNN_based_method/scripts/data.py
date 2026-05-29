@@ -1,24 +1,22 @@
-"""Dataset and DataLoader helpers for SPAD SNN training.
+"""SPAD SNN 训练使用的数据集与 DataLoader 工具。
 
-The raw reader follows ``models/raw2frame.py``:
+raw 文件读取约定:
+1. 按 uint16 读取原始 page, 每个 page 尺寸为 ``64x64``。
+2. 大于 ``time_threshold`` 的 ToF 值置 0, 作为无效触发。
+3. 按 ``pages_per_group`` 分组为 ``[G, 4096, P]``。
 
-1. Read uint16 raw pages as ``[total_pages, 64, 64]``.
-2. Set values above ``time_threshold`` to ``0``.
-3. Group pages into ``[G, 4096, P]``.
-
-This module then reshapes each group to ``[P, 1, 64, 64]``.  The custom
-collate function stacks samples as time-first batches:
+数据集会把每组 reshape 为 ``[P, 1, 64, 64]``。自定义 collate 会把
+batch 堆叠成时间维优先格式:
 
     frames: ``[P, B, 1, 64, 64]``
 
-Labels are optional weak image labels shaped ``[B, 2, 64, 64]`` where
-channel 0 is depth and channel 1 is intensity.
+弱标签是可选的 ``[B, 2, 64, 64]`` 图像标签, 通道 0 为深度, 通道 1
+为强度。
 """
 
 from __future__ import annotations
 
 import random
-import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,14 +26,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
-try:
-    from models.raw2frame import max_count_maps, n3_filter, raw2frame
-except ModuleNotFoundError:
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-    from models.raw2frame import max_count_maps, n3_filter, raw2frame
-
 
 NUM_PIXELS = 64 * 64
 RAW_VALUE_BYTES = 2
@@ -44,7 +34,7 @@ DEFAULT_SEED = 42
 
 @dataclass(frozen=True)
 class RawGroupSample:
-    """Index information for one grouped raw sample."""
+    """一个 raw 分组样本的索引信息。"""
 
     raw_path: str
     group_index: int
@@ -52,7 +42,7 @@ class RawGroupSample:
 
 
 def seed_everything(seed: int = DEFAULT_SEED) -> None:
-    """Seed Python, NumPy and PyTorch random generators."""
+    """统一设置 Python、NumPy 和 PyTorch 随机种子。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -61,7 +51,7 @@ def seed_everything(seed: int = DEFAULT_SEED) -> None:
 
 
 def seed_worker(worker_id: int) -> None:
-    """Seed one DataLoader worker from PyTorch's worker seed."""
+    """根据 PyTorch worker seed 设置单个 DataLoader worker 的随机种子。"""
     worker_seed = (torch.initial_seed() + worker_id) % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -72,14 +62,14 @@ def collect_raw_paths(
     *,
     recursive: bool = False,
 ) -> list[Path]:
-    """Collect sorted ``.raw`` files from files and directories.
+    """从文件或目录中收集排序后的 ``.raw`` 文件。
 
     Args:
-        paths: A raw file path, a directory, or a sequence of paths.
-        recursive: If ``True``, search directories recursively.
+        paths: raw 文件路径、目录路径或路径序列。
+        recursive: 为 True 时递归搜索目录。
 
     Returns:
-        Sorted raw file paths.
+        去重并排序后的 raw 文件路径。
     """
     if isinstance(paths, (str, Path)):
         candidate_paths: Iterable[str | Path] = [paths]
@@ -105,7 +95,7 @@ def infer_groupable_total_pages(
     pages_per_group: int,
     total_pages: int | None = None,
 ) -> int:
-    """Infer a valid page count that can be reshaped into complete groups."""
+    """推断可整分组的有效 page 总数。"""
     raw_path = Path(raw_path)
     if pages_per_group <= 0:
         raise ValueError("pages_per_group must be a positive integer")
@@ -143,7 +133,7 @@ def build_group_samples(
     pages_per_group: int,
     total_pages: int | None = None,
 ) -> list[RawGroupSample]:
-    """Expand raw files into group-level sample records."""
+    """把 raw 文件列表展开成分组级样本记录。"""
     samples: list[RawGroupSample] = []
     for raw_path_value in raw_paths:
         raw_path = Path(raw_path_value).resolve()
@@ -166,18 +156,78 @@ def build_group_samples(
     return samples
 
 
+def raw2frame(
+    filename: str | Path,
+    pages_per_group: int,
+    total_pages: int,
+    time_threshold: int,
+) -> np.ndarray:
+    """读取 SPAD raw 文件并返回 ``[G, 4096, P]`` 分组数组。"""
+    filename = Path(filename)
+    if not filename.is_file():
+        raise FileNotFoundError(f"raw file not found: {filename}")
+    if pages_per_group <= 0:
+        raise ValueError("pages_per_group must be a positive integer")
+    if total_pages <= 0:
+        raise ValueError("total_pages must be a positive integer")
+    if time_threshold <= 0:
+        raise ValueError("time_threshold must be a positive integer")
+    if total_pages % pages_per_group != 0:
+        raise ValueError("total_pages must be divisible by pages_per_group")
+
+    available_pages = (filename.stat().st_size // RAW_VALUE_BYTES) // NUM_PIXELS
+    if available_pages == 0:
+        return np.empty((0, NUM_PIXELS, pages_per_group), dtype=np.uint16)
+    if total_pages > available_pages:
+        raise ValueError(f"total_pages {total_pages} exceeds file pages {available_pages}")
+
+    count = int(total_pages) * NUM_PIXELS
+    flat_data = np.fromfile(filename, dtype=np.uint16, count=count)
+    if flat_data.size != count:
+        raise IOError(f"File too short: expected {count} values, got {flat_data.size}")
+
+    frames = flat_data.reshape(total_pages, 64, 64)
+    flat_frames = frames.reshape(total_pages, NUM_PIXELS)
+    flat_frames[flat_frames > time_threshold] = 0
+    num_groups = total_pages // pages_per_group
+    grouped = flat_frames.reshape(num_groups, pages_per_group, NUM_PIXELS)
+    return np.transpose(grouped, (0, 2, 1)).astype(np.uint16, copy=False)
+
+
+def n3_filter(points: np.ndarray, min_count: int) -> np.ndarray:
+    """按重复次数过滤点云行, 输出 ``[x, y, tof, count]``。"""
+    if points.size == 0:
+        return np.empty((0, 4), dtype=np.int64)
+    unique_points, counts = np.unique(points, axis=0, return_counts=True)
+    mask = counts >= min_count
+    return np.column_stack((unique_points[mask], counts[mask]))
+
+
+def max_count_maps(filtered_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """从带计数点云生成深度图和强度图。"""
+    intensity_map = np.zeros((64, 64), dtype=np.int32)
+    depth_map = np.zeros((64, 64), dtype=np.int32)
+    for x_coord, y_coord, tof_value, count in filtered_points:
+        x_idx = int(x_coord) - 1
+        y_idx = int(y_coord) - 1
+        if count > intensity_map[x_idx, y_idx]:
+            intensity_map[x_idx, y_idx] = int(count)
+            depth_map[x_idx, y_idx] = int(tof_value)
+    return depth_map, intensity_map
+
+
 def group_to_time_first_frames(
     group_tof: np.ndarray,
     *,
     normalize: bool = False,
     time_threshold: int | None = None,
 ) -> torch.Tensor:
-    """Convert a ``[4096, P]`` group to ``[P, 1, 64, 64]`` tensor."""
+    """把 ``[4096, P]`` 分组转换为 ``[P, 1, 64, 64]`` 张量。"""
     if group_tof.ndim != 2 or group_tof.shape[0] != NUM_PIXELS:
         raise ValueError("group_tof must have shape [4096, P]")
 
     pages_per_group = group_tof.shape[1]
-    # [4096, P] -> [P, 64, 64] -> [P, 1, 64, 64]
+    # 数据流: [4096, P] -> [P, 64, 64] -> [P, 1, 64, 64]
     frames = group_tof.T.reshape(pages_per_group, 64, 64)
     frames_tensor = torch.from_numpy(frames.astype(np.float32, copy=False))
     frames_tensor = frames_tensor.unsqueeze(1).contiguous()
@@ -190,15 +240,15 @@ def group_to_time_first_frames(
 
 
 def time_first_to_model_input(frames: torch.Tensor) -> torch.Tensor:
-    """Convert ``[P, B, 1, 64, 64]`` frames to ``[B, 4096, P]``.
+    """把 ``[P, B, 1, 64, 64]`` 帧序列转换为 ``[B, 4096, P]``。
 
-    ``SNN.py`` and ``SNN_new.py`` currently accept the flattened format, while
-    many SNN layers prefer the explicit time-first 5D layout.
+    ``SNN.py`` 和 ``SNN_new.py`` 当前接收扁平像素格式, DataLoader 侧则保留
+    时间维优先的 5D 形式, 因此这里做统一转换。
     """
     if frames.dim() != 5 or frames.shape[2:] != (1, 64, 64):
         raise ValueError("frames must have shape [P, B, 1, 64, 64]")
 
-    # [P, B, 1, 64, 64] -> [B, 64, 64, P] -> [B, 4096, P]
+    # 数据流: [P, B, 1, 64, 64] -> [B, 64, 64, P] -> [B, 4096, P]
     return (
         frames.squeeze(2)
         .permute(1, 2, 3, 0)
@@ -210,7 +260,7 @@ def build_point_cloud_from_group(
     group_tof: np.ndarray,
     time_threshold: int,
 ) -> np.ndarray:
-    """Build ``[N, 3]`` point cloud rows ``(x, y, tof)`` from one group."""
+    """从一个分组生成 ``[N, 3]`` 点云行 ``(x, y, tof)``。"""
     if group_tof.ndim != 2 or group_tof.shape[0] != NUM_PIXELS:
         raise ValueError("group_tof must have shape [4096, P]")
 
@@ -236,7 +286,7 @@ def build_weak_label_from_group(
     *,
     active_point: int = 1,
 ) -> torch.Tensor:
-    """Generate a weak ``[2, 64, 64]`` label from one grouped sample."""
+    """从一个分组生成弱监督 ``[2, 64, 64]`` 标签。"""
     point_cloud = build_point_cloud_from_group(group_tof, time_threshold)
     if point_cloud.size == 0:
         label = np.zeros((2, 64, 64), dtype=np.float32)
@@ -258,26 +308,23 @@ def build_weak_label_from_group(
 
 
 class SpadRawGroupDataset(Dataset):
-    """Group-level SPAD raw dataset for SNN training.
+    """面向 SNN 训练的 SPAD raw 分组数据集。
 
-    Each item contains:
+    每个样本包含:
         frames: ``[P, 1, 64, 64]``
-        label: ``[2, 64, 64]`` when ``return_label=True``
+        label: ``[2, 64, 64]``，仅当 ``return_label=True`` 时存在
 
     Args:
-        raw_paths: Raw files to read.
-        pages_per_group: Number of pages per sample group, i.e. ``P``.
-        total_pages: Optional page count per raw file. If ``None``, all
-            complete groups in each file are used.
-        time_threshold: Values greater than this threshold are set to zero by
-            ``raw2frame``. Labels also use this threshold as the valid upper
-            bound.
-        return_label: Whether to generate weak labels from each group.
-        normalize: Whether to divide input frames by ``time_threshold``.
-        shuffle_pages: Whether to randomly permute the ``P`` dimension.
-        cache_size: Number of raw files whose grouped arrays are kept in RAM.
-        transform: Optional transform applied to ``frames``.
-        label_transform: Optional transform applied to ``label``.
+        raw_paths: 需要读取的 raw 文件。
+        pages_per_group: 每个样本包含的 page 数, 即 ``P``。
+        total_pages: 每个 raw 文件使用的 page 数; 为 None 时使用所有完整分组。
+        time_threshold: 有效 ToF 上限, 大于该值的输入会被置 0。
+        return_label: 是否为每个分组生成弱标签。
+        normalize: 是否将输入除以 ``time_threshold``。
+        shuffle_pages: 是否随机打乱样本内部的 ``P`` 维。
+        cache_size: 在内存中缓存的 raw 分组数组数量。
+        transform: 作用于 ``frames`` 的可选变换。
+        label_transform: 作用于 ``label`` 的可选变换。
     """
 
     def __init__(
@@ -391,11 +438,11 @@ class SpadRawGroupDataset(Dataset):
 
 
 def spad_time_first_collate(batch: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Collate samples into a time-first SNN batch.
+    """把样本列表整理为时间维优先的 SNN batch。
 
     Returns:
-        Dict with ``frames`` shaped ``[P, B, 1, 64, 64]``. If labels are
-        present, ``label`` is shaped ``[B, 2, 64, 64]``.
+        ``frames`` 形状为 ``[P, B, 1, 64, 64]``。如果存在标签,
+        ``label`` 形状为 ``[B, 2, 64, 64]``。
     """
     if not batch:
         raise ValueError("batch must not be empty")
@@ -424,7 +471,7 @@ def make_spad_dataloader(
     seed: int = DEFAULT_SEED,
     drop_last: bool = False,
 ) -> DataLoader:
-    """Create a DataLoader whose ``frames`` batch is ``[P, B, 1, 64, 64]``."""
+    """创建输出 ``frames=[P, B, 1, 64, 64]`` 的 DataLoader。"""
     generator = torch.Generator()
     generator.manual_seed(seed)
     if pin_memory is None:
@@ -449,7 +496,7 @@ def split_indices(
     *,
     seed: int = DEFAULT_SEED,
 ) -> tuple[list[int], list[int], list[int]]:
-    """Split sample indices into train, val and test sets."""
+    """把样本索引划分为 train/val/test 三部分。"""
     if num_samples <= 0:
         raise ValueError("num_samples must be positive")
     if len(split_ratios) != 3:
@@ -499,10 +546,9 @@ def create_spad_dataloaders(
     pin_memory: bool | None = None,
     drop_last: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader, SpadRawGroupDataset]:
-    """Build train/val/test DataLoaders from raw files or directories.
+    """从 raw 文件或目录构建 train/val/test DataLoader。
 
-    The returned loaders all yield ``batch["frames"]`` with shape
-    ``[P, B, 1, 64, 64]``.
+    返回的 loader 都会产出 ``batch["frames"]``，形状为 ``[P, B, 1, 64, 64]``。
     """
     raw_paths = collect_raw_paths(paths, recursive=recursive)
     if not raw_paths:
@@ -572,7 +618,7 @@ def create_spad_dataloader(
     pin_memory: bool | None = None,
     drop_last: bool = False,
 ) -> tuple[DataLoader, SpadRawGroupDataset]:
-    """Build one DataLoader from raw files or directories."""
+    """从 raw 文件或目录构建单个 DataLoader。"""
     raw_paths = collect_raw_paths(paths, recursive=recursive)
     if not raw_paths:
         raise ValueError(f"no .raw files found in paths: {paths}")
@@ -601,7 +647,7 @@ def create_spad_dataloader(
 
 
 if __name__ == "__main__":
-    # Example:
+    # 使用示例:
     # loader, dataset = create_spad_dataloader(
     #     r"E:\path\to\raw_dir",
     #     pages_per_group=500,

@@ -1,10 +1,8 @@
-"""Unified configuration for SNN training and inference.
+"""SNN 训练与推理的统一配置。
 
-Main exports:
-    SNNConfig: Dataclass that owns data, model, loss, training and testing
-        parameters.
-    SINUSOIDAL_DEFAULT, LUT_RBF_16, LUT_SIN_16, LUT_RBF_32: Common model
-        presets.
+主要导出:
+    SNNConfig: 统一管理数据、模型、损失、训练和测试参数的 dataclass。
+    SINUSOIDAL_DEFAULT, LUT_RBF_16, LUT_SIN_16, LUT_RBF_32: 常用预设配置。
 """
 
 from __future__ import annotations
@@ -17,15 +15,13 @@ from typing import Any, Optional, Sequence
 
 import torch
 
-
-CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def _as_list(values: Sequence[str] | None) -> list[str]:
-    """Convert an optional string sequence to a JSON-friendly list."""
+    """把可选字符串序列转换为 JSON 友好的 list。"""
     if values is None:
         return []
     return [str(value) for value in values]
@@ -33,45 +29,45 @@ def _as_list(values: Sequence[str] | None) -> list[str]:
 
 @dataclass
 class SNNConfig:
-    """Global SPAD SNN configuration.
+    """SPAD SNN 的全局配置对象。
 
-    The same object is used by model construction, loss/metric construction,
-    raw data loading, checkpointing and command-line scripts.
+    同一个对象会用于模型构建、loss/metric 构建、raw 数据加载、checkpoint
+    保存和命令行脚本参数管理。
     """
 
-    # ---- Data ----
+    # ---- 数据 ----
     data_paths: list[str] | None = None
-    """Raw files or directories containing ``.raw`` files."""
+    """raw 文件路径, 或包含 ``.raw`` 文件的目录。"""
 
     pages_per_group: int = 500
-    """Number of raw pages in one training sample, i.e. ``P``."""
+    """单个训练样本包含的 raw page 数, 即 ``P``。"""
 
     total_pages: Optional[int] = None
-    """Optional page count per raw file. ``None`` means use all complete groups."""
+    """每个 raw 文件使用的 page 数; ``None`` 表示使用全部完整分组。"""
 
     time_threshold: int = 150
-    """Values larger than this ToF bin are treated as invalid and set to 0."""
+    """大于该 ToF bin 的值视为无效并置 0。"""
 
     recursive: bool = False
-    """Search data directories recursively for ``.raw`` files."""
+    """是否递归搜索数据目录中的 ``.raw`` 文件。"""
 
     return_label: bool = True
-    """Generate weak labels ``[B, 2, 64, 64]`` from grouped raw data."""
+    """是否从分组 raw 数据生成弱标签 ``[B, 2, 64, 64]``。"""
 
     normalize_input: bool = False
-    """Divide input ToF values by ``time_threshold`` in the Dataset."""
+    """是否在 Dataset 内将 ToF 输入除以 ``time_threshold``。"""
 
     shuffle_pages: bool = False
-    """Randomly permute the P dimension inside each sample during loading."""
+    """加载时是否随机打乱每个样本内部的 P 维。"""
 
     active_point: int = 1
-    """Minimum duplicate count used by the weak label point filter."""
+    """弱标签点云过滤使用的最小重复次数。"""
 
     cache_size: int = 2
-    """Number of raw files cached as grouped arrays by the Dataset."""
+    """Dataset 在内存中缓存的 raw 分组数组数量。"""
 
     split_ratios: tuple[float, float, float] = (0.7, 0.2, 0.1)
-    """Train/val/test split ratios."""
+    """train/val/test 划分比例。"""
 
     # ---- Dataloader ----
     batch_size: int = 4
@@ -80,7 +76,7 @@ class SNNConfig:
     drop_last: bool = False
     seed: int = 42
 
-    # ---- Encoding ----
+    # ---- 编码 ----
     encoding_mode: str = "sinusoidal"
     """``sinusoidal`` or ``lut``."""
 
@@ -89,9 +85,9 @@ class SNNConfig:
     lut_init: str = "sinusoidal"
     lut_max_norm: Optional[float] = None
 
-    # ---- Network ----
+    # ---- 网络 ----
     model_backend: str = "legacy"
-    """``new`` uses SNN_new.py; ``legacy`` uses SNN.py."""
+    """``new`` 使用 SNN_new.py; ``legacy`` 使用 SNN.py。"""
 
     C: int = 32
     chunk_size: int = 128
@@ -99,7 +95,7 @@ class SNNConfig:
     num_blocks: int = 3
     refine_mid: int = 8
 
-    # ---- Loss weights ----
+    # ---- 损失权重 ----
     w_gt: float = 0.3
     w_ssim: float = 0.1
     w_var: float = 1.0
@@ -108,7 +104,7 @@ class SNNConfig:
     w_lut_smooth: float = 0.01
     w_lut_norm: float = 0.005
 
-    # ---- Loss hyperparameters ----
+    # ---- 损失超参数 ----
     sigma_target: float = 4.0
     rho_target: float = 0.15
     beta_smooth: float = 5.0
@@ -116,34 +112,34 @@ class SNNConfig:
     depth_range: float = 150.0
     intensity_range: float = 1.0
 
-    # ---- Optimizer / scheduler ----
+    # ---- 优化器 / 调度器 ----
     epochs: int = 20
     lr: float = 1.0e-3
     weight_decay: float = 1.0e-4
     grad_clip: float = 1.0
     amp: bool = False
 
-    # ---- Runtime / artifacts ----
+    # ---- 运行时 / 实验产物 ----
     device: str = "auto"
-    output_dir: str = "SNN/artifacts"
+    output_dir: str = "SNN_based_method/artifacts"
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
     save_every: int = 1
 
     @property
     def t_max(self) -> int:
-        """Alias used by the model and loss code."""
+        """模型和 loss 代码使用的 ToF 上限别名。"""
         return self.time_threshold
 
     @property
     def C_enc(self) -> int:
-        """Encoded channel count before the stem layer."""
+        """stem 层之前的编码通道数。"""
         if self.encoding_mode == "lut":
             return self.embed_dim
         return 2 * self.n_freq + 1
 
     def resolved_device(self) -> torch.device:
-        """Return the configured device with ``auto`` mapped to CUDA if available."""
+        """解析配置中的设备; ``auto`` 会优先映射到可用 CUDA。"""
         if self.device == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device == "cuda" and not torch.cuda.is_available():
@@ -151,18 +147,12 @@ class SNNConfig:
         return torch.device(self.device)
 
     def build_model(self) -> torch.nn.Module:
-        """Build a ``SPADSpikeNet`` model from this config."""
+        """根据当前配置构建 ``SPADSpikeNet`` 模型。"""
         backend = self.model_backend.lower()
         if backend in {"new", "activation", "activation_based"}:
-            try:
-                from SNN.SNN_new import SPADSpikeNet
-            except ModuleNotFoundError:
-                from SNN_new import SPADSpikeNet
+            from SNN_based_method.SNN_new import SPADSpikeNet
         elif backend in {"legacy", "clock", "clock_driven"}:
-            try:
-                from SNN.SNN import SPADSpikeNet
-            except ModuleNotFoundError:
-                from SNN import SPADSpikeNet
+            from SNN_based_method.SNN import SPADSpikeNet
         else:
             raise ValueError("model_backend must be 'new' or 'legacy'")
 
@@ -179,11 +169,8 @@ class SNNConfig:
         )
 
     def build_loss(self) -> torch.nn.Module:
-        """Build the standard SNN imaging loss."""
-        try:
-            from SNN.loss import SPADImagingLoss
-        except ModuleNotFoundError:
-            from loss import SPADImagingLoss
+        """构建标准 SNN 成像损失。"""
+        from SNN_based_method.loss import SPADImagingLoss
 
         return SPADImagingLoss(
             w_gt=self.w_gt,
@@ -202,11 +189,8 @@ class SNNConfig:
         )
 
     def build_metrics(self):
-        """Build image metrics used for validation and testing."""
-        try:
-            from SNN.loss import ImageMetrics
-        except ModuleNotFoundError:
-            from loss import ImageMetrics
+        """构建验证和测试使用的图像指标。"""
+        from SNN_based_method.loss import ImageMetrics
 
         return ImageMetrics(
             depth_range=self.depth_range,
@@ -215,14 +199,11 @@ class SNNConfig:
         )
 
     def build_dataloaders(self):
-        """Build train/val/test DataLoaders from configured raw paths."""
+        """根据配置中的 raw 路径构建 train/val/test DataLoader。"""
         if not self.data_paths:
             raise ValueError("data_paths is empty; pass --data-paths or use a config JSON")
 
-        try:
-            from SNN.data import create_spad_dataloaders
-        except ModuleNotFoundError:
-            from data import create_spad_dataloaders
+        from SNN_based_method.scripts.data import create_spad_dataloaders
 
         return create_spad_dataloaders(
             self.data_paths,
@@ -244,14 +225,11 @@ class SNNConfig:
         )
 
     def build_dataloader(self, *, shuffle: bool = False):
-        """Build one DataLoader from all configured raw paths."""
+        """根据所有配置 raw 路径构建单个 DataLoader。"""
         if not self.data_paths:
             raise ValueError("data_paths is empty; pass --data-paths or use a config JSON")
 
-        try:
-            from SNN.data import create_spad_dataloader
-        except ModuleNotFoundError:
-            from data import create_spad_dataloader
+        from SNN_based_method.scripts.data import create_spad_dataloader
 
         return create_spad_dataloader(
             self.data_paths,
@@ -273,14 +251,14 @@ class SNNConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Export a JSON-serializable dictionary."""
+        """导出可 JSON 序列化的字典。"""
         data = asdict(self)
         data["data_paths"] = _as_list(self.data_paths)
         data["split_ratios"] = list(self.split_ratios)
         return data
 
     def save(self, path: str | Path) -> None:
-        """Save this config as JSON."""
+        """将当前配置保存为 JSON。"""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as file_obj:
@@ -288,7 +266,7 @@ class SNNConfig:
 
     @classmethod
     def load(cls, path: str | Path) -> "SNNConfig":
-        """Load a config from JSON."""
+        """从 JSON 文件加载配置。"""
         with Path(path).open("r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
         if "split_ratios" in data:
@@ -296,7 +274,7 @@ class SNNConfig:
         return cls(**data)
 
     def clone_with(self, **updates: Any) -> "SNNConfig":
-        """Create a new config with selected fields overridden."""
+        """创建一个覆盖指定字段的新配置。"""
         data = self.to_dict()
         data.update(updates)
         if "split_ratios" in data:
@@ -304,7 +282,7 @@ class SNNConfig:
         return SNNConfig(**data)
 
     def summary(self) -> str:
-        """Return a concise human-readable config summary."""
+        """返回适合打印的人类可读配置摘要。"""
         lines = ["SNNConfig:"]
         lines.append(f"  data_paths={self.data_paths}")
         lines.append(
@@ -323,16 +301,16 @@ class SNNConfig:
 
 
 SINUSOIDAL_DEFAULT = SNNConfig()
-"""Default sinusoidal encoding config."""
+"""默认正弦编码配置。"""
 
 LUT_RBF_16 = SNNConfig(encoding_mode="lut", embed_dim=16, lut_init="rbf")
-"""LUT encoding with 16 dimensions and RBF initialization."""
+"""16 维 LUT 编码, RBF 初始化。"""
 
 LUT_SIN_16 = SNNConfig(encoding_mode="lut", embed_dim=16, lut_init="sinusoidal")
-"""LUT encoding with 16 dimensions and sinusoidal initialization."""
+"""16 维 LUT 编码, 正弦初始化。"""
 
 LUT_RBF_32 = SNNConfig(encoding_mode="lut", embed_dim=32, lut_init="rbf")
-"""LUT encoding with 32 dimensions and RBF initialization."""
+"""32 维 LUT 编码, RBF 初始化。"""
 
 
 if __name__ == "__main__":

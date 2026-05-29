@@ -1,15 +1,14 @@
-"""正弦位置编码可视化工具.
+"""ToF 编码可视化工具。
 
 功能:
-1. 单帧 raw tof 热力图
-2. 单帧编码后 17 通道 (valid + 8对 sin/cos) 逐通道可视化
-3. 多帧累积聚合效果: 随帧数递增观察 depth / intensity 如何收敛
-4. 频率响应分析: 不同 tof 值经过编码后的频谱表征
+1. 可视化单帧 raw ToF 热力图。
+2. 逐通道查看单帧编码结果，例如 valid + 多组 sin/cos 特征。
+3. 分析多帧累积聚合时 depth / intensity 的收敛过程。
+4. 对比不同 ToF bin 经过编码后的频率响应和区分度。
 
-用法:
-    python visualize_encoding.py --data_path <txt文件路径> [--n_freq 8] [--t_max 150]
-    python visualize_encoding.py --raw_path <raw文件路径> --pages_per_group 500 \
-        --time_threshold 150 --plot_group_num 1
+用法示例:
+    python SNN_based_method/visualize_encoding.py --data_path <txt文件路径> --n_freq 8 --t_max 150
+    python SNN_based_method/visualize_encoding.py --raw_path <raw文件路径> --pages_per_group 500 --time_threshold 150 --plot_group_num 1
 """
 
 import argparse

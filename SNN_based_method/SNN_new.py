@@ -1,18 +1,20 @@
+"""SPAD 浓雾场景 SNN 成像模型（activation_based 新版后端）。
 
-"""SPAD Dense-Fog SNN Imaging Model (activation_based API)
+输入:
+    ``raw_data`` 形状为 ``[B, 4096, P]``，其中 0 表示无效或未触发 ToF。
 
-Input:  [B, 4096, P]   raw ToF timestamps (0 = invalid/untriggered)
-Output: [B, 2, 64, 64] (depth, intensity)
+输出:
+    字典形式结果，核心输出 ``output`` 形状为 ``[B, 2, 64, 64]``，
+    通道 0 为深度，通道 1 为强度。
 
-架构: 正弦位置编码 → 等宽 SpikeBlock → EchoGate → Gated Moment → 空间精修头
-使用 spikingjelly.activation_based (新版 API), 神经元 step_mode='m' 处理时间序列.
+网络结构:
+    正弦 / LUT ToF 编码 -> 等宽 SpikeBlock -> EchoGate -> Gated Moment
+    -> 空间精修头。该版本使用 ``spikingjelly.activation_based``，
+    神经元以 ``step_mode='m'`` 处理时间序列。
 """
 
-import sys
 import os
 import math
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # spikingjelly 导入前设置 CUDA_PATH, 否则 cupy backend 探测时找不到 CUDA headers
 if "CUDA_PATH" not in os.environ:
