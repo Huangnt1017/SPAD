@@ -40,9 +40,10 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from utils.point_rwkv_utils import (
-    knn_point, fps, index_points, square_distance,
+    knn_point, fps, square_distance,
     Group, Encoder, MultiScaleGrouping, PointNetFeaturePropagation
 )
+from utils.pointnet_utils import index_points_fast
 from utils.transformer_blocks import DropPath
 
 
@@ -347,8 +348,8 @@ class GraphStabilizer(nn.Module):
         """
         for t in range(self.num_iterations):
             delta_xyz = self.offset_pred(features)
-            neighbor_xyz = index_points(xyz, knn_idx)
-            neighbor_feat = index_points(features, knn_idx)
+            neighbor_xyz = index_points_fast(xyz, knn_idx)
+            neighbor_feat = index_points_fast(features, knn_idx)
             center_xyz = xyz + delta_xyz
             rel_pos = neighbor_xyz - center_xyz.unsqueeze(2)
             edge_input = torch.cat([rel_pos, neighbor_feat], dim=-1)

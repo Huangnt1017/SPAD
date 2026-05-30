@@ -28,7 +28,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.pointnet_utils import (
-    square_distance, index_points, farthest_point_sample, query_ball_point
+    square_distance,
+    farthest_point_sample_fast,
+    index_points_fast,
+    query_ball_point_fast,
 )
 
 
@@ -51,14 +54,14 @@ def sample_and_group(npoint, radius, nsample, xyz, points):
         new_xyz: [B, npoint, 3] 采样点坐标
         new_points: [B, npoint, nsample, 3+D] 归一化坐标 + 特征
     """
-    fps_idx = farthest_point_sample(xyz, npoint)         # [B, npoint]
-    new_xyz = index_points(xyz, fps_idx)                 # [B, npoint, 3]
-    idx = query_ball_point(radius, nsample, xyz, new_xyz)  # [B, npoint, nsample]
-    grouped_xyz = index_points(xyz, idx)                 # [B, npoint, nsample, 3]
+    fps_idx = farthest_point_sample_fast(xyz, npoint)    # [B, npoint]
+    new_xyz = index_points_fast(xyz, fps_idx)            # [B, npoint, 3]
+    idx = query_ball_point_fast(radius, nsample, xyz, new_xyz)  # [B, npoint, nsample]
+    grouped_xyz = index_points_fast(xyz, idx)            # [B, npoint, nsample, 3]
     grouped_xyz_norm = grouped_xyz - new_xyz[:, :, None, :]  # 中心归一化
 
     if points is not None:
-        grouped_points = index_points(points, idx)       # [B, npoint, nsample, D]
+        grouped_points = index_points_fast(points, idx)  # [B, npoint, nsample, D]
         new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
     else:
         new_points = grouped_xyz_norm
@@ -182,18 +185,19 @@ class PointNetSetAbstractionMsg(nn.Module):
         S = self.npoint
 
         # FPS 采样关键点
-        new_xyz = index_points(xyz, farthest_point_sample(xyz, self.npoint))  # [B, S, 3]
+        fps_idx = farthest_point_sample_fast(xyz, self.npoint)
+        new_xyz = index_points_fast(xyz, fps_idx)  # [B, S, 3]
 
         new_points_list = []
         for i, radius in enumerate(self.radius_list):
             nsample = self.nsample_list[i]
             # Ball query
-            idx = query_ball_point(radius, nsample, xyz, new_xyz)
-            grouped_xyz = index_points(xyz, idx)            # [B, S, K, 3]
+            idx = query_ball_point_fast(radius, nsample, xyz, new_xyz)
+            grouped_xyz = index_points_fast(xyz, idx)       # [B, S, K, 3]
             grouped_xyz_norm = grouped_xyz - new_xyz[:, :, None, :]  # 中心归一化
 
             if points is not None:
-                grouped_points = index_points(points, idx)   # [B, S, K, D]
+                grouped_points = index_points_fast(points, idx)  # [B, S, K, D]
                 grouped_features = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
             else:
                 grouped_features = grouped_xyz_norm
@@ -260,7 +264,7 @@ class PointNetFeaturePropagation(nn.Module):
             norm = torch.sum(dists_recip, dim=-1, keepdim=True)
             weight = dists_recip / norm             # [B, N1, 3]
             # 收集三个近邻的特征
-            grouped_points = index_points(points2, idx)  # [B, N1, 3, D2]
+            grouped_points = index_points_fast(points2, idx)  # [B, N1, 3, D2]
             interpolated_points = torch.sum(
                 grouped_points * weight.unsqueeze(-1), dim=2
             )  # [B, N1, D2]

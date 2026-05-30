@@ -64,9 +64,9 @@ from utils.detr3_util import (
 )
 from utils.pointnet_utils import (
     square_distance,
-    index_points,
-    farthest_point_sample,
-    query_ball_point,
+    farthest_point_sample_fast,
+    index_points_fast,
+    query_ball_point_fast,
 )
 
 
@@ -79,13 +79,13 @@ def sample_and_group(
     xyz: torch.Tensor, points: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """FPS + 球查询 + 分组 + 坐标归一化 (标准 (B,N,C) 形状)。"""
-    fps_idx = farthest_point_sample(xyz, npoint)
-    new_xyz = index_points(xyz, fps_idx)
-    idx = query_ball_point(radius, nsample, xyz, new_xyz)
-    grouped_xyz = index_points(xyz, idx)
+    fps_idx = farthest_point_sample_fast(xyz, npoint)
+    new_xyz = index_points_fast(xyz, fps_idx)
+    idx = query_ball_point_fast(radius, nsample, xyz, new_xyz)
+    grouped_xyz = index_points_fast(xyz, idx)
     grouped_xyz_norm = grouped_xyz - new_xyz[:, :, None, :]
     if points is not None:
-        grouped_points = index_points(points, idx)
+        grouped_points = index_points_fast(points, idx)
         new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
     else:
         new_points = grouped_xyz_norm
@@ -169,15 +169,15 @@ class PointnetSAModuleVotes(nn.Module):
         # FPS
         xyz_flipped = xyz.transpose(1, 2).contiguous()  # (B, 3, N)
         if inds is None:
-            inds = farthest_point_sample(xyz, self.npoint)
+            inds = farthest_point_sample_fast(xyz, self.npoint)
         else:
             assert inds.shape[1] == self.npoint
-        new_xyz = index_points(xyz, inds)  # (B, npoint, 3)
+        new_xyz = index_points_fast(xyz, inds)  # (B, npoint, 3)
 
         # 球查询分组
         # grouped_xyz: (B, npoint, nsample, 3), grouped_features: (B, npoint, nsample, C)
-        idx = query_ball_point(self.radius, self.nsample, xyz, new_xyz)
-        grouped_xyz = index_points(xyz, idx)  # (B, npoint, nsample, 3)
+        idx = query_ball_point_fast(self.radius, self.nsample, xyz, new_xyz)
+        grouped_xyz = index_points_fast(xyz, idx)  # (B, npoint, nsample, 3)
         grouped_xyz_norm = grouped_xyz - new_xyz[:, :, None, :]  # 相对坐标
 
         if self.normalize_xyz:
@@ -185,7 +185,7 @@ class PointnetSAModuleVotes(nn.Module):
 
         if features is not None:
             features_t = features.transpose(1, 2).contiguous()  # (B, N, C)
-            grouped_features = index_points(features_t, idx)  # (B, npoint, nsample, C)
+            grouped_features = index_points_fast(features_t, idx)  # (B, npoint, nsample, C)
             if self.use_xyz:
                 new_points = torch.cat([grouped_xyz_norm, grouped_features], dim=-1)  # (B, npoint, nsample, 3+C)
             else:
@@ -912,13 +912,11 @@ class Model3DETR(nn.Module):
         if xyz_for_fps.dim() == 3 and xyz_for_fps.shape[0] > xyz_for_fps.shape[1]:
             xyz_for_fps = xyz_for_fps.permute(1, 0, 2).contiguous()
 
-        query_inds = farthest_point_sample(xyz_for_fps, self.num_queries)
+        query_inds = farthest_point_sample_fast(xyz_for_fps, self.num_queries)
         query_inds = query_inds.long()
 
         # gather query xyz (official style)
-        query_xyz = torch.stack([
-            torch.gather(xyz_for_fps[..., x], 1, query_inds) for x in range(3)
-        ], dim=-1)  # (B, n_q, 3)
+        query_xyz = index_points_fast(xyz_for_fps, query_inds)  # (B, n_q, 3)
 
         pos_embed = self.pos_embedding(query_xyz, input_range=point_cloud_dims)  # (B, C, n_q)
         query_embed = self.query_projection(pos_embed)  # (B, C, n_q)

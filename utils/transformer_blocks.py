@@ -25,8 +25,8 @@ import torch
 import torch.nn as nn
 
 from utils.pointnet_utils import (
-    farthest_point_sample,
-    index_points,
+    farthest_point_sample_fast,
+    index_points_fast,
     knn_point,
 )
 
@@ -186,10 +186,10 @@ class PatchGroup(nn.Module):
             neighborhood: (B, G, K, 3) — 中心归一化后的局部 patches
             center: (B, G, 3) — FPS 采样的中心点坐标
         """
-        center_idx = farthest_point_sample(xyz, self.num_group)  # (B, G)
-        center = index_points(xyz, center_idx)                    # (B, G, 3)
+        center_idx = farthest_point_sample_fast(xyz, self.num_group)  # (B, G)
+        center = index_points_fast(xyz, center_idx)                    # (B, G, 3)
         idx = knn_point(self.group_size, xyz, center)             # (B, G, K)
-        neighborhood = index_points(xyz, idx)                     # (B, G, K, 3)
+        neighborhood = index_points_fast(xyz, idx)                # (B, G, K, 3)
         neighborhood = neighborhood - center.unsqueeze(2)         # 中心归一化
         return neighborhood, center
 

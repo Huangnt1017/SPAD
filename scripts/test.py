@@ -82,6 +82,8 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		return "pointmae"
 	if "pointrwkv" in name or "point_rwkv" in name:
 		return "pointrwkv"
+	if "pointmlpelite" in name or "pointmlp_elite" in name:
+		return "pointmlpelite"
 	if "pointmlp" in name:
 		return "pointmlp"
 	if "pointnext" in name or "pointnxt" in name:
@@ -699,7 +701,7 @@ def build_parser() -> argparse.ArgumentParser:
 		choices=[
 			"auto", "dgcnn", "pointnet", "pointnet2", "pointnet2msg",
 			"pointtransformer", "pointtransv2", "pointtransv3",
-			"pointmlp", "pointbert", "pointmae", "pointrwkv", "spt", "upp",
+			"pointmlp", "pointmlpelite", "pointbert", "pointmae", "pointrwkv", "spt", "upp",
 		],
 		help="Backbone model",
 	)

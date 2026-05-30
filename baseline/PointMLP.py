@@ -32,9 +32,6 @@ or
 
 import os
 import sys
-import math
-from typing import List, Tuple, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,9 +41,79 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 
-from utils.pointnet_utils import (
-    square_distance, index_points, knn_point, farthest_point_sample
-)
+from utils.pointnet_utils import index_points, knn_point, farthest_point_sample
+
+try:
+    from pointnet2_ops import pointnet2_utils as _pointnet2_utils
+except Exception:
+    _pointnet2_utils = None
+
+
+def _use_pointnet2_ops(tensor: torch.Tensor) -> bool:
+    """仅在官方 CUDA 扩展可用且张量在 GPU 上时使用 pointnet2_ops。"""
+    return _pointnet2_utils is not None and tensor.is_cuda and tensor.dtype == torch.float32
+
+
+@torch.no_grad()
+def _strided_sample_indices(batch_size: int, num_points: int, npoint: int,
+                            device: torch.device) -> torch.Tensor:
+    """固定步长采样中心点，适合未安装 CUDA FPS 扩展时的确定性评估。"""
+    if npoint >= num_points:
+        return torch.arange(num_points, device=device, dtype=torch.long).view(1, -1).expand(batch_size, -1)
+    idx = torch.linspace(0, num_points - 1, npoint, device=device).round().long()
+    return idx.view(1, -1).expand(batch_size, -1).contiguous()
+
+
+@torch.no_grad()
+def _random_sample_indices(batch_size: int, num_points: int, npoint: int,
+                           device: torch.device) -> torch.Tensor:
+    """随机无放回采样中心点，避免纯 Python FPS 循环成为训练瓶颈。"""
+    if npoint >= num_points:
+        return torch.arange(num_points, device=device, dtype=torch.long).view(1, -1).expand(batch_size, -1)
+    scores = torch.rand(batch_size, num_points, device=device)
+    return scores.topk(npoint, dim=1, largest=False, sorted=False).indices.long()
+
+
+@torch.no_grad()
+def _sample_center_indices(xyz: torch.Tensor, npoint: int, sample_mode: str,
+                           training: bool) -> torch.Tensor:
+    """采样中心点索引：官方 CUDA FPS 优先，缺失时提供快速 fallback。"""
+    xyz = xyz.contiguous()
+    batch_size, num_points, _ = xyz.shape
+    npoint = min(npoint, num_points)
+    mode = sample_mode.lower()
+
+    if mode == "auto":
+        if _use_pointnet2_ops(xyz):
+            mode = "fps"
+        else:
+            mode = "random" if training else "stride"
+
+    if mode in {"fps", "farthest"}:
+        if _use_pointnet2_ops(xyz):
+            return _pointnet2_utils.furthest_point_sample(xyz, npoint).long()
+        return farthest_point_sample(xyz, npoint).long()
+
+    if mode == "random":
+        return _random_sample_indices(batch_size, num_points, npoint, xyz.device)
+
+    if mode in {"stride", "strided"}:
+        return _strided_sample_indices(batch_size, num_points, npoint, xyz.device)
+
+    raise ValueError(f"Unknown PointMLP sample_mode: {sample_mode}")
+
+
+def _index_points_fast(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """按索引收集点；GPU 上优先使用 pointnet2_ops 的 gather/group CUDA kernel。"""
+    if _use_pointnet2_ops(points) and points.dim() == 3 and idx.dim() in (2, 3):
+        features = points.transpose(1, 2).contiguous()
+        idx_int = idx.int().contiguous()
+        if idx.dim() == 2:
+            gathered = _pointnet2_utils.gather_operation(features, idx_int)
+            return gathered.transpose(1, 2).contiguous()
+        grouped = _pointnet2_utils.grouping_operation(features, idx_int)
+        return grouped.permute(0, 2, 3, 1).contiguous()
+    return index_points(points, idx)
 
 
 # ============================================================================
@@ -80,15 +147,17 @@ class LocalGrouper(nn.Module):
 
     用 FPS 采样关键点 → KNN 获取邻居 → 可选归一化 (center/anchor) → 仿射变换。
 
-    与官方实现一致，使用 xyz 坐标做 FPS 和 KNN，
-    group 后拼接特征和坐标 (use_xyz=True时)。
+    与官方实现一致，使用 xyz 坐标做 FPS 和 KNN。若安装了官方
+    pointnet2_ops 扩展，FPS 和 gather/group 会走 CUDA kernel。
     """
     def __init__(self, channel: int, groups: int, kneighbors: int,
-                 use_xyz: bool = True, normalize: str = "center"):
+                 use_xyz: bool = True, normalize: str = "center",
+                 sample_mode: str = "auto"):
         super().__init__()
         self.groups = groups
         self.kneighbors = kneighbors
         self.use_xyz = use_xyz
+        self.sample_mode = sample_mode
         self.normalize = normalize.lower() if normalize else None
         if self.normalize not in ["center", "anchor"]:
             self.normalize = None
@@ -107,20 +176,21 @@ class LocalGrouper(nn.Module):
             new_points: (B, G, K, C') — 分组后特征 (含归一化坐标)
         """
         B, N, C = xyz.shape
-        S = self.groups
+        S = min(self.groups, N)
 
-        # FPS 采样
-        fps_idx = farthest_point_sample(xyz, self.groups).long()
-        new_xyz = index_points(xyz, fps_idx)
-        new_points = index_points(points, fps_idx)
+        # 官方 PointMLP 使用 pointnet2_ops CUDA FPS；缺失扩展时 auto 走快速采样。
+        fps_idx = _sample_center_indices(xyz, S, self.sample_mode, self.training)
+        new_xyz = _index_points_fast(xyz, fps_idx)
+        new_points = _index_points_fast(points, fps_idx)
 
         # KNN
         idx = knn_point(self.kneighbors, xyz, new_xyz)
-        grouped_xyz = index_points(xyz, idx)
-        grouped_points = index_points(points, idx)
+        k_actual = idx.shape[-1]
+        grouped_points = _index_points_fast(points, idx)
 
         # 是否拼接坐标
         if self.use_xyz:
+            grouped_xyz = _index_points_fast(xyz, idx)
             grouped_points = torch.cat([grouped_points, grouped_xyz], dim=-1)
 
         # 归一化 + 仿射变换
@@ -130,14 +200,16 @@ class LocalGrouper(nn.Module):
             elif self.normalize == "anchor":
                 mean = torch.cat([new_points, new_xyz], dim=-1) if self.use_xyz else new_points
                 mean = mean.unsqueeze(dim=-2)
-            std = torch.std((grouped_points - mean).reshape(B, -1), dim=-1,
+            grouped_points = grouped_points - mean
+            std = torch.std(grouped_points.reshape(B, -1), dim=-1,
                             keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
-            grouped_points = (grouped_points - mean) / (std + 1e-5)
+            grouped_points = grouped_points / (std + 1e-5)
             grouped_points = self.affine_alpha * grouped_points + self.affine_beta
 
         # 拼接中心特征 (广播到每个邻居)
+        center_points = new_points.view(B, S, 1, -1).expand(-1, -1, k_actual, -1)
         new_points = torch.cat(
-            [grouped_points, new_points.view(B, S, 1, -1).repeat(1, 1, self.kneighbors, 1)],
+            [grouped_points, center_points],
             dim=-1
         )
         return new_xyz, new_points
@@ -279,6 +351,7 @@ class PointMLPModel(nn.Module):
                  embed_dim: int = 64, groups: int = 1, res_expansion: float = 1.0,
                  activation: str = "relu", bias: bool = True,
                  use_xyz: bool = True, normalize: str = "center",
+                 sample_mode: str = "auto",
                  dim_expansion: tuple = (2, 2, 2, 2),
                  pre_blocks: tuple = (2, 2, 2, 2),
                  pos_blocks: tuple = (2, 2, 2, 2),
@@ -289,6 +362,8 @@ class PointMLPModel(nn.Module):
         self.class_num = class_num
         self.points = points
         self.embedding = ConvBNReLU1D(3, embed_dim, bias=bias, activation=activation)
+        if not (len(pre_blocks) == len(k_neighbors) == len(reducers) == len(pos_blocks) == len(dim_expansion)):
+            raise ValueError("pre_blocks, pos_blocks, k_neighbors, reducers, dim_expansion must have the same length")
 
         self.local_grouper_list = nn.ModuleList()
         self.pre_blocks_list = nn.ModuleList()
@@ -305,8 +380,10 @@ class PointMLPModel(nn.Module):
             reduce = reducers[i]
             anchor_points = anchor_points // reduce
 
-            local_grouper = LocalGrouper(last_channel, anchor_points, kneighbor,
-                                          use_xyz, normalize)
+            local_grouper = LocalGrouper(
+                last_channel, anchor_points, kneighbor,
+                use_xyz=use_xyz, normalize=normalize, sample_mode=sample_mode,
+            )
             self.local_grouper_list.append(local_grouper)
 
             pre_block_module = PreExtraction(
@@ -395,6 +472,7 @@ class PointMLPClassification(nn.Module):
             config = dict(
                 embed_dim=64, groups=1, res_expansion=1.0,
                 activation="relu", bias=False, use_xyz=False, normalize="anchor",
+                sample_mode="auto",
                 dim_expansion=(2, 2, 2, 2), pre_blocks=(2, 2, 2, 2),
                 pos_blocks=(2, 2, 2, 2), k_neighbors=(24, 24, 24, 24),
                 reducers=(2, 2, 2, 2),
@@ -403,6 +481,7 @@ class PointMLPClassification(nn.Module):
             config = dict(
                 embed_dim=32, groups=1, res_expansion=0.25,
                 activation="relu", bias=False, use_xyz=False, normalize="anchor",
+                sample_mode="auto",
                 dim_expansion=(2, 2, 2, 1), pre_blocks=(1, 1, 2, 1),
                 pos_blocks=(1, 1, 2, 1), k_neighbors=(24, 24, 24, 24),
                 reducers=(2, 2, 2, 2),

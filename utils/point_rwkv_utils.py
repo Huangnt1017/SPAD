@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.pointnet_utils import (
-    square_distance, knn_point, fps, index_points, fps_points
+    square_distance, knn_point, fps, index_points, index_points_fast, fps_points
 )
 from utils.transformer_blocks import PatchGroup, PatchEncoder
 
@@ -106,7 +106,7 @@ class PointNetFeaturePropagation(nn.Module):
             norm = torch.sum(dist_recip, dim=2, keepdim=True)
             weight = dist_recip / norm
             interpolated_points = torch.sum(
-                index_points(points2, idx) * weight.unsqueeze(-1), dim=2
+                index_points_fast(points2, idx) * weight.unsqueeze(-1), dim=2
             )
 
         new_points = interpolated_points if points1 is None else torch.cat([points1, interpolated_points], dim=-1)

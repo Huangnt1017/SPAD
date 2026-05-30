@@ -54,6 +54,14 @@ def set_seed(seed: int) -> None:
 	torch.backends.cudnn.benchmark = False
 
 
+def configure_torch_runtime(enable_tf32: bool) -> None:
+	"""配置 CUDA 数值后端，默认允许 TF32 提升 Ampere/Ada GPU 训练吞吐。"""
+	if not torch.cuda.is_available():
+		return
+	torch.backends.cuda.matmul.allow_tf32 = bool(enable_tf32)
+	torch.backends.cudnn.allow_tf32 = bool(enable_tf32)
+
+
 def resolve_path(path_str: str, base_dir: Path) -> Path:
 	"""解析路径为绝对路径。
 
@@ -118,7 +126,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/spt/3detr/pointrwkv/pointbert/pointmae/upp。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointmlpelite/spt/3detr/pointrwkv/pointbert/pointmae/upp。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -151,6 +159,10 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 	if name == "pointmlp":
 		module = load_module_from_file(baseline_dir / "PointMLP.py", "baseline_pointmlp")
 		return module.PointMLPClassification(num_classes=num_classes)
+
+	if name == "pointmlpelite":
+		module = load_module_from_file(baseline_dir / "PointMLP.py", "baseline_pointmlp")
+		return module.PointMLPClassification(num_classes=num_classes, variant="pointmlpelite")
 
 	if name == "spt":
 		module = load_module_from_file(baseline_dir / "SPT.py", "baseline_spt")
@@ -296,6 +308,8 @@ def run_epoch(
 	epoch: int,
 	phase: str,
 	optimizer: Optional[optim.Optimizer] = None,
+	scaler: Optional[torch.amp.GradScaler] = None,
+	use_amp: bool = False,
 ) -> Dict[str, float]:
 	"""执行单个 epoch 的训练或验证。
 
@@ -313,6 +327,7 @@ def run_epoch(
 	"""
 	is_train = optimizer is not None
 	model.train(is_train)
+	amp_enabled = bool(use_amp and device.type == "cuda")
 
 	# 性能优化: 累加器保留在 device 上 (GPU tensor), 避免每个 batch 多次 .item() 触发
 	# CPU-GPU 同步。仅样本计数 (total_samples / box_metric_samples) 是从 Python int
@@ -390,22 +405,30 @@ def run_epoch(
 
 			# 模型前向只吃点云，输出里会同时包含分类 logits 和 3D box 预测。
 			inputs = prepare_model_inputs(points)
-			model_outputs = model(inputs)
-			logits, box_preds = split_cls_and_box_predictions(model_outputs)
+			with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+				model_outputs = model(inputs)
+				logits, box_preds = split_cls_and_box_predictions(model_outputs)
 
-			# 多任务损失内部会分别计算分类损失、box L1 损失和 IoU 损失，并汇总成 total_loss。
-			loss_dict = criterion(
-				model_outputs=model_outputs,
-				cls_targets=labels,
-				box_targets=box_targets,
-			)
+				# 多任务损失内部会分别计算分类损失、box L1 损失和 IoU 损失，并汇总成 total_loss。
+				loss_dict = criterion(
+					model_outputs=model_outputs,
+					cls_targets=labels,
+					box_targets=box_targets,
+				)
 			loss = loss_dict["total_loss"]
 
 			if is_train:
 				# 训练阶段才反向传播；验证阶段只做前向统计，不更新参数。
 				optimizer.zero_grad(set_to_none=True)
-				loss.backward()
-				optimizer.step()
+				if amp_enabled:
+					if scaler is None:
+						raise ValueError("AMP training requires a GradScaler.")
+					scaler.scale(loss).backward()
+					scaler.step(optimizer)
+					scaler.update()
+				else:
+					loss.backward()
+					optimizer.step()
 
 			batch_size = labels.size(0)
 			# 所有指标都按样本数加权累计，最后再除以总样本数，得到 epoch 级平均值。
@@ -488,6 +511,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		raise FileNotFoundError(f"Data root not found: {data_root}")
 
 	set_seed(args.seed)
+	configure_torch_runtime(args.tf32)
 
 	if args.device == "auto":
 		device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -530,6 +554,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		lr=args.lr, weight_decay=args.weight_decay,
 	)
 	scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+	use_amp = bool(args.amp and device.type == "cuda")
+	scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
 	save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -542,6 +568,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("split train/val/test = %d / %d / %d", len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset))
 	logger.info("label_mode=%s", args.label_mode)
 	logger.info("augment_train=%s augment_eval=%s", args.augment_train, args.augment_eval)
+	logger.info("amp=%s tf32=%s", use_amp, args.tf32)
 	logger.info("args=%s", json.dumps(vars(args), ensure_ascii=False))
 
 	start_epoch = 1
@@ -573,6 +600,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			epoch=epoch,
 			phase="Train",
 			optimizer=optimizer,
+			scaler=scaler,
+			use_amp=use_amp,
 		)
 
 		val_metrics = run_epoch(
@@ -583,6 +612,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			epoch=epoch,
 			phase="Val",
 			optimizer=None,
+			scaler=None,
+			use_amp=use_amp,
 		)
 
 		scheduler.step()
@@ -669,7 +700,8 @@ def build_parser() -> argparse.ArgumentParser:
 			"pointtransformer",
 			"pointtransv2",
 			"pointtransv3",
-			"pointmlp",
+			"pointmlp", 
+			"pointmlpelite",
 			"spt",
 			"upp",
 			"graph_residual",
@@ -697,14 +729,18 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--box-l1-weight", type=float, default=1.0, help="3D box SmoothL1 loss weight")
 	parser.add_argument("--box-iou-weight", type=float, default=1.0, help="3D box IoU loss weight")
 	parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for classification loss")
+	parser.add_argument("--amp", dest="amp", action="store_true", help="Enable CUDA automatic mixed precision")
+	parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA automatic mixed precision")
+	parser.add_argument("--tf32", dest="tf32", action="store_true", help="Allow TF32 matmul/cuDNN on Ampere/Ada GPUs")
+	parser.add_argument("--no-tf32", dest="tf32", action="store_false", help="Disable TF32 matmul/cuDNN")
 	parser.add_argument("--augment-train", dest="augment_train", action="store_true", help="Apply augmentation in train dataset")
 	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="Disable train dataset augmentation")
 	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in val/test dataset")
 	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable val/test dataset augmentation")
-	parser.set_defaults(augment_train=True, augment_eval=True)
+	parser.set_defaults(augment_train=True, augment_eval=True, amp=False, tf32=False)
 	return parser
-
-
+#CUDA AMP 会在部分算子里使用半精度，通常是 FP16，比如：Conv / Linear / MatMul / 部分归一化相关算子，同时用 GradScaler 避免 FP16 梯度下溢。它的目标是加速和省显存，不保证和纯 FP32 完全一致。
+#TF32 是 NVIDIA Ampere/Ada GPU 上对 FP32 matmul/conv 的加速格式。它仍然用 FP32 存储和 FP32 输出，但乘法内部精度降低，mantissa 比标准 FP32 少。
 def main(argv=None) -> None:
 	"""训练脚本入口函数。"""
 	parser = build_parser()
@@ -715,11 +751,11 @@ def main(argv=None) -> None:
 if __name__ == "__main__":
 	# 用法示例 (PowerShell, conda env 路径见 memory/reference_train_env.md):
 	#   $env:PYTHONPATH = "D:\PYproject\SPAD"  # 不需要输入到命令行（如果是vscode打开的
-	#   & "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\train.py" --model pointnet --batch-size 32 --epochs 100
+	#   & "D:\anaconda3\envs\torchnew\python.exe" "D:\PYproject\SPAD\scripts\train.py" --model pointmlp --batch-size 32 --epochs 100
 	#
 	# 常用参数 (完整列表见 build_parser):
 	#   --model <name>          模型, 支持: dgcnn / pointnet / pointnet2 / pointnet2msg /
-	#                           pointtransformer / pointtransv2 / pointtransv3 / pointmlp /
+	#                           pointtransformer / pointtransv2 / pointtransv3 / pointmlp / pointmlpelite /
 	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr
 	#   --batch-size 32         batch 大小
 	#   --epochs 100            训练轮数
@@ -727,7 +763,9 @@ if __name__ == "__main__":
 	#   --lr 1e-3 --min-lr 1e-5 余弦退火上下界
 	#   --weight-decay 1e-4     AdamW 权重衰减
 	#   --label-mode raw        raw=用文件夹/文件名标签; generated=用增强生成的标签
-	#   --no-augment-eval       验证/测试时关增强 (默认开)
+	#   --amp / --no-amp        CUDA 混合精度 (默认开)
+	#   --tf32 / --no-tf32      Ampere/Ada GPU TF32 加速 (默认开)
+	#   --augment-eval          验证/测试时开启增强 (默认关)
 	#   --num-workers 0         DataLoader worker 数 (>0 时自动启用 persistent_workers)
 	#
 	# 输出:
@@ -735,5 +773,3 @@ if __name__ == "__main__":
 	#   checkpoints/<model>_<timestamp>_best.pth  val 最优 ckpt
 	#   checkpoints/<model>_<timestamp>_last.pth  最后一个 epoch ckpt
 	main()
-
-

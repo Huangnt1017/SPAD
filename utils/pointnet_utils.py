@@ -16,6 +16,11 @@ import torch.nn.functional as F
 import math
 
 try:
+    from pointnet2_ops import pointnet2_utils as _pointnet2_utils
+except Exception:
+    _pointnet2_utils = None
+
+try:
     from spikingjelly1.clock_driven.neuron import (
         MultiStepLIFNode, MultiStepEIFNode,
         MultiStepParametricLIFNode, MultiStepIFNode
@@ -39,6 +44,16 @@ def square_distance(src, dst):
     dist += torch.sum(src ** 2, -1).view(B, N, 1)
     dist += torch.sum(dst ** 2, -1).view(B, 1, M)
     return dist
+
+
+def pointnet2_ops_available():
+    """返回官方 pointnet2_ops CUDA 扩展是否已成功导入。"""
+    return _pointnet2_utils is not None
+
+
+def _use_pointnet2_ops(tensor):
+    """仅对 CUDA float32 张量启用官方扩展，避免 CPU/AMP 半精度路径出错。"""
+    return _pointnet2_utils is not None and tensor.is_cuda and tensor.dtype == torch.float32
 
 
 def index_points(points, idx):
@@ -68,6 +83,54 @@ def farthest_point_sample(xyz, npoint):
         distance[mask] = dist[mask]
         farthest = torch.max(distance, -1)[1]
     return centroids
+
+
+@torch.no_grad()
+def farthest_point_sample_fast(xyz, npoint):
+    """FPS 快速路径：CUDA 上优先使用 pointnet2_ops，失败时回退纯 PyTorch。"""
+    if xyz.dim() != 3:
+        return farthest_point_sample(xyz, npoint)
+    npoint = min(int(npoint), int(xyz.shape[1]))
+    if npoint <= 0:
+        return torch.empty(xyz.shape[0], 0, dtype=torch.long, device=xyz.device)
+    if _use_pointnet2_ops(xyz) and xyz.shape[-1] == 3:
+        return _pointnet2_utils.furthest_point_sample(xyz.contiguous(), npoint).long()
+    return farthest_point_sample(xyz, npoint).long()
+
+
+def index_points_fast(points, idx):
+    """按索引收集点/特征；CUDA 上优先使用 pointnet2_ops gather/grouping kernel。"""
+    if _use_pointnet2_ops(points) and points.dim() == 3 and idx.dim() in (2, 3):
+        features = points.transpose(1, 2).contiguous()
+        idx_int = idx.int().contiguous()
+        if idx.dim() == 2:
+            gathered = _pointnet2_utils.gather_operation(features, idx_int)
+            return gathered.transpose(1, 2).contiguous()
+        grouped = _pointnet2_utils.grouping_operation(features, idx_int)
+        return grouped.permute(0, 2, 3, 1).contiguous()
+    return index_points(points, idx)
+
+
+@torch.no_grad()
+def query_ball_point_fast(radius, nsample, xyz, new_xyz):
+    """Ball Query 快速路径：CUDA 上优先使用 pointnet2_ops。"""
+    if (
+        _use_pointnet2_ops(xyz)
+        and new_xyz.is_cuda
+        and new_xyz.dtype == torch.float32
+        and xyz.dim() == 3
+        and new_xyz.dim() == 3
+        and xyz.shape[-1] == 3
+        and new_xyz.shape[-1] == 3
+    ):
+        idx = _pointnet2_utils.ball_query(
+            float(radius),
+            int(nsample),
+            xyz.contiguous(),
+            new_xyz.contiguous(),
+        )
+        return idx.long()
+    return query_ball_point(radius, nsample, xyz, new_xyz).long()
 
 
 # Alias for compatibility

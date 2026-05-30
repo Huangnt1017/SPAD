@@ -65,9 +65,9 @@ from utils.transformer_blocks import (
 )
 from utils.pointnet_utils import (
     square_distance,
-    index_points,
-    farthest_point_sample,
     knn_point,
+    farthest_point_sample_fast,
+    index_points_fast,
 )
 
 
@@ -201,7 +201,7 @@ def feature_propagate(xyz1: torch.Tensor, xyz2: torch.Tensor,
     weight = (dist_recip / norm).unsqueeze(-1)  # (B, N, K, 1)
 
     # (B, N, K, C) 邻居特征 × 权重 → (B, N, C)
-    interpolated = (index_points(points2, idx) * weight).sum(dim=2)
+    interpolated = (index_points_fast(points2, idx) * weight).sum(dim=2)
     if points1 is None:
         return interpolated
     # 与官方 propagate 一致: 上层特征 + 0.3 × 插值
@@ -395,9 +395,9 @@ class UPPBlock(nn.Module):
         center2 = propagation["center2"]        # (B, G2, 3)
 
         # 取 K1 个邻居特征: patch_tokens (B,G,C) gather → (B, G2, K1, C)
-        x_neighborhoods = index_points(patch_tokens, level1_idx)
+        x_neighborhoods = index_points_fast(patch_tokens, level1_idx)
         # 取 G2 个二级中心自身的特征: (B, G2, C)
-        x_centers = index_points(patch_tokens, level2_idx)
+        x_centers = index_points_fast(patch_tokens, level2_idx)
 
         # 对每个二级中心邻域内做 max-pool + BN, 再与中心自身按 0.3 残差融合 (对应官方写法)
         pooled_centers = upp_pooling(x_neighborhoods, transform=self.bnorm) + 0.3 * x_centers
@@ -562,11 +562,11 @@ class _PointNetSAForUPP(nn.Module):
         """
         B, N, _ = xyz.shape
         # FPS 中心 + KNN 索引 (复用 SPAD 工具)
-        center_idx = farthest_point_sample(xyz, self.num_group)        # (B, G)
-        center = index_points(xyz, center_idx)                          # (B, G, 3)
+        center_idx = farthest_point_sample_fast(xyz, self.num_group)   # (B, G)
+        center = index_points_fast(xyz, center_idx)                    # (B, G, 3)
         idx = knn_point(self.group_size, xyz, center)                   # (B, G, K)
         # 邻域特征: (B, N, C) gather → (B, G, K, C)
-        grouped = index_points(point_feat, idx)
+        grouped = index_points_fast(point_feat, idx)
         # SharedMLP 期望 (B, C, K, G) → (B, out, K, G)
         grouped = grouped.permute(0, 3, 2, 1).contiguous()
         feat = self.mlp(grouped)
@@ -616,7 +616,7 @@ class _PointNetFPForUPP(nn.Module):
             dist_recip = 1.0 / (dists + 1e-4)  # 注意: 官方在 FP 里用 1e-4, 与 propagate 不同
             norm = dist_recip.sum(dim=-1, keepdim=True)
             weight = (dist_recip / norm).unsqueeze(-1)  # (B, N, K, 1)
-            interpolated = (index_points(points2, idx) * weight).sum(dim=2)
+            interpolated = (index_points_fast(points2, idx) * weight).sum(dim=2)
 
         if points1 is not None:
             new = torch.cat([points1, interpolated], dim=-1)
@@ -926,8 +926,8 @@ class UPPClassification(nn.Module):
         n_group2 = self.num_group // 2
 
         # level-2 FPS: G → G2
-        level2_idx = farthest_point_sample(center, n_group2)             # (B, G2)
-        center2 = index_points(center, level2_idx)                        # (B, G2, 3)
+        level2_idx = farthest_point_sample_fast(center, n_group2)        # (B, G2)
+        center2 = index_points_fast(center, level2_idx)                  # (B, G2, 3)
         # level-1 KNN: center2 → 在 center 中找 K1=8 邻居
         level1_idx = knn_point(8, center, center2)                        # (B, G2, K1)
 
@@ -1025,12 +1025,12 @@ class UPPClassification(nn.Module):
 
         # 取重建点的前 N/4 (FPS), 与原 pts cat 后再 FPS 到 N (官方流程)
         sample_n = N // 4
-        sample_idx = farthest_point_sample(rebuild, sample_n)             # (B, N/4)
-        sampled = index_points(rebuild, sample_idx)                       # (B, N/4, 3)
+        sample_idx = farthest_point_sample_fast(rebuild, sample_n)        # (B, N/4)
+        sampled = index_points_fast(rebuild, sample_idx)                  # (B, N/4, 3)
         merged = torch.cat([pts, sampled], dim=1)                         # (B, N + N/4, 3)
         if merged.shape[1] > N:
-            final_idx = farthest_point_sample(merged, N)
-            merged = index_points(merged, final_idx)
+            final_idx = farthest_point_sample_fast(merged, N)
+            merged = index_points_fast(merged, final_idx)
         return merged
 
     def _classify(self, pts: torch.Tensor) -> torch.Tensor:
