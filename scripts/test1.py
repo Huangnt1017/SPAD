@@ -37,7 +37,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -53,12 +53,34 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.train import build_model, resolve_path, set_seed
 from utils.data import SPAD_NORM_BOUNDS, load_point_cloud_auto, normalize_points
 from utils.data_augment import _draw_3d_box_wireframe  # 复用已有 3D wireframe 绘制
-from utils.loss import center_to_corners
+from utils.loss import center_to_corners, split_cls_and_box_predictions
 
 
 # ============================================================================
 # Logger
 # ============================================================================
+
+def merge_checkpoint_model_args(cli_args: argparse.Namespace, checkpoint: Mapping[str, Any]) -> argparse.Namespace:
+	"""用 checkpoint 训练参数重建模型结构，同时保留单样本测试参数。"""
+	ckpt_args = checkpoint.get("args") if isinstance(checkpoint, Mapping) else None
+	if not isinstance(ckpt_args, Mapping):
+		return cli_args
+
+	merged = vars(cli_args).copy()
+	for key, value in ckpt_args.items():
+		if key == "model" or key.startswith("spt_") or key == "num_points":
+			merged[key] = value
+	return argparse.Namespace(**merged)
+
+
+def infer_spt_moe_lif_from_state_dict(model_args: argparse.Namespace, state_dict: Mapping[str, torch.Tensor]) -> None:
+	"""兼容旧 SPT checkpoint: 旧权重包含 MoE-LIF gate/expert 参数。"""
+	if getattr(model_args, "model", "") != "spt":
+		return
+	if hasattr(model_args, "spt_use_moe_lif"):
+		return
+	has_moe_weights = any(".fc1.0.gate." in key or ".fc1.0.experts." in key for key in state_dict)
+	model_args.spt_use_moe_lif = has_moe_weights
 
 def setup_logger(log_dir: Path) -> Tuple[logging.Logger, Path]:
 	"""创建单样本测试的 logger (file + stderr)。"""
@@ -436,15 +458,19 @@ def run_single_test(args: argparse.Namespace) -> Dict[str, str]:
 	idx_to_class = {idx: name for name, idx in class_to_idx.items()}
 	num_classes = len(class_to_idx)
 
-	# args.model 在 build_parser 里限制了 choices, 这里直接传
-	model = build_model(args.model, num_classes=num_classes, project_root=project_root).to(device)
 	state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+	model_args = merge_checkpoint_model_args(args, checkpoint if isinstance(checkpoint, Mapping) else {})
+	model_args.model = args.model
+	infer_spt_moe_lif_from_state_dict(model_args, state_dict)
+	# args.model 在 build_parser 里限制了 choices, 这里直接传
+	model = build_model(args.model, num_classes=num_classes, project_root=project_root, args=model_args).to(device)
 	model.load_state_dict(state_dict)
 	model.eval()
 
 	with torch.no_grad():
 		# 模型期待 (B, N, 4)
-		logits, box_pred = model(normed.unsqueeze(0))
+		model_outputs = model(normed.unsqueeze(0))
+		logits, box_pred = split_cls_and_box_predictions(model_outputs)
 		probs = torch.softmax(logits, dim=1)
 		pred_score, pred_idx = probs.max(dim=1)
 		pred_class = idx_to_class.get(int(pred_idx.item()), str(int(pred_idx.item())))

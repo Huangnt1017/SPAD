@@ -62,6 +62,24 @@ def configure_torch_runtime(enable_tf32: bool) -> None:
 	torch.backends.cudnn.allow_tf32 = bool(enable_tf32)
 
 
+def has_spikingjelly_state(model: nn.Module) -> bool:
+	"""判断模型中是否包含需要跨 batch 重置的 SpikingJelly 状态模块。"""
+	return any(
+		type(module).__module__.startswith("spikingjelly1.")
+		and callable(getattr(module, "reset", None))
+		for module in model.modules()
+	)
+
+
+def reset_spikingjelly_state(model: nn.Module) -> None:
+	"""重置 SpikingJelly 膜电位状态，避免旧 batch 的计算图被下一 batch 持有。"""
+	for module in model.modules():
+		if type(module).__module__.startswith("spikingjelly1."):
+			reset = getattr(module, "reset", None)
+			if callable(reset):
+				reset()
+
+
 def resolve_path(path_str: str, base_dir: Path) -> Path:
 	"""解析路径为绝对路径。
 
@@ -122,7 +140,7 @@ def load_module_from_file(file_path: Path, module_name: str):
 	return module
 
 
-def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Module:
+def build_model(model_name: str, num_classes: int, project_root: Path, args: Optional[argparse.Namespace] = None) -> nn.Module:
 	"""按名称构建分类+框回归模型。
 
 	Args:
@@ -168,16 +186,18 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 		module = load_module_from_file(baseline_dir / "SPT.py", "baseline_spt")
 		import types
 		cfg = types.SimpleNamespace()
-		cfg.num_point = 1024
+		cfg.num_point = int(getattr(args, "num_points", 1024)) if args is not None else 1024
 		cfg.model = types.SimpleNamespace()
-		cfg.model.nblocks = 3
-		cfg.model.nneighbor = 16
-		cfg.model.blocks = [1, 1, 1, 1]
-		cfg.model.num_samples = 256
-		cfg.model.spike_mode = 'lif'
-		cfg.model.timestep = 4
-		cfg.model.use_encoder = False
-		cfg.model.transformer_dim = 64
+		cfg.model.nblocks = int(getattr(args, "spt_nblocks", 4)) if args is not None else 4
+		cfg.model.nneighbor = int(getattr(args, "spt_nneighbor", 16)) if args is not None else 16
+		cfg.model.blocks = [1] * (cfg.model.nblocks + 1)
+		cfg.model.num_samples = int(getattr(args, "spt_num_samples", 512)) if args is not None else 512
+		spike_mode = getattr(args, "spt_spike_mode", "lif") if args is not None else "lif"
+		cfg.model.spike_mode = None if spike_mode in (None, "none", "None", "ann") else spike_mode
+		cfg.model.timestep = int(getattr(args, "spt_timestep", 2)) if args is not None else 2
+		cfg.model.use_encoder = bool(getattr(args, "spt_use_encoder", True)) if args is not None else True
+		cfg.model.transformer_dim = int(getattr(args, "spt_transformer_dim", 512)) if args is not None else 512
+		cfg.model.use_moe_lif = bool(getattr(args, "spt_use_moe_lif", True)) if args is not None else True
 		cfg.input_dim = 4
 		cfg.num_classes = num_classes
 		return module.SPTNet(cfg)
@@ -228,6 +248,26 @@ def build_model(model_name: str, num_classes: int, project_root: Path) -> nn.Mod
 		return model_module.GraphResidualMultiTaskNet(num_classes=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
+
+
+def merge_resume_model_args(args: argparse.Namespace, checkpoint: Mapping[str, Any]) -> argparse.Namespace:
+	"""恢复训练时优先使用 checkpoint 中保存的模型结构参数。"""
+	ckpt_args = checkpoint.get("args") if isinstance(checkpoint, Mapping) else None
+	if not isinstance(ckpt_args, Mapping):
+		return args
+
+	merged = vars(args).copy()
+	for key, value in ckpt_args.items():
+		if key == "model" or key == "num_points" or key.startswith("spt_"):
+			merged[key] = value
+	if merged.get("model") == "spt" and "spt_use_moe_lif" not in ckpt_args:
+		state_dict = checkpoint.get("model_state_dict", {})
+		if isinstance(state_dict, Mapping):
+			merged["spt_use_moe_lif"] = any(
+				".fc1.0.gate." in key or ".fc1.0.experts." in key
+				for key in state_dict
+			)
+	return argparse.Namespace(**merged)
 
 
 def prepare_model_inputs(points_xyzi: torch.Tensor) -> torch.Tensor:
@@ -346,6 +386,7 @@ def run_epoch(
 	# 进度条每 ~20 次更新一次 (但首/末 batch 一定更新), 避免每 batch 都触发同步与字符串格式化。
 	num_batches = len(loader) if hasattr(loader, "__len__") else None
 	log_every = max(1, (num_batches // 20)) if num_batches else 1
+	reset_snn_state = has_spikingjelly_state(model)
 
 	with context:
 		for batch_step, batch in enumerate(pbar):
@@ -405,6 +446,8 @@ def run_epoch(
 
 			# 模型前向只吃点云，输出里会同时包含分类 logits 和 3D box 预测。
 			inputs = prepare_model_inputs(points)
+			if reset_snn_state:
+				reset_spikingjelly_state(model)
 			with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
 				model_outputs = model(inputs)
 				logits, box_preds = split_cls_and_box_predictions(model_outputs)
@@ -447,6 +490,9 @@ def run_epoch(
 				total_box_gauss += loss_dict["box_gauss_loss"].detach() * batch_size
 				total_box_iou += loss_dict["box_iou_mean"].detach() * batch_size
 				box_metric_samples += batch_size
+
+			if reset_snn_state:
+				reset_spikingjelly_state(model)
 
 			# 进度条节流: 只在间隔点 / 末 batch 更新一次, 把所有标量一次性 stack→cpu→tolist
 			# 来批量同步, 减少 GPU 等待。中间 batch 不显示瞬时值 (最终聚合数值不受影响)。
@@ -521,6 +567,12 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		else:
 			device = torch.device(args.device)
 
+	resume_checkpoint = None
+	if args.resume:
+		resume_path = resolve_path(args.resume, project_root)
+		resume_checkpoint = torch.load(resume_path, map_location="cpu")
+		args = merge_resume_model_args(args, resume_checkpoint)
+
 	logger, log_file, run_timestamp = setup_logger(log_dir, args.model)
 
 	# 使用统一的多任务数据管线，训练集强制开启增强。
@@ -542,7 +594,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	)
 
 	num_classes = len(class_to_idx)
-	model = build_model(args.model, num_classes=num_classes, project_root=project_root).to(device)
+	model = build_model(args.model, num_classes=num_classes, project_root=project_root, args=args).to(device)
 	# 多任务损失的三个权重控制分类、box L1 和 box IoU 三部分对总损失的贡献。
 	criterion = PointCloudMultiTaskLoss(
 		cls_weight=args.cls_loss_weight,
@@ -688,7 +740,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="pointmlp",
+		default="spt",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -710,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Backbone model",
 	)
 	parser.add_argument("--epochs", type=int, default=100)
-	parser.add_argument("--batch-size", type=int, default=32)
+	parser.add_argument("--batch-size", type=int, default=16)
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
 	parser.add_argument("--lr", type=float, default=1e-3)
 	parser.add_argument("--min-lr", type=float, default=1e-5)
@@ -729,6 +781,16 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--box-l1-weight", type=float, default=1.0, help="3D box SmoothL1 loss weight")
 	parser.add_argument("--box-iou-weight", type=float, default=1.0, help="3D box IoU loss weight")
 	parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for classification loss")
+	parser.add_argument("--spt-timestep", type=int, default=2, help="SPT temporal steps T; default follows Hengshuang.yaml")
+	parser.add_argument("--spt-nneighbor", type=int, default=16, help="SPT kNN neighborhood size")
+	parser.add_argument("--spt-transformer-dim", type=int, default=512, help="SPT internal transformer channel width; default follows Hengshuang.yaml")
+	parser.add_argument("--spt-nblocks", type=int, default=4, help="SPT transition-down stages; default follows Hengshuang.yaml")
+	parser.add_argument("--spt-num-samples", type=int, default=512, help="SPT Q-SDE samples per timestep when encoder mode is enabled")
+	parser.add_argument("--spt-spike-mode", type=str, default="lif", choices=["lif", "elif", "plif", "if", "none", "ann"], help="SPT neuron type; none/ann runs the ANN path")
+	parser.add_argument("--spt-use-encoder", dest="spt_use_encoder", action="store_true", help="Enable SPT Q-SDE encoder path")
+	parser.add_argument("--spt-no-encoder", dest="spt_use_encoder", action="store_false", help="Disable SPT Q-SDE encoder path")
+	parser.add_argument("--spt-use-moe-lif", dest="spt_use_moe_lif", action="store_true", help="Use original SPT MoE-LIF input neuron in each transformer block")
+	parser.add_argument("--spt-no-moe-lif", dest="spt_use_moe_lif", action="store_false", help="Use a single spike node instead of MoE-LIF for faster/lower-memory training")
 	parser.add_argument("--amp", dest="amp", action="store_true", help="Enable CUDA automatic mixed precision")
 	parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA automatic mixed precision")
 	parser.add_argument("--tf32", dest="tf32", action="store_true", help="Allow TF32 matmul/cuDNN on Ampere/Ada GPUs")
@@ -737,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="Disable train dataset augmentation")
 	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in val/test dataset")
 	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable val/test dataset augmentation")
-	parser.set_defaults(augment_train=True, augment_eval=True, amp=False, tf32=False)
+	parser.set_defaults(augment_train=True, augment_eval=True, amp=True, tf32=True, spt_use_encoder=True, spt_use_moe_lif=True)
 	return parser
 #CUDA AMP 会在部分算子里使用半精度，通常是 FP16，比如：Conv / Linear / MatMul / 部分归一化相关算子，同时用 GradScaler 避免 FP16 梯度下溢。它的目标是加速和省显存，不保证和纯 FP32 完全一致。
 #TF32 是 NVIDIA Ampere/Ada GPU 上对 FP32 matmul/conv 的加速格式。它仍然用 FP32 存储和 FP32 输出，但乘法内部精度降低，mantissa 比标准 FP32 少。

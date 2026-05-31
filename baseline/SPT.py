@@ -6,6 +6,22 @@ Local:   D:\essay\3d目标检测复现仓库\SPT-main\SPT-main
 Strictly reproduces https://github.com/PeppaWu/SPT incorporating spiking nodes,
 while appending dual-head regression parameters.
 
+当前本地 SPT 模型结构默认对齐原版 Hengshuang.yaml:
+    Hengshuang.yaml:
+        nblocks=4, blocks=[1, 1, 1, 1, 1], transformer_dim=512,
+        timestep=2, use_encoder=True, num_samples=512,
+        spike_mode="lif", nneighbor=16。
+    本项目训练默认保持上述结构，仅额外默认开启:
+        amp=True, tf32=True。
+    本项目任务适配:
+        输入为 SPAD xyzi 点云 (B, N, 4)，类别数来自数据集；
+        输出从原版单分类头扩展为 {"logits", "box_pred"} 双头，
+        其中 box_pred 为 3D bbox 中心点回归。
+    必要实现差异:
+        原版 Q-SDE 只维护 xyz 剩余点集，后续 gather 仍从原始 x 取点；
+        本项目输入为 xyzi，因此 queue_SDE 在剩余 xyzi 点集上同步采样与移除，
+        避免 xyz 索引误用于原始 xyzi 点集。
+
 @inproceedings{wu2025spiking,
   title={Spiking point transformer for point cloud classification},
   author={Wu, Peixi and Chai, Bosong and Li, Hebei and Zheng, Menghua and Peng, Yansong and Wang, Zeyu and Nie, Xuan and Zhang, Yueyi and Sun, Xiaoyan},
@@ -30,7 +46,8 @@ import numpy as np
 from utils.pointnet_utils import (
     square_distance,
     index_points,
-    farthest_point_sample,
+    index_points_fast,
+    farthest_point_sample_fast,
     build_spike_node,
     PointNetSetAbstraction,
 )
@@ -39,10 +56,17 @@ class globals:
     MID_TIME = 0.0
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_points, d_model, k, timestep, spike_mode, use_encoder) -> None:
+    def __init__(self, d_points, d_model, k, timestep, spike_mode, use_encoder, use_moe_lif=True) -> None:
         super().__init__()
+        input_spike = (
+            build_spike_node(timestep, ['lif', 'elif', 'plif', 'if'], d_points)
+            if spike_mode is not None and use_moe_lif
+            else build_spike_node(timestep, spike_mode)
+            if spike_mode is not None
+            else nn.Identity()
+        )
         self.fc1 = nn.Sequential(
-            build_spike_node(timestep, ['lif', 'elif', 'plif', 'if'], d_points) if spike_mode is not None else  nn.Identity(),
+            input_spike,
             nn.Conv1d(d_points, d_model, 1), 
             nn.BatchNorm1d(d_model),
             build_spike_node(timestep, spike_mode) if spike_mode is not None else  nn.Identity(),
@@ -134,17 +158,19 @@ class Backbone(nn.Module):
         super().__init__()
         npoints = getattr(cfg, 'num_point', 1024)
         if hasattr(cfg, 'model'):
-            nblocks = getattr(cfg.model, 'nblocks', 3)
+            nblocks = getattr(cfg.model, 'nblocks', 4)
             nneighbor = getattr(cfg.model, 'nneighbor', 16)
-            blocks = getattr(cfg.model, 'blocks', [1, 1, 1, 1])
-            num_samples = getattr(cfg.model, 'num_samples', 256)
+            blocks = getattr(cfg.model, 'blocks', [1, 1, 1, 1, 1])
+            num_samples = getattr(cfg.model, 'num_samples', 512)
             spike_mode = getattr(cfg.model, 'spike_mode', 'lif')
-            timestep = getattr(cfg.model, 'timestep', 4)
-            use_encoder = getattr(cfg.model, 'use_encoder', False)
-            transformer_dim = getattr(cfg.model, 'transformer_dim', 64)
+            timestep = getattr(cfg.model, 'timestep', 2)
+            use_encoder = getattr(cfg.model, 'use_encoder', True)
+            transformer_dim = getattr(cfg.model, 'transformer_dim', 512)
+            use_moe_lif = getattr(cfg.model, 'use_moe_lif', True)
         else:
-            nblocks, nneighbor, blocks = 3, 16, [1, 1, 1, 1]
-            num_samples, spike_mode, timestep, use_encoder, transformer_dim = 256, 'lif', 4, False, 64
+            nblocks, nneighbor, blocks = 4, 16, [1, 1, 1, 1, 1]
+            num_samples, spike_mode, timestep, use_encoder, transformer_dim = 512, 'lif', 2, True, 512
+            use_moe_lif = True
         
         d_points = getattr(cfg, 'input_dim', 4)  
 
@@ -158,7 +184,7 @@ class Backbone(nn.Module):
             nn.BatchNorm1d(32),
         )
 
-        transblock = lambda channel: TransformerBlock(channel, transformer_dim, nneighbor, timestep, spike_mode, use_encoder)
+        transblock = lambda channel: TransformerBlock(channel, transformer_dim, nneighbor, timestep, spike_mode, use_encoder, use_moe_lif)
         self.transformer1 = nn.ModuleList(transblock(32) for _ in range(blocks[0]))
 
         self.transition_downs = nn.ModuleList()
@@ -197,13 +223,13 @@ class PointTransformerCls(nn.Module):
         
         npoints = getattr(cfg, 'num_point', 1024)
         if hasattr(cfg, 'model'):
-            nblocks = getattr(cfg.model, 'nblocks', 3)
+            nblocks = getattr(cfg.model, 'nblocks', 4)
             spike_mode = getattr(cfg.model, 'spike_mode', 'lif')
-            timestep = getattr(cfg.model, 'timestep', 4)
-            use_encoder = getattr(cfg.model, 'use_encoder', False)
-            num_samples = getattr(cfg.model, 'num_samples', 256)
+            timestep = getattr(cfg.model, 'timestep', 2)
+            use_encoder = getattr(cfg.model, 'use_encoder', True)
+            num_samples = getattr(cfg.model, 'num_samples', 512)
         else:
-            nblocks, spike_mode, timestep, use_encoder, num_samples = 3, 'lif', 4, False, 256
+            nblocks, spike_mode, timestep, use_encoder, num_samples = 4, 'lif', 2, True, 512
 
         num_classes = getattr(cfg, 'num_classes', 26)  # From the SPAD runner
         
@@ -232,36 +258,69 @@ class PointTransformerCls(nn.Module):
         )
 
         self.nblocks = nblocks
-        self.T = timestep
+        self.T = timestep if spike_mode is not None else 1
         self.spike_mode  = spike_mode
         self.use_encoder = use_encoder
         self.num_samples = max(npoints//self.T, num_samples)
 
     def queue_SDE(self, x):
-        def queue_mask(loc, fps_idx):
-            B = loc.shape[0]
-            mask = torch.ones_like(loc, dtype=torch.bool)
-            mask[torch.arange(B).unsqueeze(1), fps_idx] = False    
-            loc = loc[mask].view(B, -1, 3)
-            return loc
+        def sample_points(points, sample_count):
+            """采样当前剩余点；采全量时直接返回顺序索引，避免 FPS 重复索引。"""
+            batch_size, num_remaining, channels = points.shape
+            sample_count = min(int(sample_count), num_remaining)
+            if sample_count <= 0:
+                empty_idx = torch.empty(batch_size, 0, dtype=torch.long, device=points.device)
+                return points[:, :0, :], empty_idx
+
+            if sample_count == num_remaining:
+                sample_idx = torch.arange(num_remaining, device=points.device).view(1, -1).expand(batch_size, -1)
+            else:
+                # 原版使用 CUDA FPS；这里优先走 pointnet2_ops，失败时回退到纯 PyTorch FPS。
+                sample_idx = farthest_point_sample_fast(points[..., :3].contiguous(), sample_count)
+            return index_points_fast(points, sample_idx), sample_idx.long()
+
+        def remove_selected(points, selected_idx):
+            """按目标数量移除本轮采样点，避免重复 FPS 索引造成各 batch 剩余长度不同。"""
+            if selected_idx.numel() == 0:
+                return points
+            batch_size, num_remaining, channels = points.shape
+            remove_count = min(int(selected_idx.shape[1]), num_remaining)
+            target_remaining = num_remaining - remove_count
+            if target_remaining <= 0:
+                return points[:, :0, :]
+
+            selected_idx = selected_idx.long().clamp(0, num_remaining - 1)
+            mask = torch.ones(batch_size, num_remaining, dtype=torch.bool, device=points.device)
+            batch_idx = torch.arange(batch_size, device=points.device).unsqueeze(1).expand_as(selected_idx)
+            mask[batch_idx, selected_idx] = False
+
+            order = torch.arange(num_remaining, device=points.device).view(1, -1).expand(batch_size, -1)
+            keep_order = torch.where(mask, order, order + num_remaining)
+            keep_idx = keep_order.argsort(dim=1)[:, :target_remaining]
+            return index_points_fast(points, keep_idx)
         
         B, N, C = x.shape
-        loc = x[...,:3]
-        npoint = self.num_samples
-        res = (N - npoint)//(self.T-1) if self.T != 1 else 0
+        npoint = min(self.num_samples, N)
+        res = max((N - npoint)//(self.T-1), 0) if self.T != 1 else 0
 
-        onion = torch.zeros(self.T, B, npoint, C).to(x.device)
-        fps_idx = farthest_point_sample(loc, npoint)
-        onion[0] = index_points(x, fps_idx)
-        loc = queue_mask(loc, fps_idx)    
+        onion = x.new_empty(self.T, B, npoint, C)
+        remaining = x
+        sampled, fps_idx = sample_points(remaining, npoint)
+        onion[0] = sampled
+        if self.T > 1:
+            remaining = remove_selected(remaining, fps_idx)
 
         for i in range(1, self.T):
-            if loc.shape[1] == 0: onion[i] = onion[i-1]
+            take_count = min(res, remaining.shape[1])
+            if take_count <= 0:
+                onion[i] = onion[i-1]
             else:
-                fps_idx = farthest_point_sample(loc, res)   
-                onion[i, :, :npoint - res] = onion[i - 1][:, res:]
-                onion[i, :, npoint - res:] = index_points(x, fps_idx)
-                loc = queue_mask(loc, fps_idx)
+                # 原版 Q-SDE 的队列思想：保留上一帧后段，末尾补入剩余点中的新 FPS 点。
+                sampled, fps_idx = sample_points(remaining, take_count)
+                onion[i, :, :npoint - take_count] = onion[i - 1][:, take_count:]
+                onion[i, :, npoint - take_count:] = sampled
+                if i + 1 < self.T:
+                    remaining = remove_selected(remaining, fps_idx)
         return onion
 
     def forward(self, x) -> Dict[str, torch.Tensor]:
@@ -316,14 +375,15 @@ if __name__ == "__main__":
         input_dim=4,
         num_classes=26,
         model=SimpleNamespace(
-            nblocks=3,
+            nblocks=4,
             nneighbor=16,
-            blocks=[1, 1, 1, 1],
-            num_samples=256,
+            blocks=[1, 1, 1, 1, 1],
+            num_samples=512,
             spike_mode="lif",
-            timestep=4,
-            use_encoder=False,
-            transformer_dim=64,
+            timestep=2,
+            use_encoder=True,
+            transformer_dim=512,
+            use_moe_lif=True,
         ),
     )
 

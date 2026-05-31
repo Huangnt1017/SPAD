@@ -106,6 +106,29 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 		return "pointnet"
 	return fallback
 
+
+def merge_checkpoint_model_args(cli_args: argparse.Namespace, checkpoint: Mapping[str, Any]) -> argparse.Namespace:
+	"""用 checkpoint 中保存的训练参数重建模型结构，同时保留测试 CLI 参数。"""
+	ckpt_args = checkpoint.get("args") if isinstance(checkpoint, Mapping) else None
+	if not isinstance(ckpt_args, Mapping):
+		return cli_args
+
+	merged = vars(cli_args).copy()
+	for key, value in ckpt_args.items():
+		if key == "model" or key.startswith("spt_") or key == "num_points":
+			merged[key] = value
+	return argparse.Namespace(**merged)
+
+
+def infer_spt_moe_lif_from_state_dict(model_args: argparse.Namespace, state_dict: Mapping[str, torch.Tensor]) -> None:
+	"""兼容旧 SPT checkpoint: 旧权重包含 MoE-LIF gate/expert 参数。"""
+	if getattr(model_args, "model", "") != "spt":
+		return
+	if hasattr(model_args, "spt_use_moe_lif"):
+		return
+	has_moe_weights = any(".fc1.0.gate." in key or ".fc1.0.experts." in key for key in state_dict)
+	model_args.spt_use_moe_lif = has_moe_weights
+
 def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, str]:
 	"""创建测试日志器。
 
@@ -584,10 +607,13 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 		label_mode=args.label_mode,
 	)
 
-	model = build_model(resolved_model, num_classes=len(class_to_idx), project_root=project_root).to(device)
 	# 测试时只需要模型参数，不需要优化器状态。
 	checkpoint = torch.load(checkpoint_path, map_location=device)
 	state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+	model_args = merge_checkpoint_model_args(args, checkpoint if isinstance(checkpoint, Mapping) else {})
+	model_args.model = resolved_model
+	infer_spt_moe_lif_from_state_dict(model_args, state_dict)
+	model = build_model(resolved_model, num_classes=len(class_to_idx), project_root=project_root, args=model_args).to(device)
 	model.load_state_dict(state_dict)
 
 	if "class_to_idx" in checkpoint:
