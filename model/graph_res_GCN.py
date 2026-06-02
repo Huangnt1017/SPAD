@@ -11,6 +11,11 @@
     - GCN_f (特征流): SAGEConv on 特征空间动态 KNN 图 (DGCNN "动态图" 范式保留, 卷积核换成真 GNN)
     - GCN_p (位置流): SAGEConv on 坐标空间静态 KNN 图 (预计算复用, 同原版)
 
+    Block 内改进 (相比原版 GraphResidualBlock):
+    - SE-style channel gate 替代全局 Q/K/V 注意力
+    - **坐标编码器残差注入**: 2 层 MLP 对 4D 坐标提取位置特征, 通过残差加法注入到最终特征,
+      使每个点特征显式包含其空间位置编码, 改善深度回归 (避免全局池化后位置信息丢失)
+
     其余 Q/K/V 注意力 + 坐标门控残差逻辑不变 (详见 readme.md 任务 1)。
 
 Block 数据流 (全程 (B, C, N) 布局, 无下采样, N=1024):
@@ -22,12 +27,13 @@ Block 数据流 (全程 (B, C, N) 布局, 无下采样, N=1024):
     ┌ GCN_f: SAGEConv(f) + BN1d + LReLU → f_gcn(B,C_out,N)   ← V source
     └ GCN_p: SAGEConv(p) + BN1d + LReLU → p_gcn(B,C_out,N)   ← K source (复用预计算边)
         ↓
-    Q = Conv1d+BN1d(f‖p),  K = Conv1d(p_gcn),  V = Conv1d(f_gcn)
-    attn = softmax(Q·K/√C) * V  → (B, C_out, N)
+    SE gate on f_gcn, 然后 cat(f_gcn_gated, p_gcn) → Conv1d → fused
         ↓
-    gate·Conv1d(attn) + (1-gate)·Conv1d(p)    ← 坐标门控
+    coord_gate(p), coord_res(p): gate·fused + (1-gate)·coord_res → out
         ↓
-    LeakyReLU → f_out(B,C_out,N), p 不变
+    coord_encoder(p): pos_feat  ← 新增: 2 层 MLP 提取位置特征
+        ↓
+    f_out = act(out + pos_feat)  ← 坐标编码残差注入
 
 References:
     - model/readme.md 任务 1
@@ -240,24 +246,28 @@ class GraphResidualBlockGCN(nn.Module):
         Dynamic KNN from f → idx(B,N,k)    ← 仅特征 KNN 每层重算
         → f_edge_index(2,E)
             ↓
-        ┌ GCN_f: BatchedSAGEConv(f) + BN1d + LReLU → f_gcn(B,C_out,N)  ← V source
-        └ GCN_p: BatchedSAGEConv(p) + BN1d + LReLU → p_gcn(B,C_out,N)  ← K source (复用预计算边)
+        ┌ GCN_f: BatchedSAGEConv(f) + BN1d + LReLU → f_gcn(B,C_out,N)
+        └ GCN_p: BatchedSAGEConv(p) + BN1d + LReLU → p_gcn(B,C_out,N)
             ↓
-        Q = Conv1d+BN1d(f‖p)     (B, C_out, N)
-        K = Conv1d(p_gcn)        (B, C_out, N)
-        V = Conv1d(f_gcn)        (B, C_out, N)
-        attn = softmax(Q·K/√C) @ V  → (B, C_out, N)
+        SE gate: f_gap = GAP(f_gcn) → MLP → sigmoid → se_weight
+        f_gcn_gated = f_gcn * se_weight
+        fused = Conv1d(cat(f_gcn_gated, p_gcn))
             ↓
-        mapped = Conv1d+BN1d(attn)
-        gate = σ(Conv1d+BN1d(p))
-        out = gate * mapped + (1-gate) * Conv1d+BN1d(p)
+        gate = sigmoid(coord_gate(p)), coord_info = coord_res(p)
+        out = gate * fused + (1-gate) * coord_info
             ↓
-        LeakyReLU → f_out(B,C_out,N), p 原样传出
+        pos_feat = coord_encoder(p)  ← 2 层 MLP, 位置编码
+        f_out = act(out + pos_feat)   ← 坐标编码残差注入
+            ↓
+        f_out(B,C_out,N), p 原样传出
 
     设计说明:
         - p 全程不变 → p_edge_index 在 Net 层预计算一次, 4 个 Block 共享
         - SAGEConv 的 mean 聚合天然保留邻域分布信息, 适合 SPAD 点云的噪声建模
-        - 相比原版 Conv2d, SAGEConv 的中心-邻居分离权重 (W_1, W_2) 表达力更强
+        - SE channel gate 替代全局注意力, 消除 1024×1024 过拟合风险
+        - **coord_encoder 残差注入**: 2 层 MLP 对 4D 坐标提取位置特征,
+          通过残差加法注入到最终特征, 使每个点特征显式包含其空间位置编码,
+          改善深度回归 (避免全局池化后位置信息丢失)
 
     Args:
         in_channels: C_in。
@@ -318,6 +328,17 @@ class GraphResidualBlockGCN(nn.Module):
             nn.BatchNorm1d(out_channels),
         )
 
+        # 坐标编码器 (2 层 MLP): 对原始 4D 坐标提取更丰富的位置特征
+        # 通过残差加法注入到最终特征中, 使每个点特征显式包含其空间位置编码
+        # 全局池化后, 位置统计量仍被保留, 改善深度回归 (避免 "盲猜" 中心点)
+        self.coord_encoder = nn.Sequential(
+            nn.Conv1d(4, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+        )
+
         self.act = nn.LeakyReLU(0.2)
 
     def forward(
@@ -370,90 +391,18 @@ class GraphResidualBlockGCN(nn.Module):
         gate = torch.sigmoid(self.coord_gate(p))                    # (B, C_out, N)
         coord_info = self.coord_res(p)                              # (B, C_out, N)
         out = gate * fused + (1.0 - gate) * coord_info
-        f_out = self.act(out)
+
+        # ── 坐标编码残差注入 (改善深度回归) ──
+        # 2 层 MLP 对 4D 坐标提取丰富位置特征, 通过残差加法注入到最终特征
+        # 使每个点的 f_out[:, :, i] 显式包含 p[:, :, i] 的空间编码
+        # 全局池化后位置统计量仍被保留, 避免深度回归 "盲猜" 中心点
+        pos_feat = self.coord_encoder(p)                            # (B, C_out, N)
+        f_out = self.act(out + pos_feat)
 
         # ── 层间下采样 ──
         if self.downsample:
             p, f_out = weighted_downsample(p, f_out, N // 2)
         return p, f_out
-
-
-# ══════════════════════════════════════════════════
-# Attention-based Box Pooling (保留空间信息)
-# ══════════════════════════════════════════════════
-
-class BoxQueryPool(nn.Module):
-    """基于 learned queries 的 attention pooling，保留空间信息用于 box 回归。
-
-    与 max+avg 全局池化不同，learned queries 通过 cross-attention
-    自适应关注点云中的物体中心区域，保留对 3D 定位任务至关重要的空间信息。
-
-    原理:
-        全局池化将 (B, C, N) 压成 (B, C)，空间位置信息完全丢失;
-        而 learned queries 通过 attention 权重选择性地聚合 N 个点中
-        与物体中心相关的特征，相当于一个可学习的 "soft voting" 机制。
-
-    数据流:
-        f (B, C_feat, N) → permute → kv (B, N, C_feat)
-        queries (1, num_q, C_feat) → expand → q (B, num_q, C_feat)
-        cross-attn(q, kv, kv) → (B, num_q, C_feat) → mean → (B, C_feat)
-        → projection → (B, out_dim)
-
-    Args:
-        feat_dim: 输入特征维度 (backbone 输出通道数)。
-        out_dim: 输出特征维度 (需对齐 box_head 输入维度)。
-        num_queries: learned query tokens 数量 (多个 queries 平均聚合)。
-        num_heads: 多头注意力头数。
-    """
-
-    def __init__(
-        self,
-        feat_dim: int,
-        out_dim: int,
-        num_queries: int = 8,
-        num_heads: int = 4,
-    ):
-        super().__init__()
-        # learned query tokens: 初始化为标准正态分布
-        self.queries = nn.Parameter(torch.randn(1, num_queries, feat_dim) * 0.02)
-
-        # cross-attention: query 关注点云特征
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=feat_dim,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-
-        # projection: feat_dim → out_dim (对齐 box_head 输入)
-        self.proj = nn.Sequential(
-            nn.Linear(feat_dim, out_dim, bias=False),
-            nn.LayerNorm(out_dim),
-            nn.GELU(),
-        )
-
-    def forward(self, f: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            f: (B, C_feat, N) — backbone 输出的 channel-first 特征。
-
-        Returns:
-            (B, out_dim) — attention-pooled 特征，用于 box 回归。
-        """
-        B, C_feat, N = f.shape
-
-        # (B, C_feat, N) → (B, N, C_feat): PyTorch attention 要求 sequence-last
-        kv = f.permute(0, 2, 1)  # (B, N, C_feat)
-
-        # (B, num_queries, C_feat): 广播到 batch size
-        q = self.queries.expand(B, -1, -1)
-
-        # cross-attention: learned queries 自适应关注点云空间位置
-        # attn_out: (B, num_queries, C_feat), attn_weights: (B, num_queries, N)
-        attn_out, _ = self.cross_attn(q, kv, kv)
-
-        # 多 queries 平均聚合 → (B, C_feat) → projection → (B, out_dim)
-        pooled = attn_out.mean(dim=1)  # (B, C_feat)
-        return self.proj(pooled)       # (B, out_dim)
 
 
 # ══════════════════════════════════════════════════
@@ -519,20 +468,9 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         )
 
         pooled_dim = 1024  # 512 * 2 (max + avg)
-        backbone_dim = 512  # agg_conv 输出通道数
 
         # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
-        # 分类任务使用全局 max+avg pooling (类别与位置无关)
         self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
-
-        # Box attention pooling: learned queries 关注物体中心区域
-        # 保留空间信息用于 3D 定位 (替代全局池化)
-        self.box_pool = BoxQueryPool(
-            feat_dim=backbone_dim,   # 输入: (B, 512, N)
-            out_dim=pooled_dim,      # 输出: (B, 1024) 对齐 box_head
-            num_queries=8,
-            num_heads=4,
-        )
 
         # 统一中心点回归头: 3 层 MLP (1024 → 256 → 128 → box_dim)
         # 直接回归, 与 baseline 一致, 确保 backbone 为唯一变量。
@@ -576,17 +514,17 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         # 多尺度拼接 + 聚合
         f = self.agg_conv(torch.cat([f1, f2, f3, f4], dim=1))  # (B, 512, N)
 
-        # ── 分类: 全局 max+avg pooling (类别与位置无关) ──
+        # 全局池化: max + avg → (B, 1024)
         f_max = f.max(dim=-1)[0]
         f_avg = f.mean(dim=-1)
         f_pooled = torch.cat([f_max, f_avg], dim=1)              # (B, 1024)
+
         logits = self.cls_head(f_pooled)
 
-        # ── Box: attention pooling 保留空间信息用于 3D 定位 ──
-        # learned queries 通过 cross-attention 关注物体中心区域
-        # 替代全局池化，解决深度估计任务空间信息丢失问题
-        box_feat = self.box_pool(f)                               # (B, 1024)
-        box_preds = self.box_head(box_feat)                       # (B, 3)
+        # Box head: 直接回归 (与 baseline 一致)
+        # backbone 内 Block 的 coord_encoder 已将位置信息注入到每个点特征中,
+        # 全局池化后位置统计量仍被保留, 深度回归不再 "盲猜" 中心点
+        box_preds = self.box_head(f_pooled)                       # (B, 3)
 
         return {"logits": logits, "box_pred": box_preds}
 

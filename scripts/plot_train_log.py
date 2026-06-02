@@ -5,12 +5,12 @@ SPAD 训练日志 → 曲线图脚本。
 日志中每个 epoch 写两行 (与 scripts/train.py run_epoch 末尾的 logger.info 一一对应):
     ``... | Epoch [E/T] | train_loss=X train_top1=Y train_top3=Z |
                           val_loss=A val_top1=B val_top3=C``
-    ``... | Epoch [E/T] | train_box_iou=X train_box_depth=Y |
-                          val_box_iou=A val_box_depth=B``
+    ``... | Epoch [E/T] | train_z_mae=X train_box_depth=Y |
+                          val_z_mae=A val_box_depth=B``
 这两行 epoch 字段一致, 用 ``Epoch [E/T]`` 做 key 把它们合并到同一个数据点。
 
 输出:
-    - 单 log 模式: loss / top1 / top3 / box_iou / box_depth 子图,
+    - 单 log 模式: loss / top1 / top3 / z_mae / box_depth 子图,
       每个子图叠 train + val 两条曲线。文件名 ``curve_<model>_<timestamp>.png``。
     - 多 log 对比模式: 每个子图把多个 log 的 val 曲线叠到一起
       横向对比, 文件名 ``compare_<时间戳>.png``。
@@ -50,9 +50,9 @@ _CLS_LINE = re.compile(
 )
 _BOX_LINE = re.compile(
     r"Epoch \[(?P<epoch>\d+)/(?P<total>\d+)\] \| "
-    r"train_box_iou=(?P<train_box_iou>[-+0-9.eE]+) "
+    r"train_z_mae=(?P<train_z_mae>[-+0-9.eE]+) "
     r"train_box_depth=(?P<train_box_depth>[-+0-9.eE]+) \| "
-    r"val_box_iou=(?P<val_box_iou>[-+0-9.eE]+) "
+    r"val_z_mae=(?P<val_z_mae>[-+0-9.eE]+) "
     r"val_box_depth=(?P<val_box_depth>[-+0-9.eE]+)"
 )
 # 从文件名提取 (model, timestamp), 例如:
@@ -94,7 +94,7 @@ def parse_log(log_path: Path) -> Dict[str, object]:
             if m_box:
                 ep = int(m_box.group("epoch"))
                 bucket = per_epoch.setdefault(ep, {})
-                for key in ("train_box_iou", "train_box_depth", "val_box_iou", "val_box_depth"):
+                for key in ("train_z_mae", "train_box_depth", "val_z_mae", "val_box_depth"):
                     bucket[key] = float(m_box.group(key))
 
     epochs_sorted = sorted(per_epoch.keys())
@@ -117,13 +117,13 @@ def parse_log(log_path: Path) -> Dict[str, object]:
 
 
 # ============================================================================
-# 子图布局: loss / top1 / top3 / box_iou / box_depth
+# 子图布局: loss / top1 / top3 / z_mae / box_depth
 # ============================================================================
 _PANEL_SPEC: List[Tuple[str, str, str, str]] = [
     ("Loss",         "train_loss",         "val_loss",         "loss"),
     ("Top-1 Acc",    "train_top1",         "val_top1",         "accuracy"),
     ("Top-3 Acc",    "train_top3",         "val_top3",         "accuracy"),
-    ("Box IoU",      "train_box_iou",      "val_box_iou",      "iou"),
+    ("Z-MAE",        "train_z_mae",        "val_z_mae",        "depth error"),
     ("Box Depth",    "train_box_depth",    "val_box_depth",    "Soft-histogram"),
 ]
 

@@ -366,7 +366,7 @@ def compute_composite_score(
 ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
 	"""计算统一尺度的多任务组合分数。
 
-	组合分数只用于 best checkpoint 选择，不反向传播。分类 Top-1、box IoU 与 depth loss
+	组合分数只用于 best checkpoint 选择，不反向传播。分类 Top-1、z 轴深度误差与 depth loss
 	先统一成 [0, 1] 质量分数，再按归一化权重加权，避免某个任务因数值范围天然更大而主导选模。
 	"""
 	has_box_metrics = float(metrics.get("box_samples", 0.0)) > 0
@@ -378,12 +378,16 @@ def compute_composite_score(
 	}
 
 	if has_box_metrics:
-		components["box_iou"] = _clamp_unit(float(metrics.get("box_iou", 0.0)))
+		# z_mae 越小越好，用与 depth_loss 相同的转换函数
+		components["box_z_mae"] = depth_loss_to_score(
+			float(metrics.get("box_z_mae", 0.0)),
+			float(args.best_score_depth_scale),
+		)
 		components["box_depth"] = depth_loss_to_score(
 			float(metrics.get("box_depth", 0.0)),
 			float(args.best_score_depth_scale),
 		)
-		raw_weights["box_iou"] = max(0.0, float(args.best_score_iou_weight))
+		raw_weights["box_z_mae"] = max(0.0, float(args.best_score_z_mae_weight))
 		raw_weights["box_depth"] = max(0.0, float(args.best_score_depth_weight))
 
 	weight_sum = sum(raw_weights.values())
@@ -399,7 +403,7 @@ def score_config_from_args(args: argparse.Namespace) -> Dict[str, float]:
 	"""提取组合评分配置，保存到 checkpoint 便于复现实验口径。"""
 	return {
 		"cls_weight": float(args.best_score_cls_weight),
-		"iou_weight": float(args.best_score_iou_weight),
+		"z_mae_weight": float(args.best_score_z_mae_weight),
 		"depth_weight": float(args.best_score_depth_weight),
 		"depth_scale": float(args.best_score_depth_scale),
 	}
@@ -462,7 +466,7 @@ def run_epoch(
 	# 一次 .cpu().tolist() 把所有需要展示的标量批量搬到 CPU。
 	total_loss = torch.zeros((), device=device)
 	total_box_depth = torch.zeros((), device=device)
-	total_box_iou = torch.zeros((), device=device)
+	total_box_z_mae = torch.zeros((), device=device)
 	correct_top1 = torch.zeros((), device=device, dtype=torch.long)
 	correct_top3 = torch.zeros((), device=device, dtype=torch.long)
 	total_samples = 0
@@ -539,7 +543,7 @@ def run_epoch(
 				model_outputs = model(inputs)
 				logits, box_preds = split_cls_and_box_predictions(model_outputs)
 
-				# 多任务损失内部会分别计算分类损失、box L1 损失和 IoU 损失，并汇总成 total_loss。
+				# 多任务损失内部会分别计算分类损失、box L1 损失和 z-MAE 深度误差，并汇总成 total_loss。
 				loss_dict = criterion(
 					model_outputs=model_outputs,
 					cls_targets=labels,
@@ -575,7 +579,7 @@ def run_epoch(
 			if box_preds is not None and box_targets is not None:
 				# box 指标只有在预测框和目标框都能成功构造时才累计，避免缺失元信息污染统计。
 				total_box_depth += loss_dict["box_depth_loss"].detach() * batch_size
-				total_box_iou += loss_dict["box_iou_mean"].detach() * batch_size
+				total_box_z_mae += loss_dict["box_z_mae"].detach() * batch_size
 				box_metric_samples += batch_size
 
 			if reset_snn_state:
@@ -590,15 +594,15 @@ def run_epoch(
 					total_loss,
 					correct_top1.to(total_loss.dtype),
 					correct_top3.to(total_loss.dtype),
-					total_box_iou,
+					total_box_z_mae,
 				]).cpu().tolist()
-				s_loss, s_c1, s_c3, s_box_iou = snap
+				s_loss, s_c1, s_c3, s_box_z_mae = snap
 				avg_loss = s_loss / max(total_samples, 1)
 				top1 = s_c1 / max(total_samples, 1)
 				top3 = s_c3 / max(total_samples, 1)
 				if box_metric_samples > 0:
-					box_iou = s_box_iou / box_metric_samples
-					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}", box_iou=f"{box_iou:.4f}")
+					box_z_mae = s_box_z_mae / box_metric_samples
+					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}", z_mae=f"{box_z_mae:.4f}")
 				else:
 					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}")
 
@@ -608,15 +612,15 @@ def run_epoch(
 		correct_top1.to(total_loss.dtype),
 		correct_top3.to(total_loss.dtype),
 		total_box_depth,
-		total_box_iou,
+		total_box_z_mae,
 	]).cpu().tolist()
-	f_loss, f_c1, f_c3, f_bd, f_bi = final_snap
+	f_loss, f_c1, f_c3, f_bd, f_bz = final_snap
 	metrics = {
 		"loss": f_loss / max(total_samples, 1),
 		"top1": f_c1 / max(total_samples, 1),
 		"top3": f_c3 / max(total_samples, 1),
 		"box_depth": f_bd / max(box_metric_samples, 1),
-		"box_iou": f_bi / max(box_metric_samples, 1),
+		"box_z_mae": f_bz / max(box_metric_samples, 1),
 		"box_samples": float(box_metric_samples),
 		"samples": float(total_samples),
 	}
@@ -722,9 +726,9 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("amp=%s tf32=%s", use_amp, args.tf32)
 	logger.info("loss_auto_balance=%s", args.auto_balance)
 	logger.info(
-		"best_score_weights cls=%.4f iou=%.4f depth=%.4f depth_scale=%.6f",
+		"best_score_weights cls=%.4f z_mae=%.4f depth=%.4f depth_scale=%.6f",
 		args.best_score_cls_weight,
-		args.best_score_iou_weight,
+		args.best_score_z_mae_weight,
 		args.best_score_depth_weight,
 		args.best_score_depth_scale,
 	)
@@ -808,35 +812,35 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			val_metrics["top3"],
 		)
 		if train_metrics["box_samples"] > 0 or val_metrics["box_samples"] > 0:
-			# box 指标单独打印，方便区分分类收敛和几何框收敛是否一致。
+			# box 指标单独打印，方便区分分类收敛和深度回归收敛是否一致。
 			logger.info(
-				"Epoch [%d/%d] | train_box_iou=%.4f train_box_depth=%.4f | "
-				"val_box_iou=%.4f val_box_depth=%.4f",
+				"Epoch [%d/%d] | train_z_mae=%.4f train_box_depth=%.4f | "
+				"val_z_mae=%.4f val_box_depth=%.4f",
 				epoch,
 				args.epochs,
-				train_metrics["box_iou"],
+				train_metrics["box_z_mae"],
 				train_metrics["box_depth"],
-				val_metrics["box_iou"],
+				val_metrics["box_z_mae"],
 				val_metrics["box_depth"],
 			)
 
 		val_score, score_components, score_weights = compute_composite_score(val_metrics, args)
 		logger.info(
-			"Epoch [%d/%d] | val_score=%.4f | components cls=%.4f iou=%.4f depth=%.4f | "
-			"weights cls=%.3f iou=%.3f depth=%.3f",
+			"Epoch [%d/%d] | val_score=%.4f | components cls=%.4f z_mae=%.4f depth=%.4f | "
+			"weights cls=%.3f z_mae=%.3f depth=%.3f",
 			epoch,
 			args.epochs,
 			val_score,
 			score_components.get("cls_top1", 0.0),
-			score_components.get("box_iou", 0.0),
+			score_components.get("box_z_mae", 0.0),
 			score_components.get("box_depth", 0.0),
 			score_weights.get("cls_top1", 0.0),
-			score_weights.get("box_iou", 0.0),
+			score_weights.get("box_z_mae", 0.0),
 			score_weights.get("box_depth", 0.0),
 		)
 
 		if val_score >= best_val_score:
-			# 用统一尺度的组合评分选 best，避免分类、IoU 或 depth 任一任务因数值范围主导选模。
+			# 用统一尺度的组合评分选 best，避免分类、z-MAE 或 depth 任一任务因数值范围主导选模。
 			best_val_score = val_score
 			best_val_top1 = val_metrics["top1"]
 			best_val_metrics = {
@@ -895,7 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="graph_residual_gcn",
+		default="graph_residual",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -939,7 +943,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--no-auto-balance", dest="auto_balance", action="store_false", help="Use fixed cls/box loss weights")
 	parser.add_argument("--label-smoothing", type=float, default=0.1, help="Label smoothing for classification loss")
 	parser.add_argument("--best-score-cls-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation Top-1")
-	parser.add_argument("--best-score-iou-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation box IoU")
+	parser.add_argument("--best-score-z-mae-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation box z-MAE (depth error)")
 	parser.add_argument("--best-score-depth-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation depth score")
 	parser.add_argument("--best-score-depth-scale", type=float, default=0.01, help="Depth loss scale used by depth_score = 1 / (1 + depth_loss / scale)")
 	parser.add_argument("--spt-timestep", type=int, default=2, help="SPT temporal steps T; default follows Hengshuang.yaml")

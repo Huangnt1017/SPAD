@@ -529,7 +529,7 @@ class PointCloudMultiTaskLoss(nn.Module):
 		  model_outputs → split → logits + center_preds [B, 3]
 		  box_targets [B, 6] → corners_to_center → gt_centers [B, 3]
 		  Soft-histogram: Σ_k w_k · ‖pred - (gt + k·δ)‖²
-		  IoU (no_grad): center_to_corners(pred/gt) → box_iou_3d_aligned
+		  深度误差 (no_grad): z 轴 MAE + 3D 中心点 MAE
 
 		Args:
 			model_outputs: 模型输出, 第二项为 [B, 3] 中心点预测 (或 None)。
@@ -542,7 +542,8 @@ class PointCloudMultiTaskLoss(nn.Module):
 			- total_loss: 加权总损失
 			- cls_loss: 分类 CrossEntropy
 			- box_depth_loss: Soft-histogram 深度损失
-			- box_iou_mean: 固定半宽重建后的 3D IoU 均值 (仅监控, 不参与反传)
+			- box_z_mae: z 轴深度误差 MAE (归一化空间, 仅监控, 不参与反传)
+			- box_center_mae: 3D 中心点 MAE (仅监控, 不参与反传)
 		"""
 		logits, center_preds = split_cls_and_box_predictions(model_outputs)
 		cls_targets = cls_targets.long().to(logits.device)
@@ -654,18 +655,12 @@ class PointCloudMultiTaskLoss(nn.Module):
 				mse_k = (pred_c_valid - gt_shifted).pow(2).sum(dim=-1).mean()
 				box_depth_loss = box_depth_loss + w_k * mse_k
 
-			# ── IoU 监控 (不参与反传) ──
-			# 用固定半宽从中心点重建角点框, 计算 3D IoU
+			# ── 深度误差监控 (z 轴为主, 不参与反传) ──
 			with torch.no_grad():
-				pred_box_recon = center_to_corners(
-					pred_c_valid, half_size=half_size,
-					device=logits.device, dtype=logits.dtype,
-				)
-				gt_box_recon = center_to_corners(
-					gt_c_valid, half_size=half_size,
-					device=logits.device, dtype=logits.dtype,
-				)
-				iou_per_sample = box_iou_3d_aligned(pred_box_recon, gt_box_recon)
+				# z 轴 MAE (归一化空间) — SPAD 深度估计核心指标
+				z_mae = (pred_c_valid[..., 2] - gt_c_valid[..., 2]).abs().mean()
+				# 3D 中心点 MAE (x/y/z 平均)
+				center_mae = (pred_c_valid - gt_c_valid).abs().mean(dim=-1).mean()
 
 			if self.auto_balance:
 				total_loss = (
@@ -676,7 +671,8 @@ class PointCloudMultiTaskLoss(nn.Module):
 				total_loss = total_loss + self.box_weight * box_depth_loss
 
 			out["box_depth_loss"] = box_depth_loss
-			out["box_iou_mean"] = iou_per_sample.mean()
+			out["box_z_mae"] = z_mae
+			out["box_center_mae"] = center_mae
 
 		out["total_loss"] = total_loss
 		return out

@@ -522,11 +522,16 @@ def run_single_test(args: argparse.Namespace) -> Dict[str, str]:
 			0.5 * (gt_box_raw[2] + gt_box_raw[3]),
 			0.5 * (gt_box_raw[4] + gt_box_raw[5]),
 		], dtype=np.float32)
-		# 中心点偏移 (L2 距离), 直观看模型定位精度; 也是 plot 中橙色虚线段的长度。
-		center_offset = float(np.linalg.norm(pred_center_raw - gt_center_raw))
+		# 中心点偏移 (3D L2 + 各轴 MAE), 直观看模型定位精度
+		# z 轴是 SPAD 深度估计核心指标, 单独报出 (raw scale 体素)
+		offset_xyz = pred_center_raw - gt_center_raw
+		center_offset_3d = float(np.linalg.norm(offset_xyz))
+		z_abs_error = float(abs(offset_xyz[2]))  # z 轴绝对误差
 		logger.info("gt_box_raw=%s", json.dumps(gt_box_raw.tolist()))
 		logger.info("gt_center_raw=%s", json.dumps([round(float(v), 3) for v in gt_center_raw.tolist()]))
-		logger.info("center_offset_raw=%.3f (raw L2 distance between pred and gt centers)", center_offset)
+		logger.info("center_offset_raw=%.3f (3D L2) | x=%.3f y=%.3f z=%.3f (raw scale)",
+		            center_offset_3d, offset_xyz[0], offset_xyz[1], offset_xyz[2])
+		logger.info("z_depth_error=%.3f (raw bin, SPAD 核心指标)", z_abs_error)
 
 	# === 7) 出图: 文件名 = <预测类别>_<完整 ckpt stem>_<时间戳到分钟>.png ===
 	# - pred_class: 模型预测的字母 (字符串)
@@ -567,25 +572,24 @@ def run_single_test(args: argparse.Namespace) -> Dict[str, str]:
 def build_parser() -> argparse.ArgumentParser:
 	"""单 txt 文件推理 + 可视化 CLI。"""
 	parser = argparse.ArgumentParser(description="SPAD single-TXT-file inference + visualization")
-	parser.add_argument(
+	parser.add_argument(  # 数据路径 
 		"--input", type=str, 
-		default=r"D:\\PYproject\\SPADdata\\2025-04-30-dpc\\D\\2025-04-30_18-51-28_Delay-0_Width-200-6-8.txt",
+		default=r"D:\\PYproject\\SPADdata\\2025-04-30-dpc\\W\\2025-04-30_19-07-46_Delay-0_Width-200-7-9.txt",
 		help="路径到单个点云 .txt (或 .npy/.npz, 与 utils.data.load_point_cloud_auto 一致)",
 	)
-	parser.add_argument(
+	parser.add_argument(  # 模型路径
 		"--checkpoint", type=str,
-		# 默认指向 2026-05-21 bbox-refactor 之后训练的 dgcnn ckpt (box_head 已是 3 维中心);
-		# 早于 2026-05-21 的 ckpt (例如 dgcnn_20260426_*) 仍是 6 维角点 box_head, 与当前
-		# baseline/DGCNN.py 接口不兼容, load_state_dict 会 size mismatch。
-		default=r"D:\PYproject\SPAD\checkpoints\dgcnn_20260521_044755_814832_best.pth",
+		default=r"D:\\PYproject\\SPAD\\checkpoints\\graph_residual_gcn_20260602_154755_454174_last.pth",
 		help="训练 checkpoint 路径 (须为 bbox-refactor 之后的 3 维 box_head ckpt)",
 	)
-	# 与 scripts/test.py 的 --model choices 列表保持一致, 覆盖 baseline/ 下所有
-	# 已注册的模型 (build_model 支持的全部 name)。
-	parser.add_argument(
-		"--model", type=str, default="dgcnn",
-		choices=["dgcnn", "pointnet", "pointnet2", "pointnet2msg", "pointtransformer", "pointtransv2", "pointtransv3",
-			"pointmlp", "pointbert", "pointmae", "pointrwkv", "spt", "upp",
+	parser.add_argument(  # 模型名称
+		"--model", type=str, default="graph_residual_gcn",
+		choices=[
+			"dgcnn", "pointnet", "pointnet2", "pointnet2msg",
+			"pointtransformer", "pointtransv2", "pointtransv3",
+			"pointmlp", "pointbert", "pointmae", "pointrwkv",
+			"spt", "upp",
+			"graph_residual", "graph_residual_gcn",   # 自研模型
 		],
 	)
 	parser.add_argument("--output-dir", type=str, default=r"D:\PYproject\SPAD\logs\test1",
