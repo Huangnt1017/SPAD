@@ -18,7 +18,6 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 TensorLike = Union[torch.Tensor, Sequence[float]]
@@ -416,18 +415,18 @@ class PointCloudMultiTaskLoss(nn.Module):
 	GT 框尺寸固定 (见 FIXED_BBOX_HALF_SIZE_NORMALIZED), 模型只回归中心点 [cx,cy,cz];
 	测试/可视化时再用固定半宽重建 6 维 bbox。
 
-	Total loss (2 项):
-	  L = w_cls * L_cls + w_box * L_gauss
+	默认使用固定权重 λ_cls · L_cls + λ_depth · L_depth (auto_balance=False)。
+	也可通过 auto_balance=True 启用 Kendall et al. 同方差不确定性自动平衡:
+	  L = exp(-s_cls) * L_cls + s_cls + exp(-s_box) * L_box + s_box
 
-	其中 L_gauss 为 SPAD Soft-Gaussian Box Loss, 受启发于:
-	  Deng et al., "Histogram-free SPAD imaging via spatiotemporal multi-head LSTM"
-	  (Optics Letters, 2026) 中的 Soft-histogram depth loss。
+	这里优化的是 s = log(sigma^2), 而不是 sigma^2 本身。s 可以为负,
+	但实际方差 sigma^2 = exp(s) 始终为正。由于 +s 正则项存在, 总优化目标
+	在分项 loss 很小时可能为负, 这不是负方差, 也不表示反向传播出错。
 
-	核心思想: 将 GT 中心建模为 3D 高斯分布 (σ_d = h_d, 各维半宽作为测量不确定度),
-	loss = -log(exp(-Σ_d Δ_d² / (2h_d²)) + ε), 统一替代之前的 SmoothL1 + DIoU:
-	  - 自然维度加权 (z 轴 h=0.018, 误差被放大 ~43 倍)
-	  - 有界、类 IoU 行为 (衡量预测落在 GT 高斯包络内的似然)
-	  - log + ε 保证梯度永不消失 (解决旧 IoU loss 在框不重叠时梯度为零的问题)
+	其中 L_depth 为 SPAD Soft-histogram depth loss:
+	  L_depth = Σ_d Σ_k w_k · (ĉ_d - (c_d^gt + k · δ_d))²
+	直接建模 SPAD 物理过程: 时间 bin 量化 (δ_d) + 高斯脉冲展宽 (w_k)。
+	w_k = exp(-k² / (2σ²)) / Z 为高斯权重, Z 为归一化常数。
 
 	输入约定:
 	- model_outputs 第二项: [B, 3] 中心点 [cx,cy,cz]
@@ -440,20 +439,39 @@ class PointCloudMultiTaskLoss(nn.Module):
 		box_weight: float = 1.0,
 		label_smoothing: float = 0.0,
 		half_size: Sequence[float] = FIXED_BBOX_HALF_SIZE_NORMALIZED,
-		auto_balance: bool = True,
-		gauss_eps: float = 0.01,
+		auto_balance: bool = False,
+		sh_k: int = 2,
+		sh_sigma: float = 1.5,
 	):
+		"""
+		Args:
+			cls_weight: 分类损失固定权重 λ_cls。
+			box_weight: 深度回归损失固定权重 λ_depth。
+			label_smoothing: 分类标签平滑系数。
+			half_size: 固定 bbox 半宽 (归一化空间)。
+			auto_balance: 是否启用 Kendall 自适应权重 (默认 False, 使用固定权重)。
+			sh_k: Soft-histogram 窗口半径 K (总窗口 2K+1)。
+			sh_sigma: Soft-histogram 高斯宽度 σ (单位: bin 数)。
+		"""
 		super().__init__()
 		self.cls_weight = float(cls_weight)
 		self.box_weight = float(box_weight)
 		self.auto_balance = auto_balance
-		self.gauss_eps = gauss_eps
 		self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
 		self.register_buffer(
 			"_half_size",
 			torch.tensor(half_size, dtype=torch.float32),
 			persistent=False,
 		)
+
+		# Soft-histogram 参数
+		self.sh_k = int(sh_k)
+		self.sh_sigma = float(sh_sigma)
+		# 预计算高斯权重 (2K+1,), 归一化使和为 1
+		k_vals = torch.arange(-sh_k, sh_k + 1, dtype=torch.float32)
+		weights = torch.exp(-k_vals.pow(2) / (2 * sh_sigma ** 2))
+		weights = weights / weights.sum()
+		self.register_buffer("_sh_weights", weights, persistent=False)
 
 		# Kendall et al. (CVPR 2018) 同方差不确定性自适应权重 (2 项: cls + box)
 		if auto_balance:
@@ -477,7 +495,7 @@ class PointCloudMultiTaskLoss(nn.Module):
 			box_valid_mask: 有效样本掩码 [B]。
 
 		Returns:
-			字典: total_loss / cls_loss / box_l1_loss (中心 smooth-L1) / box_iou_loss /
+			字典: total_loss / cls_loss / box_depth_loss /
 			       box_iou_mean (用固定半宽重建后的 3D IoU, 仅监控)。
 		"""
 		logits, center_preds = split_cls_and_box_predictions(model_outputs)
@@ -492,7 +510,7 @@ class PointCloudMultiTaskLoss(nn.Module):
 		out: Dict[str, torch.Tensor] = {
 			"total_loss": total_loss,
 			"cls_loss": cls_loss,
-			"box_gauss_loss": torch.zeros((), device=logits.device),
+			"box_depth_loss": torch.zeros((), device=logits.device),
 			"box_iou_mean": torch.zeros((), device=logits.device),
 		}
 
@@ -535,16 +553,35 @@ class PointCloudMultiTaskLoss(nn.Module):
 
 			half_size = self._half_size.to(device=logits.device, dtype=logits.dtype)
 
-			# SPAD Log-Cauchy Box Loss
-			# 受 Deng et al. (Optics Letters 2026) Soft-histogram depth loss 启发:
-			# 将 GT 中心建模为具有 per-dim 不确定度 h_d 的分布。
-			# log(1 + Δ²/h²) 兼具:
-			#   - 小误差时 MSE 行为 (Δ²/h², 柔和精调)
-			#   - 大误差时对数增长 (2·log(|Δ|/h), 永不饱和, 梯度永不为零)
-			#   - 自然维度加权 (h_z=0.018 使 z 误差被放大 ~43 倍)
-			delta = pred_c_valid - gt_c_valid                              # (B_valid, 3)
-			norm_sq = (delta / half_size.unsqueeze(0)).pow(2)              # (B_valid, 3)
-			box_gauss_loss = torch.log1p(norm_sq).sum(dim=-1).mean()       # scalar
+			# SPAD Soft-histogram depth loss (Deng et al., Optics Letters 2026)
+			# 直接建模 SPAD 物理过程: 时间 bin 量化 + 高斯脉冲展宽。
+			# L_depth = Σ_d Σ_k w_k · (ĉ_d - (c_d^gt + k · δ_d))²
+			# 其中 δ_d 为各维度的 bin 宽度 (归一化空间), w_k 为高斯权重。
+			#
+			# 物理解释:
+			# - SPAD 激光雷达的回波信号在时间 bin 上是离散量化的
+			# - 高斯脉冲展宽 (σ bins) 导致 GT 深度存在不确定性
+			# - Soft-histogram 允许预测落在 GT 附近的多个 bin 上, 受较小惩罚
+			sh_weights = self._sh_weights.to(device=logits.device, dtype=logits.dtype)
+
+			# 归一化空间的 bin 宽度: δ_d = 1 / (bins - 1)
+			# x/y: 64 bins → δ = 1/63 ≈ 0.01587
+			# z: 109 bins → δ = 1/108 ≈ 0.00926
+			delta_t = torch.tensor([1.0 / 63.0, 1.0 / 63.0, 1.0 / 108.0],
+			                      device=logits.device, dtype=logits.dtype)  # (3,)
+
+			# 对每个 k ∈ [-K, K], 计算加权 MSE
+			# sh_weights shape: (2K+1,), 索引 i 对应 k = i - K
+			box_depth_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+			for i in range(2 * self.sh_k + 1):
+				k = i - self.sh_k  # 当前偏移 bin 数
+				w_k = sh_weights[i]  # 高斯权重
+				# GT 中心偏移 k 个 bin: c_d^gt + k · δ_d
+				gt_shifted = gt_c_valid + k * delta_t.unsqueeze(0)  # (B_valid, 3)
+				# MSE: (ĉ_d - (c_d^gt + k · δ_d))²
+				mse_k = (pred_c_valid - gt_shifted).pow(2)  # (B_valid, 3)
+				# 加权求和: w_k · MSE
+				box_depth_loss = box_depth_loss + w_k * mse_k.sum(dim=-1).mean()
 
 			# 标准 IoU 仅用于监控 (不参与反传)
 			with torch.no_grad():
@@ -557,12 +594,12 @@ class PointCloudMultiTaskLoss(nn.Module):
 			if self.auto_balance:
 				total_loss = (
 					total_loss
-					+ torch.exp(-self.log_var_box) * box_gauss_loss + self.log_var_box
+					+ torch.exp(-self.log_var_box) * box_depth_loss + self.log_var_box
 				)
 			else:
-				total_loss = total_loss + self.box_weight * box_gauss_loss
+				total_loss = total_loss + self.box_weight * box_depth_loss
 
-			out["box_gauss_loss"] = box_gauss_loss
+			out["box_depth_loss"] = box_depth_loss
 			out["box_iou_mean"] = iou_per_sample.mean()
 
 		out["total_loss"] = total_loss

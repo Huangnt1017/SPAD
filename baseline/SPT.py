@@ -116,9 +116,8 @@ class TransformerBlock(nn.Module):
         T = xyz.shape[0]
         loc = xyz[0] if not self.use_encoder else xyz
         dists = square_distance(loc, loc)
-        knn_idx = dists.argsort()[:, :, :self.k] \
-                if not self.use_encoder else \
-                dists.argsort()[:, :, :, :self.k]
+        k_neighbors = min(self.k, dists.shape[-1])
+        knn_idx = dists.topk(k=k_neighbors, dim=-1, largest=False, sorted=False)[1]
         knn_xyz = index_points(loc, knn_idx)
         knn_idx = knn_idx.repeat(T, 1, 1, 1).flatten(0,1) \
                 if not self.use_encoder else \

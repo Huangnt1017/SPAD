@@ -10,14 +10,14 @@ CLI 运行示例（PowerShell）:
     # 只检查将要恢复的日志与 checkpoint，不真正启动训练。
     python scripts/resume_last_training.py --dry-run
 
-    # 恢复指定模型最近一次未完成训练。
-    python scripts/resume_last_training.py --model pointtransformer
+    # 恢复 SPT 最近一次未完成训练。
+    python scripts/resume_last_training.py --model spt
 
-    # 恢复指定模型，并把目标总 epoch 覆盖为 150。
-    python scripts/resume_last_training.py --model pointtransformer --epochs 150
+    # 恢复 SPT，并把目标总 epoch 覆盖为 150。
+    python scripts/resume_last_training.py --model spt --epochs 150
 
     # 允许选择日志里已经达到目标 epoch 的训练，常用于追加训练轮数。
-    python scripts/resume_last_training.py --model pointtransformer --include-finished --epochs 200
+    python scripts/resume_last_training.py --model spt --include-finished --epochs 200
 
 非 CLI 运行示例:
 
@@ -30,7 +30,7 @@ CLI 运行示例（PowerShell）:
 
 参数说明:
     --model:
-        可选。限制只恢复某个模型；不提供时扫描所有训练日志，选择最近的可恢复运行。
+        可选。限制只恢复某个模型；默认恢复 ``spt``，如需恢复其它模型再显式指定。
     --log-dir:
         训练日志目录。支持绝对路径或相对项目根目录的路径，默认 ``logs``。
     --save-dir:
@@ -49,10 +49,10 @@ CLI 运行示例（PowerShell）:
 
 输入输出约定:
     输入日志形如 ``logs/train_<model>_<timestamp>.log``。
-    输入 checkpoint 形如 ``checkpoints/<model>_<timestamp>_last.pth`` 或
-    ``checkpoints/<model>_<timestamp>_best.pth``，优先使用 ``_last.pth``。
-    输出由 ``scripts.train.run_training`` 生成，包括新的训练日志以及新的
-    ``_best.pth`` / ``_last.pth`` checkpoint。
+    输入 checkpoint 形如 ``checkpoints/<model>_<timestamp>_last.pth``。
+    接续训练只使用 ``_last.pth``，不从 ``_best.pth`` 兜底恢复。
+    输出由 ``scripts.train.run_training`` 生成；恢复时追加写入原日志，并沿用原
+    timestamp 覆盖/刷新同一组 ``_best.pth`` / ``_last.pth`` checkpoint。
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ from scripts import train as train_module
 
 LOG_NAME_RE = re.compile(r"^train_(?P<model>.+)_(?P<timestamp>\d{8}_\d{6}_\d{6})\.log$")
 EPOCH_RE = re.compile(r"Epoch \[(?P<epoch>\d+)/(?P<total>\d+)\]")
+RESUME_CHECKPOINT_SUFFIX = "last"
 CHECKPOINT_KEYS = (
     "epoch",
     "model_state_dict",
@@ -91,7 +92,7 @@ CHECKPOINT_KEYS = (
 class ScriptConfig:
     """CLI 与非 CLI 共享的恢复配置。"""
 
-    model: Optional[str] = None
+    model: Optional[str] = "spt"
     log_dir: Path = Path("logs")
     save_dir: Path = Path("checkpoints")
     epochs: Optional[int] = None
@@ -173,15 +174,9 @@ def iter_log_runs(log_dir: Path, model: str = "") -> Iterable[dict[str, Any]]:
 
 
 def checkpoint_candidates(save_dir: Path, model: str, timestamp: str) -> list[Path]:
-    """返回同一轮训练对应的 checkpoint 候选，优先使用可精确续训的 last。"""
-    last_path = save_dir / f"{model}_{timestamp}_last.pth"
-    best_path = save_dir / f"{model}_{timestamp}_best.pth"
-    candidates = []
-    if last_path.exists():
-        candidates.append(last_path)
-    if best_path.exists():
-        candidates.append(best_path)
-    return candidates
+    """返回同一轮训练对应的 last checkpoint 候选。"""
+    last_path = save_dir / f"{model}_{timestamp}_{RESUME_CHECKPOINT_SUFFIX}.pth"
+    return [last_path] if last_path.exists() else []
 
 
 def checkpoint_kind(checkpoint_path: Path) -> str:
@@ -236,13 +231,16 @@ def find_resume_target(
 
     model_hint = f" for model '{model}'" if model else ""
     raise FileNotFoundError(
-        f"No resumable run found{model_hint} in {log_dir} with checkpoints in {save_dir}."
+        f"No resumable run with a *_{RESUME_CHECKPOINT_SUFFIX}.pth checkpoint found"
+        f"{model_hint} in {log_dir} with checkpoints in {save_dir}."
     )
 
 
 def namespace_from_checkpoint(
     checkpoint_args: dict[str, Any],
     checkpoint_path: Path,
+    resume_log_path: Path,
+    resume_run_timestamp: str,
     log_dir: Path,
     save_dir: Path,
     epochs: Optional[int] = None,
@@ -261,6 +259,8 @@ def namespace_from_checkpoint(
     merged["resume"] = str(checkpoint_path.resolve())
     merged["log_dir"] = str(log_dir.resolve())
     merged["save_dir"] = str(save_dir.resolve())
+    merged["resume_log_file"] = str(resume_log_path.resolve())
+    merged["resume_run_timestamp"] = resume_run_timestamp
 
     return argparse.Namespace(**merged)
 
@@ -282,12 +282,6 @@ def print_target_summary(target: dict[str, Any], args: argparse.Namespace) -> No
     missing_keys = target.get("missing_checkpoint_keys") or []
     if missing_keys:
         print(f"  warning: checkpoint is missing keys: {', '.join(missing_keys)}")
-
-    if target["checkpoint_kind"] != "last" and target["log_epoch"] != target["checkpoint_epoch"]:
-        print(
-            "  note: no matching _last checkpoint was found, so resume uses the saved best checkpoint."
-        )
-
 
 def validate_config(config: ScriptConfig) -> None:
     """校验脚本级参数，避免长训练启动后才暴露明显配置错误。"""
@@ -325,20 +319,20 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  python scripts/resume_last_training.py --dry-run\n"
-            "  python scripts/resume_last_training.py --model pointtransformer\n"
-            "  python scripts/resume_last_training.py --model pointtransformer --epochs 150\n"
-            "  python scripts/resume_last_training.py --model pointtransformer --include-finished --epochs 200\n\n"
+            "  python scripts/resume_last_training.py --model spt\n"
+            "  python scripts/resume_last_training.py --model spt --epochs 150\n"
+            "  python scripts/resume_last_training.py --model spt --include-finished --epochs 200\n\n"
             "Outputs:\n"
             "  dry-run: prints selected log, checkpoint, checkpoint epoch, target epochs, batch size, data root.\n"
-            "  training: delegates to scripts.train.run_training and writes new logs/checkpoints."
+            "  training: delegates to scripts.train.run_training, appends the original log, and reuses checkpoint names."
         ),
     )
     parser.add_argument(
         "--model",
         type=str,
-        default=None,
+        default="spt",
         choices=model_choices or None,
-        help="Only resume this model. Omit to scan all models.",
+        help="Only resume this model. Default: spt.",
     )
     parser.add_argument(
         "--log-dir",
@@ -397,6 +391,8 @@ def run_with_config(config: ScriptConfig) -> Optional[dict[str, str]]:
     training_args = namespace_from_checkpoint(
         checkpoint_args=target["checkpoint_args"],
         checkpoint_path=target["checkpoint_path"],
+        resume_log_path=target["log_path"],
+        resume_run_timestamp=target["timestamp"],
         log_dir=resolved_log_dir,
         save_dir=resolved_save_dir,
         epochs=config.epochs,
@@ -413,7 +409,7 @@ def run_with_config(config: ScriptConfig) -> Optional[dict[str, str]]:
 
 
 def resume_latest_training(
-    model: str = "",
+    model: str = "spt",
     log_dir: str | Path = "logs",
     save_dir: str | Path = "checkpoints",
     epochs: Optional[int] = None,
@@ -424,7 +420,7 @@ def resume_latest_training(
     """非 CLI 兼容入口：从 Python 代码中恢复最近一次训练。
 
     Args:
-        model: 只恢复指定模型；为空时选择最近的可恢复训练。
+        model: 只恢复指定模型；默认恢复 SPT。传入空字符串时选择最近的可恢复训练。
         log_dir: 训练日志目录，支持相对项目根目录的路径。
         save_dir: checkpoint 目录，支持相对项目根目录的路径。
         epochs: 覆盖目标总 epoch；None 表示沿用 checkpoint 中保存的值。
@@ -476,14 +472,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def main_without_cli() -> None:
     """非 CLI 主程序：在函数内直接编辑参数，适合 IDE 调试和临时实验。"""
     # ===== 可编辑参数区 =====
-    # model_name=None 表示扫描所有模型；也可以改成 "pointtransv2" 等具体模型名。
-    model_name: Optional[str] = "pointtransv2"
+    # model_name="spt" 表示恢复 SPT；改成 None 可扫描所有模型。
+    model_name: Optional[str] = "spt"
     log_dir = Path("logs")
     save_dir = Path("checkpoints")
-    target_epochs: Optional[int] = 200
+    target_epochs: Optional[int] = 100
     batch_size: Optional[int] = None
     include_finished = True
-    dry_run = True
+    dry_run = False
 
     # ===== 中间变量区 =====
     selected_model = model_name.strip() if isinstance(model_name, str) else None
@@ -511,15 +507,15 @@ if __name__ == "__main__":
     #       无参数运行，进入 main_without_cli()，默认 dry-run。
     #   python scripts/resume_last_training.py --dry-run
     #       CLI dry-run，只打印恢复目标，不启动训练。
-    #   python scripts/resume_last_training.py --model pointtransformer --epochs 150
-    #       恢复指定模型，并覆盖目标总 epoch。
-    #   python scripts/resume_last_training.py --model pointtransformer --include-finished --epochs 200
-    #       允许选择已完成日志，常用于追加训练轮数。
-    #
+    #   python scripts/resume_last_training.py --model spt --epochs 150
+    #       恢复 SPT，并覆盖目标总 epoch。
+    #   python scripts/resume_last_training.py --model spt --include-finished --epochs 200
+    #       允许选择已完成 SPT 日志，常用于追加训练轮数。
+    # 接续cli：& "D:\Anaconda3\envs\torchnew\python.exe" "D:\PYproject\SPAD\scripts\resume_last_training.py" --model spt
     # 常用参数:
-    #   --model <name>          只恢复指定模型；不填则扫描所有模型。
+    #   --model <name>          只恢复指定模型；默认 spt。
     #   --log-dir logs          训练日志目录，支持相对项目根目录或绝对路径。
-    #   --save-dir checkpoints  checkpoint 目录，优先查找 *_last.pth，再查找 *_best.pth。
+    #   --save-dir checkpoints  checkpoint 目录，只查找 *_last.pth。
     #   --epochs 150            覆盖目标总 epoch，必须大于 checkpoint epoch。
     #   --batch-size 16         覆盖 batch size，不填则沿用 checkpoint 中保存的值。
     #   --include-finished      允许选择日志已达到目标 epoch 的训练。
@@ -530,8 +526,8 @@ if __name__ == "__main__":
     #       打印选中的日志、checkpoint、checkpoint epoch、恢复起始 epoch、
     #       目标 epoch、batch size、data root 和 best_val_top1。
     #   真正训练:
-    #       复用 scripts.train.run_training，生成新的
-    #       logs/train_<model>_<timestamp>.log、
+    #       复用 scripts.train.run_training，追加写入原
+    #       logs/train_<model>_<timestamp>.log，并刷新同 timestamp 的
     #       checkpoints/<model>_<timestamp>_best.pth 和
     #       checkpoints/<model>_<timestamp>_last.pth。
     if len(sys.argv) > 1:

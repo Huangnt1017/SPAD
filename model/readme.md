@@ -112,6 +112,9 @@ Box 头接收全局特征 + 点云坐标统计量 $(B, 1024{+}8)$，预测从**�
 $$\hat{\mathbf c} = \bar{\mathbf P}_{xyz} + \text{MLP}([\mathbf f_{pool} \| \bar{\mathbf P} \| \sigma_{\mathbf P}])$$
 其中 $\bar{\mathbf P}$ 为 1024 点的 4D 坐标均值（质心锚点），$\sigma_{\mathbf P}$ 为标准差（尺度先验）。网络只需学习接近零的残差偏移，收敛显著加快。推理时由固定归一化半宽 `FIXED_BBOX_HALF_SIZE_NORMALIZED` 重建完整 3D 边界框。
 
+> **GCN 变体使用直接回归**：为确保与 baseline (DGCNN/PointNet++ 等) 的对比公平性，GCN 版改为 `box_pred = self.box_head(f_pooled)` 直接从全局池化特征预测中心点坐标，不依赖质心先验。
+
+
 #### 损失函数
 
 仅 **2 项损失**，采用 **Kendall et al. (CVPR 2018) 同方差不确定性自适应权重** 自动平衡：
@@ -142,6 +145,8 @@ $$\mathcal L_{box} = \sum_{d \in \{x,y,z\}} \log\left(1 + \frac{(\hat c_d - c_d^
 | **无梯度消失** | 对数增长保证任意大的误差仍有非零梯度 (避免了纯 Gaussian/IoU 的饱和问题) |
 | **鲁棒性** | 大误差时对数增长而非线性/平方增长, 不会被离群样本主导 |
 
+> **GCN 变体使用 Soft-histogram depth loss**：直接建模 SPAD 物理过程 (时间 bin 量化 + 高斯脉冲展宽)，见下文 GCN 版优化路线。
+
 此设计**统一替代了之前的 SmoothL1 + DIoU 两项 loss**，将 3 项损失简化为 2 项。
 
 两个损失分项：
@@ -156,6 +161,94 @@ $$\mathcal L_{box} = \sum_{d \in \{x,y,z\}} \log\left(1 + \frac{(\hat c_d - c_d^
 - **参数量**：约 1.65 M（+ 2 个可学习损失权重参数）
 - **显存**：RTX 4070 SUPER 上 $B{=}32$ 训练峰值约 7.4 GB（含梯度检查点）
 - **v7 速度优化**：坐标 KNN + `get_graph_feature(p)` 在网络入口一次性预计算，4 个 Block 共享缓存张量 `p_graph`$(B,8,N,k)$，省掉 3 次 $O(N^2)$ KNN 和 3 次 gather/permute，约提速 30%
+
+#### PyG 图卷积变体 (GCN Version)
+
+为探索真图卷积 (Graph Convolutional Network) 在单光子点云上的潜力，我们在 `model/graph_res_GCN.py` 中实现了 **PyTorch Geometric SAGEConv 变体**，替换原版的 DGCNN 风格 Conv2d EdgeConv。
+
+**核心区别**：
+
+| 维度 | 原版 (DGCNN EdgeConv) | GCN 变体 (PyG SAGEConv) |
+|:----:|:--------------------:|:----------------------:|
+| **卷积核** | `Conv2d` on `[x_j - x_i, x_i]` | `SAGEConv` (真消息传递) |
+| **聚合方式** | Max pool over edge features | Mean aggregation: $\mathbf h_i' = W_1 \mathbf h_i + W_2 \cdot \text{mean}_{j \in \mathcal N(i)} \mathbf h_j$ |
+| **权重结构** | 单一 MLP (边特征 → 输出) | 中心-邻居分离权重 ($W_1$ vs $W_2$) |
+| **归纳性** | Transductive (依赖边特征拼接) | Inductive (可处理未见图拓扑) |
+| **缓存格式** | `p_graph` $(B,8,N,k)$ 边特征 | `p_edge_index` $(2, B{\cdot}N{\cdot}k)$ PyG 边索引 |
+| **双流融合** | Q/K/V 注意力 (k 邻居 softmax) | SE channel gate + Conv1d 融合 |
+| **Box 头** | Centroid-offset ($\bar{\mathbf P} + \text{MLP}$) | 直接回归 (与 baseline 一致) |
+| **深度 Loss** | Log-Cauchy | Soft-histogram (物理驱动) |
+
+**架构变化**：
+
+1. **GCN_f (特征流)**：SAGEConv on 特征空间动态 KNN 图 (DGCNN "动态图" 范式保留，卷积核换为真 GNN)
+2. **GCN_p (位置流)**：SAGEConv on 坐标空间静态 KNN 图 (预计算复用，同原版)
+3. **SE channel gate**：因 SAGEConv 已将邻域聚合为单向量，全局 $(B,N,N)$ softmax 注意力既嘈杂又过拟合；改为 SE-style channel gate 对 $f_{gcn}$ 做通道加权，再与 $p_{gcn}$ 通过 Conv1d 融合
+4. **Box 头直接回归**：与 DGCNN / PointNet++ 等 baseline 保持一致，从全局池化特征直接预测中心点坐标，不依赖质心先验
+5. **Soft-histogram depth loss**：直接建模 SPAD 物理过程 (时间 bin 量化 + 高斯脉冲展宽)，替代 Log-Cauchy 数学近似
+
+**Block 数据流 (GCN 版)**：
+
+```text
+[单 Block 数据流向 — PyG SAGEConv 版 (SE gate)]
+ f(B,C,N) + p(B,4,N) + p_edge_index(2,E) [预计算缓存]
+  │
+  ├── KNN from f (特征空间, 每层重算)   p_edge_index (坐标图边, 入口预计算复用)
+  │        ↓                                    │
+  ├── [GCN_f]                              [GCN_p]
+  │   batched_knn_edge_index(f_knn)        SAGEConv(p) + BN1d + LReLU
+  │   SAGEConv(f) + BN1d + LReLU                │
+  │       ↓                                     ↓
+  │   f_gcn (B,C_out,N)                   p_gcn (B,C_out,N)
+  │       |                                     |
+  │   GAP → Linear → ReLU → Linear → Sigmoid    |
+  │       ↓ (SE weight)                         |
+  │   f_gcn_gated (B,C_out,N)                   |
+  │       |                                     |
+  │     ┌──────────────────────────────────┐
+  │     │    SE-style Channel Gate         │
+  │     │                                   │
+  │     │  cat([f_gcn_gated, p_gcn])       │
+  │     │  → Conv1d+BN1d → fused           │
+  │     └──────────────────────────────────┘
+  │                 │
+  │                 ↓
+  └──> gate · fused + (1-gate) · coord_res ──> LeakyReLU ──> f_out
+        gate = σ(Conv1d+BN(P[4D]))                            p 不变
+```
+
+**模型规模与显存**：
+
+- **参数量**：约 1.56 M (SE gate + Conv1d 融合替代 Q/K/V 注意力，参数略减)
+- **显存**：RTX 4070 SUPER 上 $B{=}32$ 训练峰值约 **0.5 GB** (原版 v7 约 7.4 GB) — SAGEConv 消息传递 + SE gate 比 Conv2d EdgeConv + 全局注意力更轻量
+- **训练命令**：默认使用固定权重 $\lambda_{cls} \cdot \mathcal L_{cls} + \lambda_{depth} \cdot \mathcal L_{depth}$
+
+```powershell
+$env:PYTHONPATH = "D:\PYproject\SPAD"
+& "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\train.py" --model graph_residual_gcn --batch-size 32 --epochs 100
+```
+
+**设计动机**：SAGEConv 的 mean 聚合天然保留邻域分布统计信息，适合 SPAD 点云的噪声建模；中心-邻居分离权重 ($W_1, W_2$) 表达力更强；归纳式学习可处理未见过的图拓扑 (如不同噪声强度下的 KNN 图变化)。SE channel gate 替代全局注意力，消除 1024×1024 注意力矩阵的过拟合风险与显存开销。
+
+#### GCN 版优化路线 (v2)
+
+基于首轮 100 epoch 训练结果诊断 (train_top1=0.993 vs val_top1=0.872，过拟合 gap 达 12.9%)，已完成以下优化：
+
+**P0 — 移除全局注意力 (已完成)**：原 SAGEConv 已将邻域聚合为单向量 (无邻居维度 $k$)，被迫做 $(B,N,N)$ 全局 softmax — 对 1024 点全连接图注意力既嘈杂又过拟合。改为 SE-style channel gate + Conv1d 直接融合 $f_{gcn}$ 与 $p_{gcn}$，消除 1024×1024 注意力矩阵 (~512 MB 中间显存)。
+
+**统一 Box 头 (已完成)**：原 centroid-offset 预测依赖质心先验，与 baseline (DGCNN/PointNet++ 等) 的直接回归方式不一致，导致对比实验不公平。改为 `box_pred = self.box_head(f_pooled)` 直接回归，确保 backbone 成为唯一变量。
+
+**Soft-histogram depth loss (已完成)**：原 Log-Cauchy 为数学近似，改为直接建模 SPAD 物理过程：
+$$\mathcal L_{depth} = \sum_{d \in \{x,y,z\}} \sum_{k=-K}^{K} w_k \cdot (\hat c_d - (c_d^{gt} + k \cdot \delta_d))^2$$
+其中 $\delta_d$ 为各维度 bin 宽度 (归一化空间: $x/y$ 为 $1/63$, $z$ 为 $1/108$)，$w_k \propto e^{-k^2/2\sigma^2}$ 为高斯权重 ($K{=}2$, $\sigma{=}1.5$)。
+
+**固定权重 (已完成)**：原 Kendall 自适应权重导致训练 loss 变负 (log-variance 项无约束增长)，改为 $\lambda_{cls} \cdot \mathcal L_{cls} + \lambda_{depth} \cdot \mathcal L_{depth}$ (默认 $\lambda_{cls} = \lambda_{depth} = 1.0$)。
+
+**待优化**：
+
+**P1 — 缩减 head**：cls_head 占参数 40% (664K)，box_head 占 18% (298K)，head 总参数 1.23M → 目标降至 ~0.2M。
+
+**P2 — 通道缩减**：stem 4→16, block 通道减半，总参数目标 ~0.4–0.5M (当前 1.56M 的 ~30%)。
 
 ### 任务 2：面向特定领域（输电杆塔）的数据模拟与算法验证
 **目标与动机**：为了验证所提算法（任务1）在真实工程场景中的可用性与泛化能力，将研究目标投射到电网巡检领域的具体应用上。
@@ -186,6 +279,7 @@ $$\mathcal L_{box} = \sum_{d \in \{x,y,z\}} \log\left(1 + \frac{(\hat c_d - c_d^
 
 - **针对降采样图谱架构（任务1与2）**：
   - 将开发的”图残差网络”与 13 个基线模型在同等降采样的单光子数据集上开展消融实验与横向对比。基线覆盖经典与前沿方法：PointNet, PointNet++, DGCNN, CurveNet, PointMLP, PointNeXt, GDANet, PointTransformerV2, PointTransformerV3, SimplePointTransformer, PointMAE, PointRWKV, 3DETR, UPP 等。
+  - **内部消融**：对比原版 Graph Residual (DGCNN EdgeConv) 与 PyG GCN 变体 (SAGEConv)，验证真图卷积对单光子点云噪声建模的有效性。
   - 主要评估指标：分类 Top-1/Top-3 准确率、3D Box IoU、3D Box Center L1。
 
 - **针对全数据网格隐变量架构（任务3）**：

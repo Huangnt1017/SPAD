@@ -26,6 +26,7 @@ def save_checkpoint(
     best_val_top1: float,
     class_to_idx: Dict[str, int],
     args: argparse.Namespace,
+    criterion: Optional[nn.Module] = None,
 ) -> None:
     """保存完整训练状态到 checkpoint 文件。
 
@@ -41,6 +42,7 @@ def save_checkpoint(
         best_val_top1: 历史最佳验证集 Top-1 准确率。
         class_to_idx: 类别到索引的映射字典。
         args: 训练命令行参数。
+        criterion: 可选。训练损失模块；包含 Kendall 自适应权重等可学习状态时应保存。
 
     Returns:
         None
@@ -54,6 +56,8 @@ def save_checkpoint(
         "class_to_idx": class_to_idx,
         "args": vars(args),
     }
+    if criterion is not None:
+        payload["criterion_state_dict"] = criterion.state_dict()
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 
@@ -63,6 +67,7 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: Optional[optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
+    criterion: Optional[nn.Module] = None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """从 checkpoint 恢复训练状态。
@@ -72,6 +77,7 @@ def load_checkpoint(
         model: 待加载权重的模型实例。
         optimizer: 待恢复状态的优化器实例（可选）。
         scheduler: 待恢复状态的学习率调度器（可选）。
+        criterion: 待恢复状态的损失模块（可选）。
         device: 目标设备，默认使用模型当前设备。
 
     Returns:
@@ -81,6 +87,9 @@ def load_checkpoint(
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
 
     model.load_state_dict(checkpoint["model_state_dict"])
+
+    if criterion is not None and "criterion_state_dict" in checkpoint:
+        criterion.load_state_dict(checkpoint["criterion_state_dict"])
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

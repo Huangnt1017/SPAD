@@ -227,7 +227,7 @@ def farthest_point_sample_varlen(xyz, offset, new_offset):
         dst_count = int(new_counts[0].item())
         if src_count > 0 and dst_count > 0:
             batch_xyz = xyz.reshape(batch_size, src_count, xyz.shape[-1])
-            batch_idx = farthest_point_sample(batch_xyz, dst_count)
+            batch_idx = farthest_point_sample_fast(batch_xyz, dst_count)
             base = torch.arange(batch_size, dtype=torch.long, device=device).view(-1, 1) * src_count
             return (batch_idx + base).reshape(-1)
 
@@ -241,7 +241,7 @@ def farthest_point_sample_varlen(xyz, offset, new_offset):
         if npoint <= 0 or e_i - s_i <= 0:
             continue
         batch_xyz = xyz[s_i:e_i, :].unsqueeze(0)
-        idx = farthest_point_sample(batch_xyz, npoint)
+        idx = farthest_point_sample_fast(batch_xyz, npoint)
         new_xyz_idx[s_new:e_new] = idx[0] + s_i
     return new_xyz_idx
 
@@ -368,7 +368,7 @@ def sample_and_group(npoint, radius, nsample, xyz, points, use_encoder, returnfp
     S = npoint
     loc = xyz[0] if not use_encoder else xyz.flatten(0, 1)
 
-    fps_idx = farthest_point_sample(loc, npoint)
+    fps_idx = farthest_point_sample_fast(loc, npoint)
 
     torch.cuda.empty_cache()
     new_xyz = index_points(loc, fps_idx)

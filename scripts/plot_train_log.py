@@ -5,14 +5,14 @@ SPAD 训练日志 → 曲线图脚本。
 日志中每个 epoch 写两行 (与 scripts/train.py run_epoch 末尾的 logger.info 一一对应):
     ``... | Epoch [E/T] | train_loss=X train_top1=Y train_top3=Z |
                           val_loss=A val_top1=B val_top3=C``
-    ``... | Epoch [E/T] | train_box_iou=X train_box_l1=Y train_box_iou_loss=Z |
-                          val_box_iou=A val_box_l1=B val_box_iou_loss=C``
+    ``... | Epoch [E/T] | train_box_iou=X train_box_depth=Y |
+                          val_box_iou=A val_box_depth=B``
 这两行 epoch 字段一致, 用 ``Epoch [E/T]`` 做 key 把它们合并到同一个数据点。
 
 输出:
-    - 单 log 模式: 2x3 子图 (loss / top1 / top3 / box_iou / box_l1 / box_iou_loss),
+    - 单 log 模式: loss / top1 / top3 / box_iou / box_depth 子图,
       每个子图叠 train + val 两条曲线。文件名 ``curve_<model>_<timestamp>.png``。
-    - 多 log 对比模式: 同样 2x3 布局, 但每个子图把多个 log 的 val 曲线叠到一起
+    - 多 log 对比模式: 每个子图把多个 log 的 val 曲线叠到一起
       横向对比, 文件名 ``compare_<时间戳>.png``。
 
 使用方式: 直接在 if __name__ 中修改 log_patterns 列表即可运行。
@@ -51,11 +51,9 @@ _CLS_LINE = re.compile(
 _BOX_LINE = re.compile(
     r"Epoch \[(?P<epoch>\d+)/(?P<total>\d+)\] \| "
     r"train_box_iou=(?P<train_box_iou>[-+0-9.eE]+) "
-    r"train_box_l1=(?P<train_box_l1>[-+0-9.eE]+) "
-    r"train_box_iou_loss=(?P<train_box_iou_loss>[-+0-9.eE]+) \| "
+    r"train_box_depth=(?P<train_box_depth>[-+0-9.eE]+) \| "
     r"val_box_iou=(?P<val_box_iou>[-+0-9.eE]+) "
-    r"val_box_l1=(?P<val_box_l1>[-+0-9.eE]+) "
-    r"val_box_iou_loss=(?P<val_box_iou_loss>[-+0-9.eE]+)"
+    r"val_box_depth=(?P<val_box_depth>[-+0-9.eE]+)"
 )
 # 从文件名提取 (model, timestamp), 例如:
 #   train_graph_residual_20260522_050314_945951.log
@@ -96,8 +94,7 @@ def parse_log(log_path: Path) -> Dict[str, object]:
             if m_box:
                 ep = int(m_box.group("epoch"))
                 bucket = per_epoch.setdefault(ep, {})
-                for key in ("train_box_iou", "train_box_l1", "train_box_iou_loss",
-                            "val_box_iou", "val_box_l1", "val_box_iou_loss"):
+                for key in ("train_box_iou", "train_box_depth", "val_box_iou", "val_box_depth"):
                     bucket[key] = float(m_box.group(key))
 
     epochs_sorted = sorted(per_epoch.keys())
@@ -120,15 +117,14 @@ def parse_log(log_path: Path) -> Dict[str, object]:
 
 
 # ============================================================================
-# 子图布局: 2x3 (loss / top1 / top3 / box_iou / box_l1 / box_iou_loss)
+# 子图布局: loss / top1 / top3 / box_iou / box_depth
 # ============================================================================
 _PANEL_SPEC: List[Tuple[str, str, str, str]] = [
     ("Loss",         "train_loss",         "val_loss",         "loss"),
     ("Top-1 Acc",    "train_top1",         "val_top1",         "accuracy"),
     ("Top-3 Acc",    "train_top3",         "val_top3",         "accuracy"),
     ("Box IoU",      "train_box_iou",      "val_box_iou",      "iou"),
-    ("Box L1",       "train_box_l1",       "val_box_l1",       "L1 (normalized)"),
-    ("Box IoU Loss", "train_box_iou_loss", "val_box_iou_loss", "1 - iou"),
+    ("Box Depth",    "train_box_depth",    "val_box_depth",    "Soft-histogram"),
 ]
 
 
@@ -162,6 +158,8 @@ def plot_single(parsed: Dict[str, object], save_path: Path) -> None:
         ax.set_ylabel(ylabel)
         ax.grid(alpha=0.3)
         ax.legend(loc="best", fontsize=8)
+    for ax in axes[len(_PANEL_SPEC):]:
+        ax.set_visible(False)
 
     fig.suptitle(f"{model}  (run @ {timestamp})  —  {len(epochs)} epochs", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
@@ -204,6 +202,8 @@ def plot_compare(parsed_list: List[Dict[str, object]], save_path: Path,
         ax.set_ylabel(ylabel)
         ax.grid(alpha=0.3)
         ax.legend(loc="best", fontsize=8)
+    for ax in axes[len(_PANEL_SPEC):]:
+        ax.set_visible(False)
 
     fig.suptitle(f"Comparison ({split}): {len(parsed_list)} runs", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.96))

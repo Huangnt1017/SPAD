@@ -97,29 +97,48 @@ def resolve_path(path_str: str, base_dir: Path) -> Path:
 	return (base_dir / path).resolve()
 
 
-def setup_logger(log_dir: Path, model_name: str) -> Tuple[logging.Logger, Path, str]:
+def setup_logger(
+	log_dir: Path,
+	model_name: str,
+	timestamp: Optional[str] = None,
+	log_file: Optional[Path] = None,
+	append: bool = False,
+) -> Tuple[logging.Logger, Path, str]:
 	"""创建训练日志器。
 
 	Args:
 		log_dir: 日志目录。
 		model_name: 模型名称，用于日志文件命名。
+		timestamp: 可选。恢复训练时传入原 run 的时间戳，保持 checkpoint 文件名连续。
+		log_file: 可选。恢复训练时传入原日志文件，继续追加写入。
+		append: 是否以追加模式打开日志文件。
 
 	Returns:
 		(logger, log_file, timestamp)。
 	"""
 	# 同时写文件和控制台，便于训练过程中实时观察，也方便回看完整日志。
 	log_dir.mkdir(parents=True, exist_ok=True)
-	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-	log_file = log_dir / f"train_{model_name}_{timestamp}.log"
+	if timestamp is None:
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+	if log_file is None:
+		log_file = log_dir / f"train_{model_name}_{timestamp}.log"
+	else:
+		log_file = Path(log_file)
+		if not log_file.is_absolute():
+			log_file = log_dir / log_file
+	log_file.parent.mkdir(parents=True, exist_ok=True)
 
 	logger_name = f"spad_train_{model_name}_{timestamp}"
 	logger = logging.getLogger(logger_name)
 	logger.setLevel(logging.INFO)
 	logger.propagate = False
+	for handler in list(logger.handlers):
+		handler.close()
+		logger.removeHandler(handler)
 
 	formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-	file_handler = logging.FileHandler(log_file, encoding="utf-8")
+	file_handler = logging.FileHandler(log_file, mode="a" if append else "w", encoding="utf-8")
 	file_handler.setFormatter(formatter)
 	logger.addHandler(file_handler)
 
@@ -144,7 +163,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path, args: Opt
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointmlpelite/spt/3detr/pointrwkv/pointbert/pointmae/upp。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointmlpelite/spt/3detr/pointrwkv/pointbert/pointmae/upp/graph_residual/graph_residual_gcn。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -246,6 +265,13 @@ def build_model(model_name: str, num_classes: int, project_root: Path, args: Opt
 			project_root / "model" / "graph_residual.py", "model_graph_residual"
 		)
 		return model_module.GraphResidualMultiTaskNet(num_classes=num_classes)
+
+	# === Graph Residual GCN (PyG SAGEConv 版, model/graph_res_GCN.py) ===
+	if name == "graph_residual_gcn":
+		model_module = load_module_from_file(
+			project_root / "model" / "graph_res_GCN.py", "model_graph_res_gcn"
+		)
+		return model_module.GraphResidualMultiTaskNetGCN(num_classes=num_classes)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -374,7 +400,7 @@ def run_epoch(
 	# (labels.size(0)) 直接累加的, 不涉及 GPU 同步。tqdm 进度条按 log_every 节流,
 	# 一次 .cpu().tolist() 把所有需要展示的标量批量搬到 CPU。
 	total_loss = torch.zeros((), device=device)
-	total_box_gauss = torch.zeros((), device=device)
+	total_box_depth = torch.zeros((), device=device)
 	total_box_iou = torch.zeros((), device=device)
 	correct_top1 = torch.zeros((), device=device, dtype=torch.long)
 	correct_top3 = torch.zeros((), device=device, dtype=torch.long)
@@ -487,7 +513,7 @@ def run_epoch(
 
 			if box_preds is not None and box_targets is not None:
 				# box 指标只有在预测框和目标框都能成功构造时才累计，避免缺失元信息污染统计。
-				total_box_gauss += loss_dict["box_gauss_loss"].detach() * batch_size
+				total_box_depth += loss_dict["box_depth_loss"].detach() * batch_size
 				total_box_iou += loss_dict["box_iou_mean"].detach() * batch_size
 				box_metric_samples += batch_size
 
@@ -520,15 +546,15 @@ def run_epoch(
 		total_loss,
 		correct_top1.to(total_loss.dtype),
 		correct_top3.to(total_loss.dtype),
-		total_box_gauss,
+		total_box_depth,
 		total_box_iou,
 	]).cpu().tolist()
-	f_loss, f_c1, f_c3, f_bg, f_bi = final_snap
+	f_loss, f_c1, f_c3, f_bd, f_bi = final_snap
 	metrics = {
 		"loss": f_loss / max(total_samples, 1),
 		"top1": f_c1 / max(total_samples, 1),
 		"top3": f_c3 / max(total_samples, 1),
-		"box_gauss": f_bg / max(box_metric_samples, 1),
+		"box_depth": f_bd / max(box_metric_samples, 1),
 		"box_iou": f_bi / max(box_metric_samples, 1),
 		"box_samples": float(box_metric_samples),
 		"samples": float(total_samples),
@@ -573,7 +599,15 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		resume_checkpoint = torch.load(resume_path, map_location="cpu")
 		args = merge_resume_model_args(args, resume_checkpoint)
 
-	logger, log_file, run_timestamp = setup_logger(log_dir, args.model)
+	resume_log_file = getattr(args, "resume_log_file", None)
+	resume_run_timestamp = getattr(args, "resume_run_timestamp", None)
+	logger, log_file, run_timestamp = setup_logger(
+		log_dir=log_dir,
+		model_name=args.model,
+		timestamp=resume_run_timestamp or None,
+		log_file=Path(resume_log_file) if resume_log_file else None,
+		append=bool(args.resume and resume_log_file),
+	)
 
 	# 使用统一的多任务数据管线，训练集强制开启增强。
 	if args.train_ratio + args.val_ratio + args.test_ratio <= 0:
@@ -595,10 +629,12 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
 	num_classes = len(class_to_idx)
 	model = build_model(args.model, num_classes=num_classes, project_root=project_root, args=args).to(device)
-	# 多任务损失的三个权重控制分类、box L1 和 box IoU 三部分对总损失的贡献。
+	# 当前多任务损失包含 CrossEntropy 与 Soft-histogram 深度回归两项；默认用固定权重 λ_cls · L_cls + λ_depth · L_depth。
 	criterion = PointCloudMultiTaskLoss(
 		cls_weight=args.cls_loss_weight,
+		box_weight=args.box_loss_weight,
 		label_smoothing=args.label_smoothing,
+		auto_balance=args.auto_balance,
 	)
 	# 将 loss 中的可学习参数 (Kendall 不确定性权重) 一并加入 optimizer
 	optimizer = optim.AdamW(
@@ -613,6 +649,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
 	logger.info("=== Training Configuration ===")
 	logger.info("run_timestamp=%s", run_timestamp)
+	if args.resume and resume_log_file:
+		logger.info("append_log_file=%s", log_file)
 	logger.info("data_root=%s", data_root)
 	logger.info("device=%s", device)
 	logger.info("model=%s", args.model)
@@ -621,6 +659,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("label_mode=%s", args.label_mode)
 	logger.info("augment_train=%s augment_eval=%s", args.augment_train, args.augment_eval)
 	logger.info("amp=%s tf32=%s", use_amp, args.tf32)
+	logger.info("loss_auto_balance=%s", args.auto_balance)
 	logger.info("args=%s", json.dumps(vars(args), ensure_ascii=False))
 
 	start_epoch = 1
@@ -631,6 +670,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		resume_path = resolve_path(args.resume, project_root)
 		checkpoint = torch.load(resume_path, map_location=device)
 		model.load_state_dict(checkpoint["model_state_dict"])
+		if "criterion_state_dict" in checkpoint:
+			criterion.load_state_dict(checkpoint["criterion_state_dict"])
 		if "optimizer_state_dict" in checkpoint:
 			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 		if "scheduler_state_dict" in checkpoint:
@@ -685,14 +726,14 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		if train_metrics["box_samples"] > 0 or val_metrics["box_samples"] > 0:
 			# box 指标单独打印，方便区分分类收敛和几何框收敛是否一致。
 			logger.info(
-				"Epoch [%d/%d] | train_box_iou=%.4f train_box_gauss=%.4f | "
-				"val_box_iou=%.4f val_box_gauss=%.4f",
+				"Epoch [%d/%d] | train_box_iou=%.4f train_box_depth=%.4f | "
+				"val_box_iou=%.4f val_box_depth=%.4f",
 				epoch,
 				args.epochs,
 				train_metrics["box_iou"],
-				train_metrics["box_gauss"],
+				train_metrics["box_depth"],
 				val_metrics["box_iou"],
-				val_metrics["box_gauss"],
+				val_metrics["box_depth"],
 			)
 
 		if val_metrics["top1"] >= best_val_top1:
@@ -707,6 +748,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 				best_val_top1=best_val_top1,
 				class_to_idx=class_to_idx,
 				args=args,
+				criterion=criterion,
 			)
 			logger.info("Saved new best checkpoint to %s", best_ckpt)
 
@@ -720,6 +762,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			best_val_top1=best_val_top1,
 			class_to_idx=class_to_idx,
 			args=args,
+			criterion=criterion,
 		)
 		logger.info("Saved last checkpoint to %s", last_ckpt)
 
@@ -740,7 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="spt",
+		default="graph_residual_gcn",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -757,12 +800,13 @@ def build_parser() -> argparse.ArgumentParser:
 			"spt",
 			"upp",
 			"graph_residual",
+			"graph_residual_gcn",
 			"3detr",
 		],
 		help="Backbone model",
 	)
 	parser.add_argument("--epochs", type=int, default=100)
-	parser.add_argument("--batch-size", type=int, default=16)
+	parser.add_argument("--batch-size", type=int, default=32)
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
 	parser.add_argument("--lr", type=float, default=1e-3)
 	parser.add_argument("--min-lr", type=float, default=1e-5)
@@ -777,9 +821,10 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--save-dir", type=str, default="checkpoints")
 	parser.add_argument("--resume", type=str, default="", help="checkpoint path to resume")
 	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="Label source mode")
-	parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="Classification loss weight")
-	parser.add_argument("--box-l1-weight", type=float, default=1.0, help="3D box SmoothL1 loss weight")
-	parser.add_argument("--box-iou-weight", type=float, default=1.0, help="3D box IoU loss weight")
+	parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="Classification loss weight when auto-balance is disabled")
+	parser.add_argument("--box-loss-weight", type=float, default=1.0, help="Box Soft-histogram depth loss weight when auto-balance is disabled")
+	parser.add_argument("--auto-balance", dest="auto_balance", action="store_true", help="Use Kendall log-variance task balancing")
+	parser.add_argument("--no-auto-balance", dest="auto_balance", action="store_false", help="Use fixed cls/box loss weights")
 	parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for classification loss")
 	parser.add_argument("--spt-timestep", type=int, default=2, help="SPT temporal steps T; default follows Hengshuang.yaml")
 	parser.add_argument("--spt-nneighbor", type=int, default=16, help="SPT kNN neighborhood size")
@@ -799,7 +844,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="Disable train dataset augmentation")
 	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in val/test dataset")
 	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable val/test dataset augmentation")
-	parser.set_defaults(augment_train=True, augment_eval=True, amp=True, tf32=True, spt_use_encoder=True, spt_use_moe_lif=True)
+	parser.set_defaults(augment_train=True, augment_eval=True, amp=True, tf32=True, spt_use_encoder=True, spt_use_moe_lif=True, auto_balance=False)
 	return parser
 #CUDA AMP 会在部分算子里使用半精度，通常是 FP16，比如：Conv / Linear / MatMul / 部分归一化相关算子，同时用 GradScaler 避免 FP16 梯度下溢。它的目标是加速和省显存，不保证和纯 FP32 完全一致。
 #TF32 是 NVIDIA Ampere/Ada GPU 上对 FP32 matmul/conv 的加速格式。它仍然用 FP32 存储和 FP32 输出，但乘法内部精度降低，mantissa 比标准 FP32 少。
@@ -818,7 +863,8 @@ if __name__ == "__main__":
 	# 常用参数 (完整列表见 build_parser):
 	#   --model <name>          模型, 支持: dgcnn / pointnet / pointnet2 / pointnet2msg /
 	#                           pointtransformer / pointtransv2 / pointtransv3 / pointmlp / pointmlpelite /
-	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr
+	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr /
+	#                           graph_residual / graph_residual_gcn
 	#   --batch-size 32         batch 大小
 	#   --epochs 100            训练轮数
 	#   --num-points 1024       每样本固定点数 (随机采样/补齐到该数)

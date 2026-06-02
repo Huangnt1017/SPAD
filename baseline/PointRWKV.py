@@ -11,7 +11,7 @@ Full replication from official repo (Qingdong He et al.):
 - PRWKV Block: 并行 IFM + LGM 的双分支设计
 - 层级多尺度骨干: FPS 下采样 + PRWKV 块 + 特征传播
 
-输入: (B, N, 4) xyzi → 输出: (logits [B, C], box_pred [B, 6])
+输入: (B, N, 4) xyzi → 输出: (logits [B, C], box_pred [B, 3])
 
 Reference:
 @inproceedings{he2025pointrwkv,
@@ -346,9 +346,9 @@ class GraphStabilizer(nn.Module):
         Returns:
             features: (B, N, C) 更新后的特征
         """
+        neighbor_xyz = index_points_fast(xyz, knn_idx)
         for t in range(self.num_iterations):
             delta_xyz = self.offset_pred(features)
-            neighbor_xyz = index_points_fast(xyz, knn_idx)
             neighbor_feat = index_points_fast(features, knn_idx)
             center_xyz = xyz + delta_xyz
             rel_pos = neighbor_xyz - center_xyz.unsqueeze(2)
@@ -373,8 +373,9 @@ class LGMBranch(nn.Module):
             nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim)
         )
 
-    def forward(self, xyz, features):
-        knn_idx = knn_point(self.k, xyz, xyz)
+    def forward(self, xyz, features, knn_idx=None):
+        if knn_idx is None:
+            knn_idx = knn_point(self.k, xyz, xyz)
         local_features = self.graph_stabilizer(xyz, features, knn_idx)
         return self.proj(local_features)
 
@@ -408,7 +409,7 @@ class PRWKVBlock(nn.Module):
         self.channel_mixing = ChannelMixing(dim, hidden_dim=int(dim * ffn_ratio), drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, xyz, features):
+    def forward(self, xyz, features, knn_idx=None):
         """
         Args:
             xyz: (B, N, 3)
@@ -418,7 +419,7 @@ class PRWKVBlock(nn.Module):
         """
         normed = self.norm1(features)
         global_feat = self.spatial_mixing(normed)
-        local_feat = self.lgm(xyz, normed)
+        local_feat = self.lgm(xyz, normed, knn_idx=knn_idx)
         fused = self.fusion(torch.cat([global_feat, local_feat], dim=-1))
         features = features + self.drop_path(fused)
         features = features + self.drop_path(self.channel_mixing(self.norm2(features)))
@@ -507,8 +508,9 @@ class PointRWKV(nn.Module):
             tokens = self.embed_modules[i](neighborhood)
             pos = self.pos_embed[i](center)
             tokens = tokens + pos
+            knn_idx = knn_point(self.k_neighbors[i], center, center)
             for block in self.blocks[i]:
-                tokens = block(center, tokens)
+                tokens = block(center, tokens, knn_idx=knn_idx)
             tokens = self.norms[i](tokens)
             features_list.append(tokens)
             centers_list.append(center)
@@ -523,7 +525,7 @@ class PointRWKVClassification(nn.Module):
     """PointRWKV 分类 + 3D BBox 模型 (适配 SPAD 训练管道)。
 
     将 PointRWKV 多尺度特征聚合后进行全局池化，接分类和框回归头。
-    输入: (B, N, 4) xyzi → 输出: (logits [B, C], box_pred [B, 6])
+    输入: (B, N, 4) xyzi → 输出: (logits [B, C], box_pred [B, 3])
 
     关于 ``num_points`` 默认值的说明:
     官方 cfgs/cls_modelnet40.yaml 用 8192 点输入 + ``num_points=(2048, 1024, 512)``,
@@ -598,7 +600,7 @@ class PointRWKVClassification(nn.Module):
             x: (B, N, 4) xyzi 点云
         Returns:
             logits: (B, num_classes)
-            box_pred: (B, 6)
+            box_pred: (B, 3)
         """
         x = self._normalize_input_points(x)
         # 只使用 xyz 坐标 (PointRWKV 的设计)

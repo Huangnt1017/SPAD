@@ -1,102 +1,276 @@
 #!/usr/bin/env python3
-"""
-监控训练日志完成状态，自动启动下一个训练任务。
+"""按模型队列自动串行训练 SPAD 点云模型。
 
-监控逻辑：
-- 每次检查日志最后一行是否包含 "Epoch [100/100]" 或 "Training completed"
-- 若检测到完成标记，启动 PointTransformer 训练（B=32, epoch=100）
-- 记录启动时间戳到 auto_train_next.log
+CLI example:
+    python scripts/auto_train_monitor.py --models pointnet2 graph_residual spt --poll-seconds 30
+
+Non-CLI example:
+    python scripts/auto_train_monitor.py
+
+说明:
+    无参运行会使用 main_without_cli() 中显式定义的 AUTO_TRAIN_MODELS。
+    脚本每次只启动一个训练进程；检测到当前模型日志出现 "Training finished" 后,
+    自动启动队列中的下一个模型。
 """
 
+from __future__ import annotations
+
+import argparse
+import json
+import os
 import subprocess
 import sys
 import time
-from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Optional, Sequence
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-LOG_FILE = PROJECT_ROOT / "logs" / "train_pointtransv2_20260528_005554_877505.log"
-MONITOR_LOG = PROJECT_ROOT / "auto_train_next.log"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRAIN_SCRIPT = PROJECT_ROOT / "scripts" / "train.py"
-STARTED_FLAG = PROJECT_ROOT / ".auto_train_started"
+STATE_FILE = PROJECT_ROOT / ".auto_train_monitor_state.json"
+MONITOR_LOG = PROJECT_ROOT / "auto_train_next.log"
+
+# 无参运行时使用的自动训练队列。需要调整顺序时只改这里。
+AUTO_TRAIN_MODELS: list[str] = [
+    "pointtransformer",
+    "pointnet",
+    "pointnet2",
+    "pointnet2msg",
+    "pointtransv3",
+    "pointmlp",
+    "upp",
+    "spt",
+]
 
 
-def check_training_complete() -> bool:
-    """检查日志是否显示训练完成。"""
-    if not LOG_FILE.exists():
+@dataclass
+class AutoTrainConfig:
+    """自动训练运行配置。"""
+
+    models: list[str]
+    epochs: int = 100
+    batch_size: int = 32
+    poll_seconds: int = 30
+    python_exe: Path = Path(sys.executable)
+    data_root: Optional[Path] = None
+    log_dir: Path = PROJECT_ROOT / "logs"
+    save_dir: Path = PROJECT_ROOT / "checkpoints"
+    state_file: Path = STATE_FILE
+    monitor_log: Path = MONITOR_LOG
+    dry_run: bool = False
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def append_monitor_log(config: AutoTrainConfig, message: str) -> None:
+    """写入监控日志并同步输出到控制台。"""
+    line = f"[{_now()}] {message}"
+    print(line)
+    if config.dry_run:
+        return
+    config.monitor_log.parent.mkdir(parents=True, exist_ok=True)
+    with open(config.monitor_log, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def load_state(state_file: Path) -> dict:
+    """读取自动训练状态；不存在时返回空状态。"""
+    if not state_file.exists():
+        return {}
+    with open(state_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state_file: Path, state: dict) -> None:
+    """保存当前训练队列状态。"""
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def latest_log_for_model(log_dir: Path, model: str) -> Optional[Path]:
+    """返回指定模型最近一次训练日志。"""
+    pattern = f"train_{model}_*.log"
+    candidates = sorted(log_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
+    return candidates[-1] if candidates else None
+
+
+def log_is_finished(log_path: Path) -> bool:
+    """检查训练日志是否已完整结束。"""
+    if not log_path.exists():
         return False
-
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            if not lines:
-                return False
-
-            # 检查最后几行是否包含完成标记
-            last_lines = "".join(lines[-5:])
-            return "Epoch [100/100]" in last_lines or "Training completed" in last_lines
-    except Exception as e:
-        print(f"[ERROR] 读取日志失败: {e}", file=sys.stderr)
-        return False
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        tail = f.readlines()[-20:]
+    text = "".join(tail)
+    return "Training finished" in text
 
 
-def launch_pointtransformer_training():
-    """启动 PointTransformer 训练。"""
-    # 检查是否已启动过
-    if STARTED_FLAG.exists():
-        print("[INFO] PointTransformer 训练已启动，跳过重复启动")
-        return False
+def process_is_running(process: subprocess.Popen) -> bool:
+    """判断 Popen 进程是否仍在运行。"""
+    return process.poll() is None
 
+
+def build_train_command(config: AutoTrainConfig, model: str) -> list[str]:
+    """构造单个模型的训练命令。"""
     cmd = [
-        sys.executable,
+        str(config.python_exe),
         str(TRAIN_SCRIPT),
-        "--model", "pointtransformer",
-        "--batch_size", "32",
-        "--epochs", "100",
+        "--model",
+        model,
+        "--batch-size",
+        str(config.batch_size),
+        "--epochs",
+        str(config.epochs),
+        "--log-dir",
+        str(config.log_dir),
+        "--save-dir",
+        str(config.save_dir),
     ]
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_msg = f"[{timestamp}] 启动 PointTransformer 训练 (B=32, epoch=100)\n"
-
-    try:
-        print(log_msg, end="")
-        with open(MONITOR_LOG, "a", encoding="utf-8") as f:
-            f.write(log_msg)
-
-        # 后台启动训练
-        subprocess.Popen(cmd, cwd=PROJECT_ROOT)
-        print(f"[{timestamp}] 训练进程已启动")
-
-        # 创建启动标志
-        STARTED_FLAG.touch()
-        return True
-    except Exception as e:
-        err_msg = f"[{timestamp}] 启动失败: {e}\n"
-        print(err_msg, file=sys.stderr)
-        with open(MONITOR_LOG, "a", encoding="utf-8") as f:
-            f.write(err_msg)
-        return False
+    if config.data_root is not None:
+        cmd.extend(["--data-root", str(config.data_root)])
+    return cmd
 
 
-def main():
-    """主监控循环。"""
-    if check_training_complete():
-        print("[INFO] 检测到前一个训练已完成，启动 PointTransformer 训练...")
-        launch_pointtransformer_training()
-    else:
-        # 获取当前进度
-        try:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                if lines:
-                    last_line = lines[-1]
-                    if "Epoch" in last_line:
-                        print(f"[INFO] 训练进行中: {last_line.strip()}")
-                    else:
-                        print("[INFO] 等待训练完成...")
-        except Exception as e:
-            print(f"[ERROR] {e}", file=sys.stderr)
+def launch_training(config: AutoTrainConfig, model: str) -> subprocess.Popen:
+    """启动一个模型训练进程。"""
+    cmd = build_train_command(config, model)
+    append_monitor_log(config, "启动训练: " + " ".join(cmd))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.Popen(cmd, cwd=PROJECT_ROOT, env=env)
+
+
+def run_auto_train(config: AutoTrainConfig) -> None:
+    """按队列串行启动训练，完成一个再启动下一个。"""
+    if not config.models:
+        raise ValueError("models must not be empty.")
+    if config.epochs <= 0:
+        raise ValueError("epochs must be positive.")
+    if config.batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if config.poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive.")
+    if not TRAIN_SCRIPT.exists():
+        raise FileNotFoundError(f"Training script not found: {TRAIN_SCRIPT}")
+
+    config.log_dir.mkdir(parents=True, exist_ok=True)
+    config.save_dir.mkdir(parents=True, exist_ok=True)
+
+    state = load_state(config.state_file)
+    if state.get("models") != config.models:
+        state = {"models": config.models, "next_index": 0, "runs": []}
+
+    next_index = int(state.get("next_index", 0))
+    append_monitor_log(config, f"自动训练队列: {', '.join(config.models)}")
+
+    while next_index < len(config.models):
+        model = config.models[next_index]
+        if config.dry_run:
+            append_monitor_log(config, "dry-run: " + " ".join(build_train_command(config, model)))
+            next_index += 1
+            continue
+
+        process = launch_training(config, model)
+        state["current_model"] = model
+        state["current_pid"] = process.pid
+        state["next_index"] = next_index
+        save_state(config.state_file, state)
+
+        while process_is_running(process):
+            time.sleep(config.poll_seconds)
+
+        exit_code = process.poll()
+        log_path = latest_log_for_model(config.log_dir, model)
+        finished = log_path is not None and log_is_finished(log_path)
+        run_record = {
+            "model": model,
+            "exit_code": exit_code,
+            "log_path": str(log_path) if log_path else "",
+            "finished": finished,
+            "finished_at": _now(),
+        }
+        state.setdefault("runs", []).append(run_record)
+
+        if exit_code != 0 or not finished:
+            state["failed_model"] = model
+            save_state(config.state_file, state)
+            raise RuntimeError(
+                f"Training for {model} did not finish cleanly: exit_code={exit_code}, log={log_path}"
+            )
+
+        append_monitor_log(config, f"{model} 训练完成: {log_path}")
+        next_index += 1
+        state["next_index"] = next_index
+        state.pop("current_model", None)
+        state.pop("current_pid", None)
+        save_state(config.state_file, state)
+
+    state["completed"] = True
+    state["completed_at"] = _now()
+    if not config.dry_run:
+        save_state(config.state_file, state)
+    append_monitor_log(config, "自动训练队列全部完成")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数。"""
+    parser = argparse.ArgumentParser(description="Run SPAD training jobs sequentially.")
+    parser.add_argument("--models", nargs="+", default=AUTO_TRAIN_MODELS, help="Model queue to train in order.")
+    parser.add_argument("--epochs", type=int, default=100, help="Epochs for each model.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for each model.")
+    parser.add_argument("--poll-seconds", type=int, default=30, help="Seconds between process checks.")
+    parser.add_argument("--python-exe", type=Path, default=Path(sys.executable), help="Python executable for training.")
+    parser.add_argument("--data-root", type=Path, default=None, help="Optional data root override.")
+    parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "logs", help="Training log directory.")
+    parser.add_argument("--save-dir", type=Path, default=PROJECT_ROOT / "checkpoints", help="Checkpoint directory.")
+    parser.add_argument("--state-file", type=Path, default=STATE_FILE, help="Monitor state JSON path.")
+    parser.add_argument("--dry-run", action="store_true", help="Print the queue without launching training.")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI 入口。"""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    config = AutoTrainConfig(
+        models=list(args.models),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        poll_seconds=args.poll_seconds,
+        python_exe=args.python_exe,
+        data_root=args.data_root,
+        log_dir=args.log_dir,
+        save_dir=args.save_dir,
+        state_file=args.state_file,
+        dry_run=args.dry_run,
+    )
+    run_auto_train(config)
+    return 0
+
+
+def main_without_cli() -> None:
+    """无参运行入口：显式使用 AUTO_TRAIN_MODELS 队列。"""
+    config = AutoTrainConfig(
+        models=AUTO_TRAIN_MODELS,
+        epochs=100,
+        batch_size=32,
+        poll_seconds=30,
+        python_exe=Path(sys.executable),
+        data_root=None,
+        log_dir=PROJECT_ROOT / "logs",
+        save_dir=PROJECT_ROOT / "checkpoints",
+        state_file=STATE_FILE,
+        monitor_log=MONITOR_LOG,
+        dry_run=False,
+    )
+    run_auto_train(config)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        raise SystemExit(main())
+    main_without_cli()
