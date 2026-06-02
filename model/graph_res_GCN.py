@@ -44,6 +44,8 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 
+from utils.heads import build_standard_cls_head, build_standard_box_head
+
 try:
     from torch_geometric.nn import SAGEConv
 except ImportError as exc:
@@ -440,29 +442,12 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
 
         pooled_dim = 1024  # 512 * 2 (max + avg)
 
-        self.cls_head = nn.Sequential(
-            nn.Linear(pooled_dim, 512, bias=False),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout),
-            nn.Linear(256, num_classes),
-        )
+        # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
 
-        # Box head: 直接回归 (与 baseline 一致)
-        self.box_head = nn.Sequential(
-            nn.Linear(pooled_dim, 256, bias=False),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.2),
-            nn.Linear(128, box_dim),
-        )
+        # 统一中心点回归头: 3 层 MLP (1024 → 256 → 128 → box_dim)
+        # 直接回归, 与 baseline 一致, 确保 backbone 为唯一变量。
+        self.box_head = build_standard_box_head(pooled_dim, box_dim=box_dim, dropout=dropout)
 
     def forward(self, points: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

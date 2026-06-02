@@ -68,6 +68,7 @@ from utils.pointnet_utils import (
     offset2batch, batch2offset, offset2bincount,
     farthest_point_sample, knn_point, index_points, square_distance
 )
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 # ============================================================================
@@ -591,6 +592,7 @@ class PointTransformerV2Cls(nn.Module):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         enable_checkpoint: bool = False,
+        dropout: float = 0.3,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -643,29 +645,14 @@ class PointTransformerV2Cls(nn.Module):
             )
             self.enc_stages.append(enc)
 
-        # 分类头: 与 Pointcept 的 seg_head 结构一致 (Linear → BN → ReLU → Linear), 仅在最后一层
-        # 接 ``num_classes`` 输出; 增加两层 Dropout(0.5) 与 SPAD 项目其他 baseline 的分类头保持一致。
+        # pooled_dim = enc_channels[-1] = 512 (per-offset average pool)
         final_channels = enc_channels_list[-1]
-        self.cls_head = nn.Sequential(
-            nn.Linear(final_channels, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(128, num_classes),
-        )
 
-        # 中心点回归头 (SPAD 特有 center-only 约定): 输出 [B, 3], 由全局特征预测归一化中心。
-        self.center_head = nn.Sequential(
-            nn.Linear(final_channels, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, box_dim),
-        )
+        # 统一分类头: 3 层 MLP (512 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(final_channels, num_classes, dropout=dropout)
+
+        # 统一中心点回归头: 3 层 MLP (512 → 256 → 128 → 3)
+        self.center_head = build_standard_box_head(final_channels, box_dim=box_dim, dropout=dropout)
 
     def forward(self, data_dict):
         """

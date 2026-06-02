@@ -69,6 +69,7 @@ from utils.pointnet_utils import (
     farthest_point_sample_fast,
     index_points_fast,
 )
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 # ============================================================================
@@ -759,6 +760,7 @@ class UPPClassification(nn.Module):
                  enable_completion: bool = False,
                  noise_keep_ratio: float = 0.95,
                  noise_step: float = 0.2,
+                 dropout: float = 0.3,
                  **kwargs):
         super().__init__()
         if encoder_dims != trans_dim:
@@ -849,34 +851,17 @@ class UPPClassification(nn.Module):
         # —— 分类头 cls_token / cls_pos / cls_head_finetune (与 Point-MAE 一致) ——
         self.cls_token = nn.Parameter(torch.zeros(1, 1, trans_dim))
         self.cls_pos = nn.Parameter(torch.randn(1, 1, trans_dim))
-        self.cls_head = nn.Sequential(
-            nn.Linear(trans_dim * 2, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes),
-        )
+        # —— 统一分类头: pooled_dim = trans_dim * 2 (cls_token + max_pool 拼接) ——
+        pooled_dim = trans_dim * 2
+        self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
 
-        # —— SPAD 中心点回归头 (官方无此分支) ——
-        self.box_head = nn.Sequential(
-            nn.Linear(trans_dim * 2, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, 3),
-        )
+        # —— 统一中心点回归头: 直接回归 [B, 3] 中心坐标 ——
+        self.box_head = build_standard_box_head(pooled_dim, dropout=dropout)
 
         # —— 初始化 ——
         trunc_normal_(self.cls_token, std=0.02)
         trunc_normal_(self.cls_pos, std=0.02)
         trunc_normal_(self.mask_token, std=0.02)
-        for layer in self.cls_head:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_uniform_(layer.weight, a=5.0 ** 0.5)
         self.apply(self._init_weights)
 
     @staticmethod

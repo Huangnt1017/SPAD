@@ -231,29 +231,33 @@ class PointTransformerCls(nn.Module):
             nblocks, spike_mode, timestep, use_encoder, num_samples = 4, 'lif', 2, True, 512
 
         num_classes = getattr(cfg, 'num_classes', 26)  # From the SPAD runner
-        
+
+        # 统一头部维度: Conv1d 替代 Linear (SNN 时序架构), 但中间维度对齐标准
+        # pooled=512 → 256 → 128 → out, Dropout=0.3
+        pooled_dim = 32 * 2 ** nblocks  # 512
+
         self.fc2_cls = nn.Sequential(
             build_spike_node(timestep, spike_mode) if spike_mode is not None else nn.Identity(),
-            nn.Conv1d(32 * 2 ** nblocks, 256, 1),
+            nn.Conv1d(pooled_dim, 256, 1),
             nn.BatchNorm1d(256),
             build_spike_node(timestep, spike_mode) if spike_mode is not None else nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Conv1d(256, 64, 1),
-            nn.BatchNorm1d(64),
+            nn.Dropout(0.3),
+            nn.Conv1d(256, 128, 1),
+            nn.BatchNorm1d(128),
             build_spike_node(timestep, spike_mode) if spike_mode is not None else nn.ReLU(),
-            nn.Conv1d(64, num_classes, 1),
+            nn.Conv1d(128, num_classes, 1),
         )
-        
+
         self.fc2_box = nn.Sequential(
             build_spike_node(timestep, spike_mode) if spike_mode is not None else nn.Identity(),
-            nn.Conv1d(32 * 2 ** nblocks, 256, 1),
+            nn.Conv1d(pooled_dim, 256, 1),
             nn.BatchNorm1d(256),
             build_spike_node(timestep, spike_mode) if spike_mode is not None else nn.ReLU(),
-            nn.Dropout(0.2), 
-            nn.Conv1d(256, 64, 1),
-            nn.BatchNorm1d(64),
+            nn.Dropout(0.3),
+            nn.Conv1d(256, 128, 1),
+            nn.BatchNorm1d(128),
             build_spike_node(timestep, spike_mode) if spike_mode is not None else nn.ReLU(),
-            nn.Conv1d(64, 3, 1),
+            nn.Conv1d(128, 3, 1),
         )
 
         self.nblocks = nblocks

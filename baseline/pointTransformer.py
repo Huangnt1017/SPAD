@@ -50,6 +50,7 @@ from utils.pointnet_utils import (
     farthest_point_sample_varlen,
     knn_point_varlen,
 )
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 # ============================================================================
@@ -359,7 +360,7 @@ class PointTransformerCls(nn.Module):
     """
 
     def __init__(self, block, blocks: List[int], in_channels: int = 6,
-                 num_classes: int = 40, center_dim: int = 3):
+                 num_classes: int = 40, center_dim: int = 3, dropout: float = 0.3):
         super().__init__()
         self.in_channels = in_channels
         self.in_planes = in_channels
@@ -379,26 +380,20 @@ class PointTransformerCls(nn.Module):
         self.enc5 = self._make_enc(block, planes[4], blocks[4], share_planes,
                                    stride=stride[4], nsample=nsample[4])
 
-        # 分类头与官方完全一致 (Linear → BN → ReLU → Dropout(0.5) ×2 + 最后 Linear)。
-        self.cls_head = nn.Sequential(
-            nn.Linear(planes[4], 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(128, num_classes),
+        # pooled_dim = planes[4] = 512 (per-offset average pool)
+
+        # 统一分类头: 3 层 MLP (512 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(
+            pooled_dim=planes[4],
+            num_classes=num_classes,
+            dropout=dropout,
         )
 
-        # 中心点回归头 (SPAD 特有, center-only 约定): 与其它 baseline 形状统一。
-        self.center_head = nn.Sequential(
-            nn.Linear(planes[4], 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, center_dim),
+        # 统一中心点回归头: 3 层 MLP (512 → 256 → 128 → 3)
+        self.center_head = build_standard_box_head(
+            pooled_dim=planes[4],
+            box_dim=center_dim,
+            dropout=dropout,
         )
 
     def _make_enc(self, block, planes: int, blocks: int, share_planes: int = 8,

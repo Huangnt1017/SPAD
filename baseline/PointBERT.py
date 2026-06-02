@@ -36,6 +36,7 @@ from utils.transformer_blocks import (
     TransformerEncoder,
     trunc_normal_,
 )
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 # ============================================================================
@@ -58,7 +59,7 @@ class PointBERTClassification(nn.Module):
     def __init__(self, num_classes: int = 26, trans_dim: int = 384,
                  depth: int = 6, num_heads: int = 6, drop_path_rate: float = 0.1,
                  group_size: int = 32, num_group: int = 64,
-                 encoder_dims: int = 256, **kwargs):
+                 encoder_dims: int = 256, dropout: float = 0.3, **kwargs):
         super().__init__()
         self.trans_dim = trans_dim
         self.depth = depth
@@ -92,22 +93,12 @@ class PointBERTClassification(nn.Module):
 
         self.norm = nn.LayerNorm(trans_dim)
 
-        # 分类头 (concat cls_token + max pool)
-        self.cls_head = nn.Sequential(
-            nn.Linear(trans_dim * 2, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes),
-        )
+        # 统一分类头: pooled_dim = trans_dim * 2 (cls_token + max_pool 拼接)
+        pooled_dim = trans_dim * 2
+        self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
 
-        # BBox 回归头
-        self.box_head = nn.Sequential(
-            nn.Linear(trans_dim * 2, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, 3),
-        )
+        # 统一中心点回归头: 直接回归 [B, 3] 中心坐标
+        self.box_head = build_standard_box_head(pooled_dim, dropout=dropout)
 
         trunc_normal_(self.cls_token, std=0.02)
         self.apply(self._init_weights)

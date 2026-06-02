@@ -16,9 +16,18 @@ Local:   D:\essay\3d目标检测复现仓库\dgcnn-master (baseline 参考)
 }
 """
 
+import os
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 def knn(x, k):
@@ -65,18 +74,17 @@ class DGCNNCls(nn.Module):
         logits [B, num_classes]
         box_pred [B, 6] -> [xmin, xmax, ymin, ymax, zmin, zmax]
     """
-    def __init__(self, num_classes=26, k=20, emb_dims=1024, dropout=0.5):
+    def __init__(self, num_classes=26, k=20, emb_dims=1024, dropout=0.3):
         super().__init__()
         self.k = k
         self.emb_dims = emb_dims
 
+        # backbone 卷积层
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(128)
         self.bn4 = nn.BatchNorm2d(256)
         self.bn5 = nn.BatchNorm1d(emb_dims)
-        self.bn6 = nn.BatchNorm1d(512)
-        self.bn7 = nn.BatchNorm1d(256)
 
         self.conv1 = nn.Sequential(
             nn.Conv2d(8, 64, kernel_size=1, bias=False),
@@ -99,24 +107,28 @@ class DGCNNCls(nn.Module):
             nn.LeakyReLU(negative_slope=0.2)
         )
 
+        # 多尺度特征聚合: 64+64+128+256=512 → emb_dims
         self.conv5 = nn.Sequential(
             nn.Conv1d(64 + 64 + 128 + 256, emb_dims, kernel_size=1, bias=False),
             self.bn5,
             nn.LeakyReLU(negative_slope=0.2)
         )
 
-        self.linear1 = nn.Linear(emb_dims * 2, 512, bias=False)
-        self.dp1 = nn.Dropout(p=dropout)
-        self.linear2 = nn.Linear(512, 256)
-        self.dp2 = nn.Dropout(p=dropout)
-        self.linear3 = nn.Linear(256, num_classes)
+        # 全局池化: adaptive_max + adaptive_avg → (B, emb_dims*2)
+        # pooled_dim = emb_dims * 2 = 2048
 
-        self.box_head = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(p=0.2),
-            nn.Linear(128, 3),
+        # 统一分类头: 3 层 MLP (2048 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(
+            pooled_dim=emb_dims * 2,
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+
+        # 统一中心点回归头: 3 层 MLP (2048 → 256 → 128 → 3)
+        self.box_head = build_standard_box_head(
+            pooled_dim=emb_dims * 2,
+            box_dim=3,
+            dropout=dropout,
         )
 
     def forward(self, x):
@@ -147,15 +159,12 @@ class DGCNNCls(nn.Module):
 
         x1 = F.adaptive_max_pool1d(x, 1).view(B, -1)
         x2 = F.adaptive_avg_pool1d(x, 1).view(B, -1)
-        x = torch.cat((x1, x2), dim=1)          # [B, emb_dims*2]
+        # (B, 2048) 全局特征
+        f_pooled = torch.cat((x1, x2), dim=1)
 
-        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
-        x = self.dp1(x)
-        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
-        feat = self.dp2(x)
-
-        logits = self.linear3(feat)
-        box_pred = self.box_head(feat)
+        # 统一头直接处理池化特征
+        logits = self.cls_head(f_pooled)
+        box_pred = self.box_head(f_pooled)
         return logits, box_pred
 
 

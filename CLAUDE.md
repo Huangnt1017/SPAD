@@ -20,6 +20,7 @@ SPAD/
 │   └── plot_train_log.py  # 训练曲线绘制
 ├── utils/
 │   ├── loss.py        # 多任务损失 + 框几何工具
+│   ├── heads.py       # 统一分类头 + 中心点回归头构建
 │   ├── data.py        # DataLoader + 归一化
 │   ├── data_augment.py    # 数据增强
 │   └── checkpoint.py  # checkpoint 保存/加载
@@ -42,6 +43,30 @@ box_preds = self.box_head(f_pooled)  # (B, 3) 中心点 [cx, cy, cz]
 - 12 个 baseline 全部使用直接回归
 - 论文要求 backbone 是唯一变量，box_head 策略必须统一
 - 3DETR 是例外 (centroid-offset + 6 维输出)，但其架构本身就是 query-based
+
+### 统一头部架构 (utils/heads.py)
+
+所有模型 (baseline + 自研) 的 cls_head 和 box_head **必须**使用 `utils/heads.py` 中的统一构建函数:
+
+```python
+from utils.heads import build_standard_cls_head, build_standard_box_head
+
+# 分类头: 3 层 MLP (pooled → 256 → 128 → num_classes)
+self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=0.3)
+
+# 中心点回归头: 3 层 MLP (pooled → 256 → 128 → 3)
+self.box_head = build_standard_box_head(pooled_dim, box_dim=3, dropout=0.3)
+```
+
+**统一标准:**
+- **cls_head**: `Linear(pooled→256, bias=False) → BN1d → LeakyReLU(0.2) → Dropout → Linear(256→128) → BN1d → LeakyReLU(0.2) → Dropout → Linear(128→num_classes)`
+- **box_head**: `Linear(pooled→256, bias=False) → BN1d → LeakyReLU(0.2) → Dropout → Linear(256→128) → BN1d → LeakyReLU(0.2) → Linear(128→3)`
+- 所有模型使用相同的中间维度 (256 → 128)、激活函数 (LeakyReLU 0.2)、Dropout 率 (0.3)
+- **唯一变量仅为 backbone 架构**，确保论文对比公平
+
+**特殊架构例外:**
+- **SPT** (脉冲神经网络): 使用 Conv1d + SpikeNode 替代 Linear + LeakyReLU，但中间维度对齐标准 (512→256→128→out)
+- **3DETR** (query-based): per-query GenericMLP 头，架构本质上无法适配统一头
 
 ### Loss: Soft-Histogram Depth Loss
 
@@ -164,12 +189,13 @@ raw → parsed → dataset 样本 → batch tensor → model 输入 → loss 目
 
 ## 当前模型状态 (截至 2026-06-02)
 
-| 模型 | Box Head | Loss | 权重策略 |
-|:-----|:--------:|:----:|:--------:|
-| 12 个 baseline (DGCNN, PointNet++, ...) | 直接回归 [B,3] | Soft-histogram | 固定 λ=1.0 |
-| graph_residual.py (DGCNN EdgeConv) | 直接回归 [B,3] | Soft-histogram | 固定 λ=1.0 |
-| graph_res_GCN.py (PyG SAGEConv) | 直接回归 [B,3] | Soft-histogram | 固定 λ=1.0 |
-| 3DETR (例外) | centroid-offset [B,6] | Soft-histogram | 固定 λ=1.0 |
+| 模型 | Box Head | cls_head / box_head 架构 | Loss | 权重策略 |
+|:-----|:--------:|:------------------------:|:----:|:--------:|
+| 12 个 baseline (DGCNN, PointNet++, ...) | 直接回归 [B,3] | 统一 MLP (utils/heads.py) | Soft-histogram | 固定 λ=1.0 |
+| graph_residual.py (DGCNN EdgeConv) | 直接回归 [B,3] | 统一 MLP (utils/heads.py) | Soft-histogram | 固定 λ=1.0 |
+| graph_res_GCN.py (PyG SAGEConv) | 直接回归 [B,3] | 统一 MLP (utils/heads.py) | Soft-histogram | 固定 λ=1.0 |
+| SPT (脉冲神经网络) | 直接回归 [B,3] | Conv1d + SpikeNode (维度对齐) | Soft-histogram | 固定 λ=1.0 |
+| 3DETR (例外) | centroid-offset [B,6] | per-query GenericMLP | Soft-histogram | 固定 λ=1.0 |
 
 **所有模型统一训练条件 → backbone 是唯一变量 → 论文对比公平。**
 

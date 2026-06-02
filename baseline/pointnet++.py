@@ -33,6 +33,7 @@ from utils.pointnet_utils import (
     index_points_fast,
     query_ball_point_fast,
 )
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 # ============================================================================
@@ -295,7 +296,7 @@ class PointNet2ClassificationSSG(nn.Module):
     - intensity（第4维）作为额外特征，在各 SA 模块中与归一化 xyz 拼接后送入 MLP
     强度信息不会丢失，它通过 points 特征流贯穿整个网络。
     """
-    def __init__(self, num_class=26):
+    def __init__(self, num_class=26, dropout=0.3):
         super().__init__()
         # 额外特征通道数: 1 = 强度(intensity)
         in_channel = 1
@@ -313,20 +314,18 @@ class PointNet2ClassificationSSG(nn.Module):
             in_channel=256, mlp=[256, 512, 1024], group_all=True
         )
 
-        self.fc1 = nn.Linear(1024, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.drop1 = nn.Dropout(0.4)
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.drop2 = nn.Dropout(0.4)
-        self.fc3 = nn.Linear(256, num_class)
+        # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(
+            pooled_dim=1024,
+            num_classes=num_class,
+            dropout=dropout,
+        )
 
-        self.box_head = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(128, 3),
+        # 统一中心点回归头: 3 层 MLP (1024 → 256 → 128 → 3)
+        self.box_head = build_standard_box_head(
+            pooled_dim=1024,
+            box_dim=3,
+            dropout=dropout,
         )
 
     @staticmethod
@@ -374,12 +373,12 @@ class PointNet2ClassificationSSG(nn.Module):
         l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)  # SA2: 特征流继续
         _, l3_points = self.sa3(l2_xyz, l2_points)       # SA3: 全局池化 → 1024 维
 
-        x = l3_points.view(x.shape[0], 1024)
-        x = self.drop1(F.relu(self.bn1(self.fc1(x))))
-        feat = self.drop2(F.relu(self.bn2(self.fc2(x))))
+        # (B, 1024) 全局特征
+        f_pooled = l3_points.view(x.shape[0], 1024)
 
-        logits = self.fc3(feat)
-        box_pred = self.box_head(feat)
+        # 统一头直接处理池化特征
+        logits = self.cls_head(f_pooled)
+        box_pred = self.box_head(f_pooled)
         return logits, box_pred
 
 
@@ -394,7 +393,7 @@ class PointNet2ClassificationMSG(nn.Module):
     与 SSG 的区别在于前两层 SA 使用多半径 ball query 提取多尺度特征。
     参考官方实现 pointnet2_cls_msg.py。
     """
-    def __init__(self, num_class=26):
+    def __init__(self, num_class=26, dropout=0.3):
         super().__init__()
         in_channel = 1  # 强度通道
 
@@ -429,20 +428,18 @@ class PointNet2ClassificationMSG(nn.Module):
             mlp=[256, 512, 1024], group_all=True
         )
 
-        self.fc1 = nn.Linear(1024, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.drop1 = nn.Dropout(0.4)
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.drop2 = nn.Dropout(0.4)
-        self.fc3 = nn.Linear(256, num_class)
+        # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(
+            pooled_dim=1024,
+            num_classes=num_class,
+            dropout=dropout,
+        )
 
-        self.box_head = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(128, 3),
+        # 统一中心点回归头: 3 层 MLP (1024 → 256 → 128 → 3)
+        self.box_head = build_standard_box_head(
+            pooled_dim=1024,
+            box_dim=3,
+            dropout=dropout,
         )
 
     @staticmethod
@@ -478,12 +475,12 @@ class PointNet2ClassificationMSG(nn.Module):
         l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)   # MSG SA2
         _, l3_points = self.sa3(l2_xyz, l2_points)        # 全局 SA3
 
-        x = l3_points.view(x.shape[0], 1024)
-        x = self.drop1(F.relu(self.bn1(self.fc1(x))))
-        feat = self.drop2(F.relu(self.bn2(self.fc2(x))))
+        # (B, 1024) 全局特征
+        f_pooled = l3_points.view(x.shape[0], 1024)
 
-        logits = self.fc3(feat)
-        box_pred = self.box_head(feat)
+        # 统一头直接处理池化特征
+        logits = self.cls_head(f_pooled)
+        box_pred = self.box_head(f_pooled)
         return logits, box_pred
 
 

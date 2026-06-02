@@ -77,6 +77,7 @@ from utils.pointnet_utils import (
     farthest_point_sample, knn_point, index_points
 )
 from utils.serialization import encode, decode, z_order_encode, hilbert_encode
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 # ============================================================================
@@ -705,6 +706,7 @@ class PointTransformerV3Cls(PointModule):
         enable_flash: bool = False,
         upcast_attention: bool = True,
         upcast_softmax: bool = True,
+        dropout: float = 0.3,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -776,28 +778,14 @@ class PointTransformerV3Cls(PointModule):
             if len(enc) != 0:
                 self.enc.add(module=enc, name=f"enc{s}")
 
-        # Classification head
+        # pooled_dim = enc_channels[-1] = 512 (per-offset average pool)
         final_channels = enc_channels[-1]
-        self.cls_head = nn.Sequential(
-            nn.Linear(final_channels, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(128, num_classes),
-        )
 
-        # 中心点回归头 (SPAD 特有 center-only 约定): 输出 [B, 3], 由全局特征预测归一化中心。
-        self.center_head = nn.Sequential(
-            nn.Linear(final_channels, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, box_dim),
-        )
+        # 统一分类头: 3 层 MLP (512 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(final_channels, num_classes, dropout=dropout)
+
+        # 统一中心点回归头: 3 层 MLP (512 → 256 → 128 → 3)
+        self.center_head = build_standard_box_head(final_channels, box_dim=box_dim, dropout=dropout)
 
     def forward(self, data_dict: dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """

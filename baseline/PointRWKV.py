@@ -45,6 +45,7 @@ from utils.point_rwkv_utils import (
 )
 from utils.pointnet_utils import index_points_fast
 from utils.transformer_blocks import DropPath
+from utils.heads import build_standard_cls_head, build_standard_box_head
 
 
 # ============================================================================
@@ -541,6 +542,7 @@ class PointRWKVClassification(nn.Module):
                  group_sizes: tuple = (32, 32, 32),
                  k_neighbors: tuple = (16, 8, 8),
                  graph_iter: int = 3, drop_path_rate: float = 0.1,
+                 dropout: float = 0.3,
                  **kwargs):
         super().__init__()
         config = {
@@ -555,27 +557,14 @@ class PointRWKVClassification(nn.Module):
         }
         self.backbone = PointRWKV(config)
 
-        # 分类头
-        self.cls_head = nn.Sequential(
-            nn.Linear(embed_dim * 2, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes),
-        )
+        # pooled_dim = embed_dim * 2 = 768 (dual-scale max_pool concat)
+        pooled_dim = embed_dim * 2
 
-        # BBox 回归头
-        self.box_head = nn.Sequential(
-            nn.Linear(embed_dim * 2, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, 3),
-        )
+        # 统一分类头: 3 层 MLP (768 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
+
+        # 统一中心点回归头: 3 层 MLP (768 → 256 → 128 → 3)
+        self.box_head = build_standard_box_head(pooled_dim, dropout=dropout)
 
     @staticmethod
     def _normalize_input_points(x):

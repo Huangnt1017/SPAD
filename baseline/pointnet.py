@@ -34,6 +34,8 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from utils.heads import build_standard_cls_head, build_standard_box_head
+
 
 # ============================================================================
 # 输入变换网络 (STN3d): 预测 3x3 仿射变换对齐输入点云
@@ -221,29 +223,23 @@ class PointNetCls(nn.Module):
     Input:  (B, N, 4) xyzi
     Output: (logits [B, C], box_pred [B, 6])
     """
-    def __init__(self, num_classes: int = 26, feature_transform: bool = True):
+    def __init__(self, num_classes: int = 26, feature_transform: bool = True, dropout: float = 0.3):
         super().__init__()
         self.feature_transform = feature_transform
         self.feat = PointNetfeat(global_feat=True, feature_transform=feature_transform)
 
-        self.cls_head = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes),
+        # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
+        self.cls_head = build_standard_cls_head(
+            pooled_dim=1024,
+            num_classes=num_classes,
+            dropout=dropout,
         )
 
-        self.box_head = nn.Sequential(
-            nn.Linear(1024, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(0.2),
-            nn.Linear(128, 3),
+        # 统一中心点回归头: 3 层 MLP (1024 → 256 → 128 → 3)
+        self.box_head = build_standard_box_head(
+            pooled_dim=1024,
+            box_dim=3,
+            dropout=dropout,
         )
 
     @staticmethod
