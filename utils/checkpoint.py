@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,9 @@ def save_checkpoint(
     class_to_idx: Dict[str, int],
     args: argparse.Namespace,
     criterion: Optional[nn.Module] = None,
+    best_val_score: Optional[float] = None,
+    best_val_metrics: Optional[Mapping[str, float]] = None,
+    score_config: Optional[Mapping[str, float]] = None,
 ) -> None:
     """保存完整训练状态到 checkpoint 文件。
 
@@ -43,6 +46,9 @@ def save_checkpoint(
         class_to_idx: 类别到索引的映射字典。
         args: 训练命令行参数。
         criterion: 可选。训练损失模块；包含 Kendall 自适应权重等可学习状态时应保存。
+        best_val_score: 可选。历史最佳组合评分；None 时兼容旧的 Top-1 选模口径。
+        best_val_metrics: 可选。刷新最佳组合评分时对应的验证指标快照。
+        score_config: 可选。组合评分配置，便于复现实验口径。
 
     Returns:
         None
@@ -53,6 +59,9 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "best_val_top1": best_val_top1,
+        "best_val_score": best_val_top1 if best_val_score is None else float(best_val_score),
+        "best_val_metrics": dict(best_val_metrics or {}),
+        "score_config": dict(score_config or {}),
         "class_to_idx": class_to_idx,
         "args": vars(args),
     }
@@ -81,7 +90,7 @@ def load_checkpoint(
         device: 目标设备，默认使用模型当前设备。
 
     Returns:
-        包含 epoch, best_val_top1, class_to_idx, args 的字典。
+        包含 epoch, best_val_top1, best_val_score, class_to_idx, args 的字典。
     """
     map_location = device if device is not None else next(model.parameters()).device
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
@@ -100,6 +109,9 @@ def load_checkpoint(
     return {
         "epoch": checkpoint.get("epoch", 0),
         "best_val_top1": checkpoint.get("best_val_top1", 0.0),
+        "best_val_score": checkpoint.get("best_val_score", checkpoint.get("best_val_top1", 0.0)),
+        "best_val_metrics": checkpoint.get("best_val_metrics", {}),
+        "score_config": checkpoint.get("score_config", {}),
         "class_to_idx": checkpoint.get("class_to_idx", {}),
         "args": checkpoint.get("args", {}),
     }

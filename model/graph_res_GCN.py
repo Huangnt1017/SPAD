@@ -379,6 +379,84 @@ class GraphResidualBlockGCN(nn.Module):
 
 
 # ══════════════════════════════════════════════════
+# Attention-based Box Pooling (保留空间信息)
+# ══════════════════════════════════════════════════
+
+class BoxQueryPool(nn.Module):
+    """基于 learned queries 的 attention pooling，保留空间信息用于 box 回归。
+
+    与 max+avg 全局池化不同，learned queries 通过 cross-attention
+    自适应关注点云中的物体中心区域，保留对 3D 定位任务至关重要的空间信息。
+
+    原理:
+        全局池化将 (B, C, N) 压成 (B, C)，空间位置信息完全丢失;
+        而 learned queries 通过 attention 权重选择性地聚合 N 个点中
+        与物体中心相关的特征，相当于一个可学习的 "soft voting" 机制。
+
+    数据流:
+        f (B, C_feat, N) → permute → kv (B, N, C_feat)
+        queries (1, num_q, C_feat) → expand → q (B, num_q, C_feat)
+        cross-attn(q, kv, kv) → (B, num_q, C_feat) → mean → (B, C_feat)
+        → projection → (B, out_dim)
+
+    Args:
+        feat_dim: 输入特征维度 (backbone 输出通道数)。
+        out_dim: 输出特征维度 (需对齐 box_head 输入维度)。
+        num_queries: learned query tokens 数量 (多个 queries 平均聚合)。
+        num_heads: 多头注意力头数。
+    """
+
+    def __init__(
+        self,
+        feat_dim: int,
+        out_dim: int,
+        num_queries: int = 8,
+        num_heads: int = 4,
+    ):
+        super().__init__()
+        # learned query tokens: 初始化为标准正态分布
+        self.queries = nn.Parameter(torch.randn(1, num_queries, feat_dim) * 0.02)
+
+        # cross-attention: query 关注点云特征
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=feat_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+
+        # projection: feat_dim → out_dim (对齐 box_head 输入)
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, out_dim, bias=False),
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            f: (B, C_feat, N) — backbone 输出的 channel-first 特征。
+
+        Returns:
+            (B, out_dim) — attention-pooled 特征，用于 box 回归。
+        """
+        B, C_feat, N = f.shape
+
+        # (B, C_feat, N) → (B, N, C_feat): PyTorch attention 要求 sequence-last
+        kv = f.permute(0, 2, 1)  # (B, N, C_feat)
+
+        # (B, num_queries, C_feat): 广播到 batch size
+        q = self.queries.expand(B, -1, -1)
+
+        # cross-attention: learned queries 自适应关注点云空间位置
+        # attn_out: (B, num_queries, C_feat), attn_weights: (B, num_queries, N)
+        attn_out, _ = self.cross_attn(q, kv, kv)
+
+        # 多 queries 平均聚合 → (B, C_feat) → projection → (B, out_dim)
+        pooled = attn_out.mean(dim=1)  # (B, C_feat)
+        return self.proj(pooled)       # (B, out_dim)
+
+
+# ══════════════════════════════════════════════════
 # 外层多任务网络 — PyG 图卷积版
 # ══════════════════════════════════════════════════
 
@@ -441,9 +519,20 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         )
 
         pooled_dim = 1024  # 512 * 2 (max + avg)
+        backbone_dim = 512  # agg_conv 输出通道数
 
         # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
+        # 分类任务使用全局 max+avg pooling (类别与位置无关)
         self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
+
+        # Box attention pooling: learned queries 关注物体中心区域
+        # 保留空间信息用于 3D 定位 (替代全局池化)
+        self.box_pool = BoxQueryPool(
+            feat_dim=backbone_dim,   # 输入: (B, 512, N)
+            out_dim=pooled_dim,      # 输出: (B, 1024) 对齐 box_head
+            num_queries=8,
+            num_heads=4,
+        )
 
         # 统一中心点回归头: 3 层 MLP (1024 → 256 → 128 → box_dim)
         # 直接回归, 与 baseline 一致, 确保 backbone 为唯一变量。
@@ -487,16 +576,17 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         # 多尺度拼接 + 聚合
         f = self.agg_conv(torch.cat([f1, f2, f3, f4], dim=1))  # (B, 512, N)
 
-        # 全局池化: max + avg → (B, 1024)
+        # ── 分类: 全局 max+avg pooling (类别与位置无关) ──
         f_max = f.max(dim=-1)[0]
         f_avg = f.mean(dim=-1)
         f_pooled = torch.cat([f_max, f_avg], dim=1)              # (B, 1024)
-
         logits = self.cls_head(f_pooled)
 
-        # Box head: 直接回归 (与 baseline 一致)
-        # 从全局特征直接预测中心点坐标, 不依赖质心先验
-        box_preds = self.box_head(f_pooled)                       # (B, 3)
+        # ── Box: attention pooling 保留空间信息用于 3D 定位 ──
+        # learned queries 通过 cross-attention 关注物体中心区域
+        # 替代全局池化，解决深度估计任务空间信息丢失问题
+        box_feat = self.box_pool(f)                               # (B, 1024)
+        box_preds = self.box_head(box_feat)                       # (B, 3)
 
         return {"logits": logits, "box_pred": box_preds}
 

@@ -344,6 +344,67 @@ def compute_topk_hits(logits: torch.Tensor, labels: torch.Tensor, topk: Iterable
 	return out
 
 
+def _clamp_unit(value: float) -> float:
+	"""把度量值压到 [0, 1]，用于组合评分的统一尺度。"""
+	if not np.isfinite(value):
+		return 0.0
+	return float(min(1.0, max(0.0, value)))
+
+
+def depth_loss_to_score(depth_loss: float, depth_scale: float) -> float:
+	"""将越小越好的 depth loss 映射成 [0, 1] 分数。"""
+	if depth_scale <= 0:
+		raise ValueError(f"best_score_depth_scale must be positive, got {depth_scale}")
+	if not np.isfinite(depth_loss):
+		return 0.0
+	return float(1.0 / (1.0 + max(0.0, depth_loss) / depth_scale))
+
+
+def compute_composite_score(
+	metrics: Mapping[str, float],
+	args: argparse.Namespace,
+) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+	"""计算统一尺度的多任务组合分数。
+
+	组合分数只用于 best checkpoint 选择，不反向传播。分类 Top-1、box IoU 与 depth loss
+	先统一成 [0, 1] 质量分数，再按归一化权重加权，避免某个任务因数值范围天然更大而主导选模。
+	"""
+	has_box_metrics = float(metrics.get("box_samples", 0.0)) > 0
+	components: Dict[str, float] = {
+		"cls_top1": _clamp_unit(float(metrics.get("top1", 0.0))),
+	}
+	raw_weights: Dict[str, float] = {
+		"cls_top1": max(0.0, float(args.best_score_cls_weight)),
+	}
+
+	if has_box_metrics:
+		components["box_iou"] = _clamp_unit(float(metrics.get("box_iou", 0.0)))
+		components["box_depth"] = depth_loss_to_score(
+			float(metrics.get("box_depth", 0.0)),
+			float(args.best_score_depth_scale),
+		)
+		raw_weights["box_iou"] = max(0.0, float(args.best_score_iou_weight))
+		raw_weights["box_depth"] = max(0.0, float(args.best_score_depth_weight))
+
+	weight_sum = sum(raw_weights.values())
+	if weight_sum <= 0:
+		raise ValueError("At least one active best-score weight must be positive.")
+
+	weights = {key: value / weight_sum for key, value in raw_weights.items()}
+	score = sum(weights[key] * components[key] for key in components)
+	return float(score), components, weights
+
+
+def score_config_from_args(args: argparse.Namespace) -> Dict[str, float]:
+	"""提取组合评分配置，保存到 checkpoint 便于复现实验口径。"""
+	return {
+		"cls_weight": float(args.best_score_cls_weight),
+		"iou_weight": float(args.best_score_iou_weight),
+		"depth_weight": float(args.best_score_depth_weight),
+		"depth_scale": float(args.best_score_depth_scale),
+	}
+
+
 def slice_batch_meta(meta: Mapping[str, Any], valid_mask: torch.Tensor) -> Dict[str, Any]:
 	"""Slice collated metadata using a batch-level validity mask."""
 	# DataLoader 会把 batch 内元信息拼起来，这里要按有效样本掩码同步裁剪，避免点云和标签对不齐。
@@ -660,10 +721,20 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("augment_train=%s augment_eval=%s", args.augment_train, args.augment_eval)
 	logger.info("amp=%s tf32=%s", use_amp, args.tf32)
 	logger.info("loss_auto_balance=%s", args.auto_balance)
+	logger.info(
+		"best_score_weights cls=%.4f iou=%.4f depth=%.4f depth_scale=%.6f",
+		args.best_score_cls_weight,
+		args.best_score_iou_weight,
+		args.best_score_depth_weight,
+		args.best_score_depth_scale,
+	)
 	logger.info("args=%s", json.dumps(vars(args), ensure_ascii=False))
 
 	start_epoch = 1
 	best_val_top1 = 0.0
+	best_val_score = float("-inf")
+	best_val_metrics: Dict[str, float] = {}
+	current_score_config = score_config_from_args(args)
 
 	if args.resume:
 		# 恢复训练时把模型、优化器和 scheduler 状态一起读回，epoch 从 checkpoint 里接着往后走。
@@ -678,7 +749,20 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 		start_epoch = int(checkpoint.get("epoch", 0)) + 1
 		best_val_top1 = float(checkpoint.get("best_val_top1", 0.0))
+		if "best_val_score" in checkpoint:
+			best_val_score = float(checkpoint["best_val_score"])
+		else:
+			best_val_score = float("-inf")
+		loaded_best_val_metrics = checkpoint.get("best_val_metrics", {})
+		if isinstance(loaded_best_val_metrics, Mapping):
+			best_val_metrics = {
+				str(key): float(value)
+				for key, value in loaded_best_val_metrics.items()
+				if isinstance(value, (int, float))
+			}
 		logger.info("Resumed from %s at epoch %d", resume_path, start_epoch)
+		if not np.isfinite(best_val_score):
+			logger.info("Checkpoint has no best_val_score; composite best selection restarts from this resume run.")
 
 	best_ckpt = save_dir / f"{args.model}_{run_timestamp}_best.pth"
 	last_ckpt = save_dir / f"{args.model}_{run_timestamp}_last.pth"
@@ -736,9 +820,31 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 				val_metrics["box_depth"],
 			)
 
-		if val_metrics["top1"] >= best_val_top1:
-			# 这里用验证集 top1 作为 best 依据，和常规分类训练保持一致。
+		val_score, score_components, score_weights = compute_composite_score(val_metrics, args)
+		logger.info(
+			"Epoch [%d/%d] | val_score=%.4f | components cls=%.4f iou=%.4f depth=%.4f | "
+			"weights cls=%.3f iou=%.3f depth=%.3f",
+			epoch,
+			args.epochs,
+			val_score,
+			score_components.get("cls_top1", 0.0),
+			score_components.get("box_iou", 0.0),
+			score_components.get("box_depth", 0.0),
+			score_weights.get("cls_top1", 0.0),
+			score_weights.get("box_iou", 0.0),
+			score_weights.get("box_depth", 0.0),
+		)
+
+		if val_score >= best_val_score:
+			# 用统一尺度的组合评分选 best，避免分类、IoU 或 depth 任一任务因数值范围主导选模。
+			best_val_score = val_score
 			best_val_top1 = val_metrics["top1"]
+			best_val_metrics = {
+				key: float(value)
+				for key, value in val_metrics.items()
+				if isinstance(value, (int, float))
+			}
+			best_val_metrics["score"] = best_val_score
 			save_checkpoint(
 				path=best_ckpt,
 				model=model,
@@ -749,8 +855,11 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 				class_to_idx=class_to_idx,
 				args=args,
 				criterion=criterion,
+				best_val_score=best_val_score,
+				best_val_metrics=best_val_metrics,
+				score_config=current_score_config,
 			)
-			logger.info("Saved new best checkpoint to %s", best_ckpt)
+			logger.info("Saved new best checkpoint to %s (score=%.4f)", best_ckpt, best_val_score)
 
 		# last checkpoint 每个 epoch 覆盖保存一次，确保中断后能从最近完整 epoch 继续。
 		save_checkpoint(
@@ -763,10 +872,13 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			class_to_idx=class_to_idx,
 			args=args,
 			criterion=criterion,
+			best_val_score=best_val_score,
+			best_val_metrics=best_val_metrics,
+			score_config=current_score_config,
 		)
 		logger.info("Saved last checkpoint to %s", last_ckpt)
 
-	logger.info("Training finished. Best val top1=%.4f", best_val_top1)
+	logger.info("Training finished. Best val score=%.4f best val top1=%.4f", best_val_score, best_val_top1)
 
 	return {
 		"log_file": str(log_file),
@@ -822,10 +934,14 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--resume", type=str, default="", help="checkpoint path to resume")
 	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="Label source mode")
 	parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="Classification loss weight when auto-balance is disabled")
-	parser.add_argument("--box-loss-weight", type=float, default=1.0, help="Box Soft-histogram depth loss weight when auto-balance is disabled")
+	parser.add_argument("--box-loss-weight", type=float, default=10.0, help="Box Soft-histogram depth loss weight when auto-balance is disabled")
 	parser.add_argument("--auto-balance", dest="auto_balance", action="store_true", help="Use Kendall log-variance task balancing")
 	parser.add_argument("--no-auto-balance", dest="auto_balance", action="store_false", help="Use fixed cls/box loss weights")
-	parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for classification loss")
+	parser.add_argument("--label-smoothing", type=float, default=0.1, help="Label smoothing for classification loss")
+	parser.add_argument("--best-score-cls-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation Top-1")
+	parser.add_argument("--best-score-iou-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation box IoU")
+	parser.add_argument("--best-score-depth-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation depth score")
+	parser.add_argument("--best-score-depth-scale", type=float, default=0.01, help="Depth loss scale used by depth_score = 1 / (1 + depth_loss / scale)")
 	parser.add_argument("--spt-timestep", type=int, default=2, help="SPT temporal steps T; default follows Hengshuang.yaml")
 	parser.add_argument("--spt-nneighbor", type=int, default=16, help="SPT kNN neighborhood size")
 	parser.add_argument("--spt-transformer-dim", type=int, default=512, help="SPT internal transformer channel width; default follows Hengshuang.yaml")

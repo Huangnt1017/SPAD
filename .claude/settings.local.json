@@ -10,7 +10,9 @@
       "Bash(cmd //c \"where codegraph\")",
       "Bash(codegraph --help)",
       "Bash(git *)",
-      "Bash(codegraph init *)"
+      "Bash(codegraph init *)",
+      "Bash(cmd *)",
+      "Bash(powershell *)"
     ]
   }
 }

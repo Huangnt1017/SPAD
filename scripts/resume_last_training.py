@@ -130,6 +130,7 @@ def load_checkpoint_meta(checkpoint_path: Path) -> dict[str, Any]:
     return {
         "epoch": int(payload.get("epoch", 0)),
         "best_val_top1": float(payload.get("best_val_top1", 0.0)),
+        "best_val_score": float(payload.get("best_val_score", payload.get("best_val_top1", 0.0))),
         "args": args,
         "missing_keys": missing_keys,
     }
@@ -222,6 +223,7 @@ def find_resume_target(
                     "checkpoint_path": checkpoint_path,
                     "checkpoint_epoch": meta["epoch"],
                     "best_val_top1": meta["best_val_top1"],
+                    "best_val_score": meta["best_val_score"],
                     "checkpoint_args": meta["args"],
                     "checkpoint_kind": checkpoint_kind(checkpoint_path),
                     "missing_checkpoint_keys": meta["missing_keys"],
@@ -277,6 +279,7 @@ def print_target_summary(target: dict[str, Any], args: argparse.Namespace) -> No
     print(f"  target epochs: {args.epochs}")
     print(f"  batch size: {args.batch_size}")
     print(f"  data root: {args.data_root}")
+    print(f"  best val score: {target['best_val_score']:.4f}")
     print(f"  best val top1: {target['best_val_top1']:.4f}")
 
     missing_keys = target.get("missing_checkpoint_keys") or []
@@ -524,7 +527,7 @@ if __name__ == "__main__":
     # 输出:
     #   dry-run:
     #       打印选中的日志、checkpoint、checkpoint epoch、恢复起始 epoch、
-    #       目标 epoch、batch size、data root 和 best_val_top1。
+    #       目标 epoch、batch size、data root、best_val_score 和 best_val_top1。
     #   真正训练:
     #       复用 scripts.train.run_training，追加写入原
     #       logs/train_<model>_<timestamp>.log，并刷新同 timestamp 的
