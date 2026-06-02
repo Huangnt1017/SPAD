@@ -36,7 +36,7 @@
 | 多尺度聚合 | Conv1d + BN1d + LeakyReLU | $\text{cat}(f_1,f_2,f_3,f_4){=}(B,512,N) \to (B,512,N)$ | 各层特征拼接后跨层融合 |
 | 全局池化 | max-pool + avg-pool | $(B,512,N) \to (B,1024)$ | 全局描述子 |
 | 分类头 | MLP (1024→512→256→$C$) | $(B,1024) \to (B,C)$ | BN + LeakyReLU + Dropout |
-| Box 头 | MLP (1032→256→128→3) + centroid-offset | $(B,1032) \to (B,3)$ | 预测 = 点云质心 + 偏移 |
+| Box 头 | MLP (1024→256→128→3) + 直接回归 | $(B,1024) \to (B,3)$ | 从全局特征直接预测中心点坐标 |
 
 > **无下采样设计**: 全部 1024 点贯穿 4 层 Block，保留完整的 intensity 空间结构；多尺度拼接融合各层局部/全局特征。每个 Block 输出 `(p, f_out)`，其中 **p 始终为原始输入坐标 $(B,4,N)$ 不变**，仅 f 逐层升维。
 
@@ -106,13 +106,12 @@ $$\mathbf{out} = \mathbf g \odot \text{Conv1d}_{out}(\mathbf{attn}) + (1 - \math
         gate = σ(Conv1d+BN(P[4D]))                            p 不变
 ```
 
-#### Box 头: Centroid-Offset 预测
+#### Box 头: 直接回归 (Center-Only)
 
-Box 头接收全局特征 + 点云坐标统计量 $(B, 1024{+}8)$，预测从**点云质心到目标中心的偏移量**（而非绝对坐标）：
-$$\hat{\mathbf c} = \bar{\mathbf P}_{xyz} + \text{MLP}([\mathbf f_{pool} \| \bar{\mathbf P} \| \sigma_{\mathbf P}])$$
-其中 $\bar{\mathbf P}$ 为 1024 点的 4D 坐标均值（质心锚点），$\sigma_{\mathbf P}$ 为标准差（尺度先验）。网络只需学习接近零的残差偏移，收敛显著加快。推理时由固定归一化半宽 `FIXED_BBOX_HALF_SIZE_NORMALIZED` 重建完整 3D 边界框。
+Box 头从全局池化特征直接预测中心点坐标 $(B, 1024) \to (B, 3)$：
+$$\hat{\mathbf c} = \text{MLP}(\mathbf f_{pool})$$
 
-> **GCN 变体使用直接回归**：为确保与 baseline (DGCNN/PointNet++ 等) 的对比公平性，GCN 版改为 `box_pred = self.box_head(f_pooled)` 直接从全局池化特征预测中心点坐标，不依赖质心先验。
+> **设计原因**：为确保与 baseline (DGCNN / PointNet++ 等) 的对比公平性，所有模型统一使用直接回归，不依赖质心先验。推理时由固定归一化半宽 `FIXED_BBOX_HALF_SIZE_NORMALIZED` 重建完整 3D 边界框。
 
 
 #### 损失函数
@@ -236,7 +235,7 @@ $env:PYTHONPATH = "D:\PYproject\SPAD"
 
 **P0 — 移除全局注意力 (已完成)**：原 SAGEConv 已将邻域聚合为单向量 (无邻居维度 $k$)，被迫做 $(B,N,N)$ 全局 softmax — 对 1024 点全连接图注意力既嘈杂又过拟合。改为 SE-style channel gate + Conv1d 直接融合 $f_{gcn}$ 与 $p_{gcn}$，消除 1024×1024 注意力矩阵 (~512 MB 中间显存)。
 
-**统一 Box 头 (已完成)**：原 centroid-offset 预测依赖质心先验，与 baseline (DGCNN/PointNet++ 等) 的直接回归方式不一致，导致对比实验不公平。改为 `box_pred = self.box_head(f_pooled)` 直接回归，确保 backbone 成为唯一变量。
+**统一 Box 头 (已完成)**：原 centroid-offset 预测依赖质心先验，与 baseline (DGCNN/PointNet++ 等) 的直接回归方式不一致，导致对比实验不公平。`graph_residual.py` 和 `graph_res_GCN.py` 均已改为 `box_pred = self.box_head(f_pooled)` 直接回归，确保 backbone 成为唯一变量。
 
 **Soft-histogram depth loss (已完成)**：原 Log-Cauchy 为数学近似，改为直接建模 SPAD 物理过程：
 $$\mathcal L_{depth} = \sum_{d \in \{x,y,z\}} \sum_{k=-K}^{K} w_k \cdot (\hat c_d - (c_d^{gt} + k \cdot \delta_d))^2$$

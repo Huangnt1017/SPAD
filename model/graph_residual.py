@@ -357,7 +357,6 @@ class GraphResidualMultiTaskNet(nn.Module):
         )
 
         pooled_dim = 1024  # 512 * 2
-        box_input_dim = pooled_dim + 8
 
         self.cls_head = nn.Sequential(
             nn.Linear(pooled_dim, 512, bias=False),
@@ -371,10 +370,11 @@ class GraphResidualMultiTaskNet(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-        # Box head: 拼接坐标均值+标准差 → 提供空间锚点
-        # p_mean 近似目标中心, p_std 反映空间尺度
+        # Box head: 直接回归 (与 baseline 一致)
+        # 从全局池化特征直接预测中心点坐标, 不依赖质心先验,
+        # 确保与 DGCNN / PointNet++ 等 baseline 的对比公平性。
         self.box_head = nn.Sequential(
-            nn.Linear(box_input_dim, 256, bias=False),
+            nn.Linear(pooled_dim, 256, bias=False),
             nn.BatchNorm1d(256),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
@@ -427,14 +427,9 @@ class GraphResidualMultiTaskNet(nn.Module):
 
         logits = self.cls_head(f_pooled)
 
-        # Box head: centroid-offset 预测
-        # 点云质心是目标中心的强先验 → box head 只需学小偏移量, 收敛更快
-        p_mean = p.mean(dim=-1)                                   # (B, 4)
-        p_std = p.std(dim=-1)                                     # (B, 4)
-        centroid_xyz = p_mean[:, :3]                              # (B, 3) 点云质心 xyz
-        box_input = torch.cat([f_pooled, p_mean, p_std], dim=1)  # (B, 1032)
-        box_offset = self.box_head(box_input)                     # (B, 3) 从质心到中心的偏移
-        box_preds = centroid_xyz + box_offset                     # (B, 3) 最终中心预测
+        # Box head: 直接回归 (与 baseline 一致)
+        # 从全局特征直接预测中心点坐标, 不依赖质心先验
+        box_preds = self.box_head(f_pooled)                       # (B, 3)
 
         return {"logits": logits, "box_pred": box_preds}
 

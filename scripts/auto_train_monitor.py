@@ -32,17 +32,7 @@ TRAIN_SCRIPT = PROJECT_ROOT / "scripts" / "train.py"
 STATE_FILE = PROJECT_ROOT / ".auto_train_monitor_state.json"
 MONITOR_LOG = PROJECT_ROOT / "auto_train_next.log"
 
-# 无参运行时使用的自动训练队列。需要调整顺序时只改这里。
-AUTO_TRAIN_MODELS: list[str] = [
-    "pointtransformer",
-    "pointnet",
-    "pointnet2",
-    "pointnet2msg",
-    "pointtransv3",
-    "pointmlp",
-    "upp",
-    "spt",
-]
+
 
 
 @dataclass
@@ -251,6 +241,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_auto_train(config)
     return 0
 
+
+# 无参运行时使用的自动训练队列。需要调整顺序时只改这里。
+AUTO_TRAIN_MODELS: list[str] = [
+    "dgcnn",
+    "pointnet",
+    "pointnet2",
+    "pointnet2msg",
+    "pointbert",
+    "pointmae",
+
+    "pointtransformer",
+    "pointtransv2",
+    "pointtransv3",
+    "pointmlp",
+    "pointmlpelite",
+    "upp",
+    "spt",
+    "graph_residual",
+	"graph_residual_gcn",
+]
 
 def main_without_cli() -> None:
     """无参运行入口：显式使用 AUTO_TRAIN_MODELS 队列。"""

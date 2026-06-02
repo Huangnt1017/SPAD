@@ -453,8 +453,6 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         )
 
         # Box head: 直接回归 (与 baseline 一致)
-        # 从全局池化特征直接预测中心点坐标, 不依赖质心先验,
-        # 确保与 DGCNN / PointNet++ 等 baseline 的对比公平性。
         self.box_head = nn.Sequential(
             nn.Linear(pooled_dim, 256, bias=False),
             nn.BatchNorm1d(256),
