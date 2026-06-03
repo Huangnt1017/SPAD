@@ -395,21 +395,23 @@ python .\SNN\test.py  --checkpoint SNN\artifacts\train_xxx\best.pth --data-paths
 python .\SNN\test1.py --checkpoint SNN\artifacts\train_xxx\best.pth --raw-path data\raw\one.raw --group-index 0
 ```
 
-## 8. SNN_new.py — activation_based API 版本
+## 8. SNN 模型 — 官方 activation_based API
 
-`SNN_new.py` 将后端从旧版 `clock_driven` 迁移到 `activation_based`，对外接口（输入/输出形状、参数名）与 `SNN.py` 完全一致，可直接替换。
+本项目的 SNN 训练、测试和单样本推理现在统一使用环境中安装的官方
+`spikingjelly.activation_based`。`SNN_new.py` 是实际模型实现，`SNN.py`
+只保留为兼容旧导入路径的转发入口，不再依赖本地 `spikingjelly1` 副本。
 
-### 8.1 API 差异
+### 8.1 API 约定
 
-| 维度 | SNN.py (clock_driven) | SNN_new.py (activation_based) |
-|------|----------------------|-------------------------------|
-| 导入 | `spikingjelly1.clock_driven.neuron` | `spikingjelly.activation_based.neuron/functional` |
-| 神经元 | `MultiStepParametricLIFNode(timestep=T)` | `neuron.ParametricLIFNode(step_mode='m')` |
-| 时间步 | 构造传 `timestep`, 内部展开 | `step_mode='m'` 多步模式 |
-| 输入形状 | `[T*B, C, H, W]` | `[T, B, C, H, W]` |
-| ANN 子模块 | 直接调用 (已展平) | `functional.seq_to_ann_forward(x, module)` |
-| chunk 截断 | 手动 `m.v = m.v.detach()` | `functional.detach_net(self)` |
-| 网络重置 | `functional.reset_net(self)` | 同 (接口不变) |
+| 维度 | 当前实现 |
+|------|----------|
+| 导入 | `spikingjelly.activation_based.neuron/functional` |
+| 神经元 | `neuron.ParametricLIFNode(step_mode='m')` |
+| 时间步 | `step_mode='m'` 多步模式 |
+| 输入形状 | `[T, B, C, H, W]` |
+| ANN 子模块 | `functional.seq_to_ann_forward(x, module)` |
+| chunk 截断 | `functional.detach_net(self)` |
+| 网络重置 | `functional.reset_net(self)` |
 
 ### 8.2 结构变化
 
@@ -432,12 +434,18 @@ model = SPADSpikeNet(encoding_mode="lut", embed_dim=16, lut_init="rbf")
 out = model(raw_data)         # raw_data [B,4096,P] → out["output"] [B,2,64,64]
 ```
 
+旧代码中的以下导入也可继续使用，但同样会转发到官方 `activation_based` 实现：
+
+```python
+from SNN_based_method.SNN import SPADSpikeNet
+```
+
 ### 8.4 环境要求
 
 ```
-SNN.py     → spikingjelly1 (本地 clock_driven 副本, env: pytorch)
-SNN_new.py → spikingjelly  (activation_based, env: torchnew)
-两文件各自环境独立运行, 互不依赖
+SNN.py     → 兼容入口, 转发到 SNN_new.py
+SNN_new.py → 官方 spikingjelly.activation_based 实现
+运行环境    → torchnew
 ```
 
 ### 8.5 cupy backend 自动检测
@@ -454,12 +462,6 @@ SNN_new.py → spikingjelly  (activation_based, env: torchnew)
 
 `CUDA_PATH`：`conda run` 子进程可能未继承新增环境变量，`_probe_cupy_backend()` 在其缺失时自动兜底默认路径。
 
-spikingjelly 开发版兼容修复：
-```
-activation_based              → 缩进对齐
-activation_based/neuron/base_node.py → 文件头加 from abc import abstractmethod
-```
-
 ---
 
 ## 9. 文件说明
@@ -468,8 +470,8 @@ activation_based/neuron/base_node.py → 文件头加 from abc import abstractme
 SNN_based_method/
   reademe.md            本文档
   SNN_config.py         统一配置 (SNNConfig + 预置 + JSON)
-  SNN.py                模型 — clock_driven API (env: pytorch)
-  SNN_new.py            模型 — activation_based API (env: torchnew)
+  SNN.py                模型兼容入口, 转发到官方 activation_based 实现
+  SNN_new.py            模型实现, 使用官方 spikingjelly.activation_based
   loss.py               训练损失 + 评估指标
   visualize_encoding.py 编码可视化工具
 ```
@@ -504,4 +506,3 @@ cupy backend: available
 9. 有无 `L_var` / `L_sparse` / `L_smooth`
 10. P shuffle 训练 vs 不 shuffle
 11. train P=120, test P=60/120/240/500 可变 P 泛化曲线
-

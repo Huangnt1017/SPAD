@@ -28,6 +28,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
+try:
+    from SNN_based_method.scripts.augment import (
+        SpadRawTrainAugmentation,
+        clip_tof_to_valid_range,
+    )
+except ImportError:
+    from augment import SpadRawTrainAugmentation, clip_tof_to_valid_range
+
 
 NUM_PIXELS = 64 * 64
 RAW_VALUE_BYTES = 2
@@ -280,7 +288,12 @@ def raw2frame(
     total_pages: int,
     time_threshold: int,
 ) -> np.ndarray:
-    """读取 SPAD raw 文件并返回 ``[G, 4096, P]`` 分组数组。"""
+    """读取 SPAD raw 文件并返回未裁剪的 ``[G, 4096, P]`` 分组数组。
+
+    注意: 这里保留 raw 中原始 ToF 值, 不提前把 ``> time_threshold`` 置 0。
+    训练增强需要先在原始 ToF 层面操作, 再由 Dataset 统一把小于 1 或大于
+    ``time_threshold`` 的值置 0。
+    """
     filename = Path(filename)
     if not filename.is_file():
         raise FileNotFoundError(f"raw file not found: {filename}")
@@ -306,7 +319,6 @@ def raw2frame(
 
     frames = flat_data.reshape(total_pages, 64, 64)
     flat_frames = frames.reshape(total_pages, NUM_PIXELS)
-    flat_frames[flat_frames > time_threshold] = 0
     num_groups = total_pages // pages_per_group
     grouped = flat_frames.reshape(num_groups, pages_per_group, NUM_PIXELS)
     return np.transpose(grouped, (0, 2, 1)).astype(np.uint16, copy=False)
@@ -383,7 +395,7 @@ def build_point_cloud_from_group(
         raise ValueError("group_tof must have shape [4096, P]")
 
     frames = group_tof.T.reshape(group_tof.shape[1], 64, 64)
-    valid_mask = (frames > 0) & (frames < time_threshold)
+    valid_mask = (frames > 0) & (frames <= time_threshold)
     if not np.any(valid_mask):
         return np.empty((0, 3), dtype=np.uint16)
 
@@ -459,6 +471,7 @@ class SpadRawGroupDataset(Dataset):
         cache_size: int = 2,
         raw_metadata: Sequence[Mapping[str, Any]] | None = None,
         samples: Sequence[RawGroupSample] | None = None,
+        raw_group_transform: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
         transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         label_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
@@ -481,6 +494,7 @@ class SpadRawGroupDataset(Dataset):
         self.shuffle_pages = bool(shuffle_pages)
         self.active_point = int(active_point)
         self.cache_size = max(0, int(cache_size))
+        self.raw_group_transform = raw_group_transform
         self.transform = transform
         self.label_transform = label_transform
         if raw_metadata is None:
@@ -531,7 +545,13 @@ class SpadRawGroupDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.samples[index]
         grouped = self._load_raw_groups(sample)
-        group_tof = grouped[sample.group_index]
+        raw_group_tof = grouped[sample.group_index]
+
+        if self.raw_group_transform is not None:
+            group_tof, label_group_tof = self.raw_group_transform(raw_group_tof)
+        else:
+            group_tof = clip_tof_to_valid_range(raw_group_tof, self.time_threshold)
+            label_group_tof = group_tof
 
         frames = group_to_time_first_frames(
             group_tof,
@@ -562,7 +582,7 @@ class SpadRawGroupDataset(Dataset):
 
         if self.return_label:
             label = build_weak_label_from_group(
-                group_tof,
+                label_group_tof,
                 time_threshold=self.time_threshold,
                 active_point=self.active_point,
             )
@@ -683,6 +703,11 @@ def create_spad_dataloaders(
     return_label: bool = True,
     normalize: bool = False,
     shuffle_pages: bool = False,
+    augment_train: bool = False,
+    tof_shift_max: int = 15,
+    tof_shift_prob: float = 1.0,
+    page_dropout: bool = False,
+    page_dropout_prob: float = 0.1,
     active_point: int = 1,
     cache_size: int = 2,
     recursive: bool = False,
@@ -712,7 +737,7 @@ def create_spad_dataloaders(
         time_threshold=time_threshold,
         return_label=return_label,
         normalize=normalize,
-        shuffle_pages=shuffle_pages,
+        shuffle_pages=False,
         active_point=active_point,
         cache_size=cache_size,
         raw_metadata=raw_metadata,
@@ -722,9 +747,34 @@ def create_spad_dataloaders(
         split_ratios=split_ratios,
         seed=seed,
     )
+    train_transform = (
+        SpadRawTrainAugmentation(
+            t_max=time_threshold,
+            tof_shift_max=tof_shift_max,
+            tof_shift_prob=tof_shift_prob,
+            page_dropout=page_dropout,
+            page_dropout_prob=page_dropout_prob,
+        )
+        if augment_train
+        else None
+    )
+    train_dataset = SpadRawGroupDataset(
+        raw_paths=raw_paths,
+        pages_per_group=pages_per_group,
+        total_pages=total_pages,
+        time_threshold=time_threshold,
+        return_label=return_label,
+        normalize=normalize,
+        shuffle_pages=shuffle_pages,
+        active_point=active_point,
+        cache_size=cache_size,
+        raw_metadata=raw_metadata,
+        samples=[dataset.samples[index] for index in train_indices],
+        raw_group_transform=train_transform,
+    )
 
     train_loader = make_spad_dataloader(
-        Subset(dataset, train_indices),
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,

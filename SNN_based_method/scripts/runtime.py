@@ -43,13 +43,19 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lr", type=float, default=None, help="学习率")
     parser.add_argument("--weight-decay", type=float, default=None, help="AdamW 权重衰减")
     parser.add_argument("--grad-clip", type=float, default=None, help="梯度裁剪最大范数")
+    parser.add_argument("--grad-accum-steps", type=int, default=None, help="梯度累积步数")
     parser.add_argument("--device", default=None, help="运行设备: auto/cpu/cuda")
     parser.add_argument("--log-dir", default=None, help="训练日志、测试结果输出目录")
     parser.add_argument("--checkpoint-dir", default=None, help="训练 checkpoint 输出目录")
     parser.add_argument("--output-dir", default=None, help="旧版统一实验产物输出目录")
     parser.add_argument("--run-name", default=None, help="本次运行名称")
     parser.add_argument("--checkpoint", dest="checkpoint_path", default=None, help="checkpoint 路径")
-    parser.add_argument("--model-backend", choices=["new", "legacy"], default=None, help="模型后端: new 或 legacy")
+    parser.add_argument(
+        "--model-backend",
+        choices=["new", "activation", "activation_based", "legacy", "clock", "clock_driven"],
+        default=None,
+        help="模型后端; legacy/clock_driven 仅作旧配置兼容, 实际使用官方 activation_based",
+    )
     parser.add_argument("--encoding-mode", choices=["sinusoidal", "lut"], default=None, help="ToF 编码方式")
     parser.add_argument("--embed-dim", type=int, default=None, help="LUT 编码维度")
     parser.add_argument("--lut-init", choices=["sinusoidal", "rbf", "random"], default=None, help="LUT 初始化方式")
@@ -57,6 +63,66 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--chunk-size", type=int, default=None, help="按时间维切块的 chunk 大小")
     parser.add_argument("--spike-mode", choices=["plif", "lif", "if"], default=None, help="脉冲神经元类型")
     parser.add_argument("--num-blocks", type=int, default=None, help="SpikeBlock 数量")
+    parser.add_argument("--refine-mid", type=int, default=None, help="深度/强度精修头的中间通道数")
+    sequence_group = parser.add_mutually_exclusive_group()
+    sequence_group.add_argument(
+        "--return-sequence",
+        dest="return_sequence",
+        action="store_true",
+        default=None,
+        help="返回完整 gate/tof/valid 时间序列; 训练 var/sparse loss 时需要",
+    )
+    sequence_group.add_argument(
+        "--no-return-sequence",
+        dest="return_sequence",
+        action="store_false",
+        help="只返回最终图像输出; 推理时可降低显存和日志负担",
+    )
+    parser.add_argument("--w-gt", type=float, default=None, help="GT L1 loss 权重")
+    parser.add_argument("--w-ssim", type=float, default=None, help="SSIM loss 权重")
+    parser.add_argument("--w-var", type=float, default=None, help="gate 方差 loss 权重")
+    parser.add_argument("--w-sparse", type=float, default=None, help="gate 稀疏 loss 权重")
+    parser.add_argument("--w-smooth", type=float, default=None, help="强度引导平滑 loss 权重")
+    parser.add_argument("--w-lut-smooth", type=float, default=None, help="LUT 相邻 bin 平滑正则权重")
+    parser.add_argument("--w-lut-norm", type=float, default=None, help="LUT 范数一致性正则权重")
+    parser.add_argument("--sigma-target", type=float, default=None, help="gate 方差 loss 的目标 sigma, 单位为 bin")
+    parser.add_argument("--rho-target", type=float, default=None, help="gate 稀疏 loss 的目标平均激活率")
+    parser.add_argument("--beta-smooth", type=float, default=None, help="强度引导平滑 loss 的边缘衰减系数")
+    parser.add_argument("--ssim-kernel-size", type=int, default=None, help="SSIM 高斯窗口大小")
+    parser.add_argument(
+        "--ssim-smooth-kernel-size",
+        type=int,
+        default=None,
+        help="SSIM 前均值滤波窗口; 1 表示关闭, 必须为奇数",
+    )
+    gt_mask_group = parser.add_mutually_exclusive_group()
+    gt_mask_group.add_argument(
+        "--gt-use-mask",
+        dest="gt_use_mask",
+        action="store_true",
+        default=None,
+        help="GT L1 仅在 depth_gt > 0 区域计算",
+    )
+    gt_mask_group.add_argument(
+        "--no-gt-mask",
+        dest="gt_use_mask",
+        action="store_false",
+        help="GT L1 在全图计算",
+    )
+    ssim_mask_group = parser.add_mutually_exclusive_group()
+    ssim_mask_group.add_argument(
+        "--ssim-use-mask",
+        dest="ssim_use_mask",
+        action="store_true",
+        default=None,
+        help="SSIM 仅在 depth_gt > 0 区域计算",
+    )
+    ssim_mask_group.add_argument(
+        "--no-ssim-mask",
+        dest="ssim_use_mask",
+        action="store_false",
+        help="SSIM 在全图计算",
+    )
     parser.add_argument("--recursive", action="store_true", help="递归搜索数据目录")
     parser.add_argument("--no-label", action="store_true", help="关闭弱标签生成")
     parser.add_argument("--normalize-input", action="store_true", help="按 time_threshold 归一化输入")
@@ -85,6 +151,7 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "lr",
         "weight_decay",
         "grad_clip",
+        "grad_accum_steps",
         "device",
         "log_dir",
         "checkpoint_dir",
@@ -99,6 +166,22 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "chunk_size",
         "spike_mode",
         "num_blocks",
+        "refine_mid",
+        "return_sequence",
+        "w_gt",
+        "w_ssim",
+        "w_var",
+        "w_sparse",
+        "w_smooth",
+        "w_lut_smooth",
+        "w_lut_norm",
+        "sigma_target",
+        "rho_target",
+        "beta_smooth",
+        "ssim_kernel_size",
+        "ssim_smooth_kernel_size",
+        "gt_use_mask",
+        "ssim_use_mask",
     ):
         if hasattr(args, key):
             value = getattr(args, key)
@@ -171,6 +254,7 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "lr",
         "weight_decay",
         "grad_clip",
+        "grad_accum_steps",
         "device",
         "log_dir",
         "checkpoint_dir",
@@ -185,6 +269,22 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "chunk_size",
         "spike_mode",
         "num_blocks",
+        "refine_mid",
+        "return_sequence",
+        "w_gt",
+        "w_ssim",
+        "w_var",
+        "w_sparse",
+        "w_smooth",
+        "w_lut_smooth",
+        "w_lut_norm",
+        "sigma_target",
+        "rho_target",
+        "beta_smooth",
+        "ssim_kernel_size",
+        "ssim_smooth_kernel_size",
+        "gt_use_mask",
+        "ssim_use_mask",
     ):
         if hasattr(args, key):
             value = getattr(args, key)
@@ -309,13 +409,76 @@ def state_dict_needs_model_adaptation(
     state_dict: dict[str, torch.Tensor],
     model: torch.nn.Module,
 ) -> bool:
-    """当 checkpoint 张量形状与当前模型不完全一致时返回 True。"""
+    """当 checkpoint 需要旧结构兼容适配时返回 True。"""
     model_state = model.state_dict()
     for key, value in state_dict.items():
+        if key.startswith("refine.net."):
+            return True
         target = model_state.get(key)
         if target is not None and value.shape != target.shape:
             return True
     return False
+
+
+def _pad_conv_input_if_needed(
+    value: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """旧卷积输入通道少于新卷积时, 复制旧通道并把新增通道置 0。"""
+    can_pad_conv_input = (
+        value.ndim == 4
+        and target.ndim == 4
+        and value.shape[0] == target.shape[0]
+        and value.shape[2:] == target.shape[2:]
+        and value.shape[1] < target.shape[1]
+    )
+    if not can_pad_conv_input:
+        return value
+
+    padded = torch.zeros_like(target)
+    padded[:, : value.shape[1], :, :] = value
+    return padded
+
+
+def _map_legacy_refine_key(
+    key: str,
+    value: torch.Tensor,
+    model_state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """把旧版共享 refine.net.* 权重映射到 depth/intensity 两个精修头。"""
+    if not key.startswith("refine.net."):
+        return {}
+
+    suffix = key.removeprefix("refine.net.")
+    mapped: dict[str, torch.Tensor] = {}
+
+    if suffix.startswith("0.") or suffix.startswith("1."):
+        for branch in ("depth_net", "intensity_net"):
+            new_key = f"refine.{branch}.{suffix}"
+            target = model_state.get(new_key)
+            if target is not None:
+                mapped[new_key] = _pad_conv_input_if_needed(value, target)
+        return mapped
+
+    if suffix.startswith("3."):
+        for branch, channel_index in (("depth_net", 0), ("intensity_net", 1)):
+            new_key = f"refine.{branch}.{suffix}"
+            target = model_state.get(new_key)
+            if target is None:
+                continue
+            if (
+                value.ndim >= 1
+                and target.ndim >= 1
+                and value.shape[0] >= channel_index + 1
+                and target.shape[0] == 1
+            ):
+                branch_value = value[channel_index : channel_index + 1]
+            else:
+                branch_value = value
+            mapped[new_key] = _pad_conv_input_if_needed(branch_value, target)
+        return mapped
+
+    return {}
 
 
 def adapt_state_dict_for_model(
@@ -324,27 +487,30 @@ def adapt_state_dict_for_model(
 ) -> dict[str, torch.Tensor]:
     """在严格加载前适配少量向后兼容的形状变化。
 
-    曾经的置信度门控精修头把第一层卷积输入从 2 通道扩展到 3 通道。
-    旧 checkpoint 可以复制已有 2 个通道, 新增置信度通道用 0 初始化。
+    兼容两类历史变化:
+    1. 共享 ``refine.net.*`` 精修头拆成 ``depth_net`` 和 ``intensity_net``。
+    2. 置信度门控让第一层卷积输入从 2 通道扩展到 3 通道。
     """
     model_state = model.state_dict()
     adapted: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
+        legacy_refine = _map_legacy_refine_key(key, value, model_state)
+        if legacy_refine:
+            adapted.update(legacy_refine)
+            continue
+        if key.startswith("refine.net."):
+            continue
+
         target = model_state.get(key)
-        if target is None or value.shape == target.shape:
+        if target is None:
+            adapted[key] = value
+            continue
+        if value.shape == target.shape:
             adapted[key] = value
             continue
 
-        can_pad_conv_input = (
-            value.ndim == 4
-            and target.ndim == 4
-            and value.shape[0] == target.shape[0]
-            and value.shape[2:] == target.shape[2:]
-            and value.shape[1] < target.shape[1]
-        )
-        if can_pad_conv_input:
-            padded = torch.zeros_like(target)
-            padded[:, : value.shape[1], :, :] = value
+        padded = _pad_conv_input_if_needed(value, target)
+        if padded.shape == target.shape:
             adapted[key] = padded
         else:
             adapted[key] = value
@@ -352,14 +518,16 @@ def adapt_state_dict_for_model(
 
 
 def reset_spiking_state(model: torch.nn.Module) -> None:
-    """如果当前后端提供 reset_net, 则重置脉冲神经元状态。"""
-    for module_name in ("spikingjelly.activation_based.functional", "spikingjelly.clock_driven.functional"):
-        try:
-            module = __import__(module_name, fromlist=["reset_net"])
-            module.reset_net(model)
-            return
-        except Exception:
-            continue
+    """按官方 ``spikingjelly.activation_based`` API 重置脉冲神经元状态。"""
+    try:
+        from spikingjelly.activation_based import functional
+    except ImportError as exc:
+        raise RuntimeError(
+            "当前 SNN 项目需要环境中安装官方 spikingjelly, "
+            "且必须包含 spikingjelly.activation_based。"
+        ) from exc
+
+    functional.reset_net(model)
 
 
 def prepare_model_input(frames: torch.Tensor) -> torch.Tensor:

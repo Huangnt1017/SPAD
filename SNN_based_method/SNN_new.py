@@ -24,6 +24,7 @@ if "CUDA_PATH" not in os.environ:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from spikingjelly.activation_based import neuron, functional
 
 
@@ -267,8 +268,36 @@ class MultiScaleDSConv(nn.Module):
         Returns:
             [B, C, H, W]
         """
-        # 三路膨胀卷积拼接: [B, C, H, W] × 3 → [B, 3C, H, W]
-        return self.bn(self.pw(torch.cat([self.dw1(x), self.dw2(x), self.dw4(x)], dim=1)))
+        # 避免显式构造 [B, 3C, H, W] 的大拼接张量, 降低训练峰值显存。
+        weight1, weight2, weight4 = self.pw.weight.chunk(3, dim=1)
+        out = F.conv2d(
+            self.dw1(x),
+            weight1,
+            bias=None,
+            stride=self.pw.stride,
+            padding=self.pw.padding,
+            dilation=self.pw.dilation,
+            groups=self.pw.groups,
+        )
+        out = out + F.conv2d(
+            self.dw2(x),
+            weight2,
+            bias=None,
+            stride=self.pw.stride,
+            padding=self.pw.padding,
+            dilation=self.pw.dilation,
+            groups=self.pw.groups,
+        )
+        out = out + F.conv2d(
+            self.dw4(x),
+            weight4,
+            bias=None,
+            stride=self.pw.stride,
+            padding=self.pw.padding,
+            dilation=self.pw.dilation,
+            groups=self.pw.groups,
+        )
+        return self.bn(out)
 
 
 class SpikeBlock(nn.Module):
@@ -310,7 +339,7 @@ class SpikeBlock(nn.Module):
 
 
 class SpatialRefineHead(nn.Module):
-    """置信度调制的轻量 CNN 精修头, 并将输出约束到物理有效范围.
+    """深度/强度分离的置信度调制精修头, 并将输出约束到物理有效范围.
 
     Args:
         mid: 中间通道数
@@ -320,11 +349,17 @@ class SpatialRefineHead(nn.Module):
     def __init__(self, mid: int = 8, depth_range: float = 128.0):
         super().__init__()
         self.depth_range = float(depth_range)
-        self.net = nn.Sequential(
+        self.depth_net = nn.Sequential(
             nn.Conv2d(3, mid, 3, padding=1, bias=False),
             nn.BatchNorm2d(mid),
             nn.ReLU(inplace=True),
-            nn.Conv2d(mid, 2, 3, padding=1, bias=False),
+            nn.Conv2d(mid, 1, 3, padding=1, bias=False),
+        )
+        self.intensity_net = nn.Sequential(
+            nn.Conv2d(3, mid, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, 1, 3, padding=1, bias=False),
         )
 
     def forward(
@@ -350,10 +385,14 @@ class SpatialRefineHead(nn.Module):
             ],
             dim=1,
         )
-        residual = self.net(torch.cat([coarse_norm, confidence], dim=1))
-        output_norm = (coarse_norm + residual * confidence).clamp(0.0, 1.0)
-        depth = output_norm[:, 0:1] * self.depth_range
-        intensity = output_norm[:, 1:2]
+        refine_input = torch.cat([coarse_norm, confidence], dim=1)
+        depth_norm = (
+            coarse_norm[:, 0:1] + self.depth_net(refine_input) * confidence
+        ).clamp(0.0, 1.0)
+        intensity = (
+            coarse_norm[:, 1:2] + self.intensity_net(refine_input) * confidence
+        ).clamp(0.0, 1.0)
+        depth = depth_norm * self.depth_range
         return torch.cat([depth, intensity], dim=1)
 
 
@@ -462,6 +501,8 @@ class SPADSpikeNet(nn.Module):
         encoding_mode: str = "sinusoidal",
         embed_dim: int = 16,
         lut_init: str = "sinusoidal",
+        refine_mid: int = 8,
+        return_sequence: bool = True,
     ):
         super().__init__()
         self.C = C
@@ -469,6 +510,7 @@ class SPADSpikeNet(nn.Module):
         self.t_max = t_max
         self.n_freq = n_freq
         self.encoding_mode = encoding_mode
+        self.return_sequence = bool(return_sequence)
 
         if encoding_mode == "lut":
             self.tof_embedding = LearnableTofEmbedding(
@@ -485,7 +527,7 @@ class SPADSpikeNet(nn.Module):
             [SpikeBlock(C, spike_mode) for _ in range(num_blocks)]
         )
         self.gate_head = _GateHead(C, spike_mode)
-        self.refine = SpatialRefineHead(depth_range=t_max)
+        self.refine = SpatialRefineHead(mid=refine_mid, depth_range=t_max)
 
     def _encode_chunk(
         self, chunk: torch.Tensor
@@ -527,7 +569,12 @@ class SPADSpikeNet(nn.Module):
         gate = self.gate_head(x)                        # [T, B, 1, H, W]
         return gate, tof, valid
 
-    def forward(self, raw_data: torch.Tensor) -> dict:
+    def forward(
+        self,
+        raw_data: torch.Tensor,
+        *,
+        return_sequence: bool | None = None,
+    ) -> dict:
         """
         Args:
             raw_data: [B, N, P]  raw ToF timestamps, N = H*W (默认 4096 = 64×64)
@@ -539,12 +586,11 @@ class SPADSpikeNet(nn.Module):
                 intensity:         [B, 1, H, W]
                 depth_coarse:      [B, 1, H, W]
                 intensity_coarse:  [B, 1, H, W]
-                gate:              [P, B, 1, H, W]
-                tof:               [P, B, H, W]
-                valid:             [P, B, H, W]
+                gate/tof/valid:    仅 return_sequence=True 时返回完整时间序列
                 lut_smooth:        scalar (仅 encoding_mode="lut")
                 lut_norm:          scalar (仅 encoding_mode="lut")
         """
+        should_return_sequence = self.return_sequence if return_sequence is None else bool(return_sequence)
         B, N, P = raw_data.shape
         # N = H*W, 假设正方形; 支持任意分辨率 (如 16×16 用于测试, 64×64 用于生产)
         H = W = int(N ** 0.5)
@@ -583,9 +629,10 @@ class SPADSpikeNet(nn.Module):
             weighted_sum = weighted_sum + (gate * tof_exp * v_exp).sum(0)
             weight_sum = weight_sum + (gate * v_exp).sum(0)
 
-            all_gates.append(gate)
-            all_tofs.append(tof)
-            all_valids.append(valid)
+            if should_return_sequence:
+                all_gates.append(gate)
+                all_tofs.append(tof)
+                all_valids.append(valid)
 
             # chunk 间截断膜电位梯度, 防止 BPTT 跨 chunk 爆炸
             if i < n_chunks - 1:
@@ -608,10 +655,11 @@ class SPADSpikeNet(nn.Module):
             "depth_coarse": depth,
             "intensity_coarse": intensity,
             "confidence": confidence,
-            "gate": torch.cat(all_gates, dim=0),        # [P, B, 1, H, W]
-            "tof": torch.cat(all_tofs, dim=0),          # [P, B, H, W]
-            "valid": torch.cat(all_valids, dim=0),      # [P, B, H, W]
         }
+        if should_return_sequence:
+            out["gate"] = torch.cat(all_gates, dim=0)   # [P, B, 1, H, W]
+            out["tof"] = torch.cat(all_tofs, dim=0)     # [P, B, H, W]
+            out["valid"] = torch.cat(all_valids, dim=0) # [P, B, H, W]
 
         if self.tof_embedding is not None:
             out["lut_smooth"] = self.tof_embedding.smoothness_loss()

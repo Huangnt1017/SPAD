@@ -98,14 +98,22 @@ def _compute_ssim(pred, target, mask=None, kernel_size=11, sigma=1.5,
 
 
 class WeakGTLoss(nn.Module):
-    """L1 loss against noisy GT after normalizing channels to comparable ranges."""
+    """归一化后的 GT L1 约束, 可选择是否仅在有效深度区域计算。"""
 
-    def __init__(self, w_depth=1.0, w_intensity=1.0, depth_range=128.0, intensity_range=1.0):
+    def __init__(
+        self,
+        w_depth=1.0,
+        w_intensity=1.0,
+        depth_range=128.0,
+        intensity_range=1.0,
+        use_mask: bool = False,
+    ):
         super().__init__()
         self.w_depth = w_depth
         self.w_intensity = w_intensity
         self.depth_range = float(depth_range)
         self.intensity_range = float(intensity_range)
+        self.use_mask = bool(use_mask)
 
     def forward(self, result, gt):
         """
@@ -118,10 +126,14 @@ class WeakGTLoss(nn.Module):
         d_gt = (gt[:, 0:1] / self.depth_range).clamp(0.0, 1.0)
         i_gt = (gt[:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
 
-        mask = (d_gt > 0).float()
-
-        loss_d = (torch.abs(d_pred - d_gt) * mask).sum() / (mask.sum() + 1e-6)
-        loss_i = (torch.abs(i_pred - i_gt) * mask).sum() / (mask.sum() + 1e-6)
+        if self.use_mask:
+            mask = (d_gt > 0).float()
+            normalizer = mask.sum() + 1e-6
+            loss_d = (torch.abs(d_pred - d_gt) * mask).sum() / normalizer
+            loss_i = (torch.abs(i_pred - i_gt) * mask).sum() / normalizer
+        else:
+            loss_d = torch.abs(d_pred - d_gt).mean()
+            loss_i = torch.abs(i_pred - i_gt).mean()
 
         return self.w_depth * loss_d + self.w_intensity * loss_i
 
@@ -178,7 +190,7 @@ class SSIMLoss(nn.Module):
     """结构相似性损失 (1 - SSIM), 对 depth 和 intensity 分别计算.
 
     SSIM 捕获局部亮度/对比度/结构信息, 弥补纯像素级 L1 的不足.
-    仅在有 GT 且 mask 覆盖区域计算; 数据范围由 depth_range / intensity_range 指定.
+    可选对 GT 做有效区域 mask, 并可在 SSIM 前做轻量平滑以降低标签噪声影响。
 
     Args:
         w_depth: depth SSIM loss 权重
@@ -188,14 +200,34 @@ class SSIMLoss(nn.Module):
         intensity_range: intensity 的动态范围 (默认 1.0, 归一化后)
     """
 
-    def __init__(self, w_depth=1.0, w_intensity=1.0,
-                 kernel_size=7, depth_range=128.0, intensity_range=1.0):
+    def __init__(
+        self,
+        w_depth=1.0,
+        w_intensity=1.0,
+        kernel_size=7,
+        depth_range=128.0,
+        intensity_range=1.0,
+        use_mask: bool = False,
+        smooth_kernel_size: int = 3,
+    ):
         super().__init__()
         self.w_depth = w_depth
         self.w_intensity = w_intensity
         self.kernel_size = kernel_size
         self.depth_range = depth_range
         self.intensity_range = intensity_range
+        self.use_mask = bool(use_mask)
+        self.smooth_kernel_size = int(smooth_kernel_size)
+
+    def _smooth_for_ssim(self, x: torch.Tensor) -> torch.Tensor:
+        """SSIM 前的轻量低通滤波, 降低少量标签噪声对结构项的影响。"""
+        if self.smooth_kernel_size <= 1:
+            return x
+        kernel_size = self.smooth_kernel_size
+        if kernel_size % 2 == 0:
+            raise ValueError("smooth_kernel_size must be odd or <= 1")
+        padding = kernel_size // 2
+        return F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=padding)
 
     def forward(self, result, gt):
         """
@@ -211,7 +243,12 @@ class SSIMLoss(nn.Module):
         d_gt = (gt[:, 0:1] / self.depth_range).clamp(0.0, 1.0)
         i_gt = (gt[:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
 
-        mask = (d_gt > 0).float()               # [B, 1, H, W]
+        d_pred = self._smooth_for_ssim(d_pred)
+        i_pred = self._smooth_for_ssim(i_pred)
+        d_gt = self._smooth_for_ssim(d_gt)
+        i_gt = self._smooth_for_ssim(i_gt)
+
+        mask = (d_gt > 0).float() if self.use_mask else None
 
         ssim_d = _compute_ssim(d_pred, d_gt, mask=mask,
                                kernel_size=self.kernel_size,
@@ -273,16 +310,19 @@ class SPADImagingLoss(nn.Module):
     def __init__(
         self,
         w_gt=0.3,
-        w_ssim=0.1,
-        w_var=1.0,
-        w_sparse=0.05,
-        w_smooth=0.1,
+        w_ssim=0.5,
+        w_var=0.15,
+        w_sparse=0.02,
+        w_smooth=0.03,
         w_lut_smooth=0.01,
         w_lut_norm=0.005,
         sigma_target=4.0,
         rho_target=0.15,
         beta_smooth=5.0,
         ssim_kernel_size=7,
+        ssim_smooth_kernel_size=3,
+        gt_use_mask=False,
+        ssim_use_mask=False,
         depth_range=128.0,
         intensity_range=1.0,
     ):
@@ -295,11 +335,17 @@ class SPADImagingLoss(nn.Module):
         self.w_lut_smooth = w_lut_smooth
         self.w_lut_norm = w_lut_norm
 
-        self.gt_loss = WeakGTLoss(depth_range=depth_range, intensity_range=intensity_range)
+        self.gt_loss = WeakGTLoss(
+            depth_range=depth_range,
+            intensity_range=intensity_range,
+            use_mask=gt_use_mask,
+        )
         self.ssim_loss = SSIMLoss(
             kernel_size=ssim_kernel_size,
             depth_range=depth_range,
             intensity_range=intensity_range,
+            use_mask=ssim_use_mask,
+            smooth_kernel_size=ssim_smooth_kernel_size,
         )
         self.var_loss = GatedMomentVarianceLoss(
             sigma_target=sigma_target,
@@ -327,41 +373,53 @@ class SPADImagingLoss(nn.Module):
 
         if gt is not None and self.w_gt > 0:
             l_gt = self.gt_loss(result, gt)
-            losses["gt"] = l_gt.item()
+            losses["gt"] = l_gt.detach()
+            losses["weighted_gt"] = (self.w_gt * l_gt).detach()
             total = total + self.w_gt * l_gt
 
         if gt is not None and self.w_ssim > 0:
             l_ssim = self.ssim_loss(result, gt)
-            losses["ssim"] = l_ssim.item()
+            losses["ssim"] = l_ssim.detach()
+            losses["weighted_ssim"] = (self.w_ssim * l_ssim).detach()
             total = total + self.w_ssim * l_ssim
 
-        if self.w_var > 0:
+        has_sequence = all(key in result for key in ("gate", "tof", "valid"))
+        if self.w_var > 0 and has_sequence:
             l_var = self.var_loss(result)
-            losses["var"] = l_var.item()
+            losses["var"] = l_var.detach()
+            losses["weighted_var"] = (self.w_var * l_var).detach()
             total = total + self.w_var * l_var
+        elif self.w_var > 0:
+            losses["var_skipped"] = 1.0
 
-        if self.w_sparse > 0:
+        if self.w_sparse > 0 and has_sequence:
             l_sparse = self.sparse_loss(result)
-            losses["sparse"] = l_sparse.item()
+            losses["sparse"] = l_sparse.detach()
+            losses["weighted_sparse"] = (self.w_sparse * l_sparse).detach()
             total = total + self.w_sparse * l_sparse
+        elif self.w_sparse > 0:
+            losses["sparse_skipped"] = 1.0
 
         if self.w_smooth > 0:
             l_smooth = self.smooth_loss(result)
-            losses["smooth"] = l_smooth.item()
+            losses["smooth"] = l_smooth.detach()
+            losses["weighted_smooth"] = (self.w_smooth * l_smooth).detach()
             total = total + self.w_smooth * l_smooth
 
         # LUT 编码正则 (仅当 model 使用 encoding_mode="lut" 时 result 中才有这些键)
         if "lut_smooth" in result and self.w_lut_smooth > 0:
             l_lut_s = result["lut_smooth"]
-            losses["lut_smooth"] = l_lut_s.item()
+            losses["lut_smooth"] = l_lut_s.detach()
+            losses["weighted_lut_smooth"] = (self.w_lut_smooth * l_lut_s).detach()
             total = total + self.w_lut_smooth * l_lut_s
 
         if "lut_norm" in result and self.w_lut_norm > 0:
             l_lut_n = result["lut_norm"]
-            losses["lut_norm"] = l_lut_n.item()
+            losses["lut_norm"] = l_lut_n.detach()
+            losses["weighted_lut_norm"] = (self.w_lut_norm * l_lut_n).detach()
             total = total + self.w_lut_norm * l_lut_n
 
-        losses["total"] = total.item()
+        losses["total"] = total.detach()
         return total, losses
 
 

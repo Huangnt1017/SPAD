@@ -45,7 +45,7 @@ class SNNConfig:
     skip_missing_csv_raw: bool = False
     """CSV 中 raw 文件缺失时是否跳过; 默认严格报错, 避免静默丢样本。"""
 
-    pages_per_group: int = 64 * 8
+    pages_per_group: int = 32 * 4
     """单个训练样本包含的 raw page 数, 即 ``P``。"""
 
     total_pages: Optional[int] = None
@@ -64,7 +64,22 @@ class SNNConfig:
     """是否在 Dataset 内将 ToF 输入除以 ``time_threshold``。"""
 
     shuffle_pages: bool = False
-    """加载时是否随机打乱每个样本内部的 P 维。"""
+    """训练时是否随机打乱每个样本内部的 P 维; val/test 不使用。"""
+
+    augment_train: bool = False
+    """是否在训练集启用 raw group 级数据增强。"""
+
+    tof_shift_max: int = 15
+    """训练增强的最大整数 ToF 偏移; 增强后小于 1 或大于 time_threshold 的值置 0。"""
+
+    tof_shift_prob: float = 1.0
+    """训练增强中每个样本执行 ToF 偏移的概率。"""
+
+    page_dropout: bool = False
+    """训练增强中是否随机丢弃整页 raw page。"""
+
+    page_dropout_prob: float = 0.1
+    """PageDropout 中每页被置 0 的概率。"""
 
     active_point: int = 1
     """弱标签点云过滤使用的最小重复次数。"""
@@ -76,8 +91,8 @@ class SNNConfig:
     """train/val/test 划分比例。"""
 
     # ---- Dataloader ----
-    batch_size: int = 8
-    num_workers: int = 0
+    batch_size: int = 4
+    num_workers: int = 4
     pin_memory: Optional[bool] = None
     drop_last: bool = False
     seed: int = 42
@@ -92,21 +107,23 @@ class SNNConfig:
     lut_max_norm: Optional[float] = None
 
     # ---- 网络 ----
-    model_backend: str = "legacy"
-    """``new`` 使用 SNN_new.py; ``legacy`` 使用 SNN.py。"""
+    model_backend: str = "new"
+    """模型后端; 本项目统一使用官方 ``spikingjelly.activation_based``。"""
 
     C: int = 32
-    chunk_size: int = 64
+    chunk_size: int = 32
     spike_mode: str = "plif"
-    num_blocks: int = 3
+    num_blocks: int = 2
     refine_mid: int = 8
+    return_sequence: bool = True
+    """是否返回完整 gate/tof/valid 时间序列; 训练 var/sparse loss 时需要开启。"""
 
     # ---- 损失权重 ----
     w_gt: float = 0.3
-    w_ssim: float = 0.1
-    w_var: float = 1.0
-    w_sparse: float = 0.05
-    w_smooth: float = 0.1
+    w_ssim: float = 0.5
+    w_var: float = 0.15
+    w_sparse: float = 0.02
+    w_smooth: float = 0.03
     w_lut_smooth: float = 0.01
     w_lut_norm: float = 0.005
 
@@ -115,6 +132,15 @@ class SNNConfig:
     rho_target: float = 0.15
     beta_smooth: float = 5.0
     ssim_kernel_size: int = 7
+    ssim_smooth_kernel_size: int = 3
+    """SSIM 前对预测和标签做轻量均值滤波的窗口; 1 表示关闭。"""
+
+    gt_use_mask: bool = False
+    """GT L1 是否仅在 depth_gt > 0 区域计算; 干净 GT 默认全图计算。"""
+
+    ssim_use_mask: bool = False
+    """SSIM 是否仅在 depth_gt > 0 区域计算; 干净 GT 默认全图计算。"""
+
     depth_range: float = 128.0
     intensity_range: float = 1.0
 
@@ -123,6 +149,9 @@ class SNNConfig:
     lr: float = 1.0e-3
     weight_decay: float = 1.0e-4
     grad_clip: float = 1.0
+    grad_accum_steps: int = 8
+    """梯度累积步数; 实际等效 batch_size = batch_size * grad_accum_steps。"""
+
     amp: bool = False
 
     # ---- 运行时 / 实验产物 ----
@@ -139,6 +168,14 @@ class SNNConfig:
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
     save_every: int = 1
+
+    def __post_init__(self) -> None:
+        """把旧后端名归一化为官方 activation_based 实现。"""
+        backend = str(self.model_backend).lower()
+        if backend in {"legacy", "clock", "clock_driven"}:
+            self.model_backend = "new"
+        elif backend in {"activation", "activation_based"}:
+            self.model_backend = "new"
 
     @property
     def t_max(self) -> int:
@@ -166,9 +203,11 @@ class SNNConfig:
         if backend in {"new", "activation", "activation_based"}:
             from SNN_based_method.SNN_new import SPADSpikeNet
         elif backend in {"legacy", "clock", "clock_driven"}:
-            from SNN_based_method.SNN import SPADSpikeNet
+            # 旧配置文件可能还保存为 legacy/clock_driven。这里仅做兼容映射,
+            # 实际仍使用官方 spikingjelly.activation_based 实现。
+            from SNN_based_method.SNN_new import SPADSpikeNet
         else:
-            raise ValueError("model_backend must be 'new' or 'legacy'")
+            raise ValueError("model_backend must be 'new'/'activation_based'")
 
         return SPADSpikeNet(
             C=self.C,
@@ -180,6 +219,8 @@ class SNNConfig:
             encoding_mode=self.encoding_mode,
             embed_dim=self.embed_dim,
             lut_init=self.lut_init,
+            refine_mid=self.refine_mid,
+            return_sequence=self.return_sequence,
         )
 
     def build_loss(self) -> torch.nn.Module:
@@ -198,6 +239,9 @@ class SNNConfig:
             rho_target=self.rho_target,
             beta_smooth=self.beta_smooth,
             ssim_kernel_size=self.ssim_kernel_size,
+            ssim_smooth_kernel_size=self.ssim_smooth_kernel_size,
+            gt_use_mask=self.gt_use_mask,
+            ssim_use_mask=self.ssim_use_mask,
             depth_range=self.depth_range,
             intensity_range=self.intensity_range,
         )
@@ -232,6 +276,11 @@ class SNNConfig:
             return_label=self.return_label,
             normalize=self.normalize_input,
             shuffle_pages=self.shuffle_pages,
+            augment_train=self.augment_train,
+            tof_shift_max=self.tof_shift_max,
+            tof_shift_prob=self.tof_shift_prob,
+            page_dropout=self.page_dropout,
+            page_dropout_prob=self.page_dropout_prob,
             active_point=self.active_point,
             cache_size=self.cache_size,
             recursive=self.recursive,
@@ -310,12 +359,22 @@ class SNNConfig:
             f"time_threshold={self.time_threshold}, batch_size={self.batch_size}"
         )
         lines.append(
+            f"  augment_train={self.augment_train}, tof_shift_max={self.tof_shift_max}, "
+            f"tof_shift_prob={self.tof_shift_prob}, page_dropout={self.page_dropout}, "
+            f"page_dropout_prob={self.page_dropout_prob}, shuffle_pages={self.shuffle_pages}"
+        )
+        lines.append(
             f"  model_backend={self.model_backend}, encoding={self.encoding_mode}, "
-            f"C_enc={self.C_enc}, C={self.C}, chunk_size={self.chunk_size}"
+            f"C_enc={self.C_enc}, C={self.C}, chunk_size={self.chunk_size}, "
+            f"refine_mid={self.refine_mid}, return_sequence={self.return_sequence}"
+        )
+        lines.append(
+            f"  loss_weights: gt={self.w_gt}, ssim={self.w_ssim}, "
+            f"var={self.w_var}, sparse={self.w_sparse}, smooth={self.w_smooth}"
         )
         lines.append(
             f"  epochs={self.epochs}, lr={self.lr}, weight_decay={self.weight_decay}, "
-            f"device={self.resolved_device()}"
+            f"grad_accum_steps={self.grad_accum_steps}, device={self.resolved_device()}"
         )
         lines.append(f"  log_dir={self.log_dir}, checkpoint_dir={self.checkpoint_dir}")
         return "\n".join(lines)

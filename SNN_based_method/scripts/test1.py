@@ -29,7 +29,6 @@ from SNN_based_method.scripts.runtime import (
     load_checkpoint,
     make_log_run_dir,
     prepare_model_input,
-    reset_spiking_state,
 )
 
 
@@ -102,8 +101,7 @@ def run_single_test(
 
     frames = batch["frames"].to(device)
     model_input = prepare_model_input(frames).to(device)
-    result = model(model_input)
-    reset_spiking_state(model)
+    result = model(model_input, return_sequence=False)
 
     output = result["output"].detach().cpu()
     info: dict[str, object] = {
