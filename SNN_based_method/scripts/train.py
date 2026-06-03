@@ -25,14 +25,11 @@ from SNN_based_method.scripts.runtime import (
     add_config_arguments,
     build_run_name,
     config_from_args,
-    divide_average,
     load_checkpoint,
     make_checkpoint_run_dir,
     prepare_model_input,
-    reduce_loss_dict,
     resolve_output_root,
     save_checkpoint,
-    update_average,
 )
 
 DEFAULT_TRAIN_DATA_PATHS = [
@@ -79,6 +76,131 @@ def _format_values(values: dict[str, float]) -> str:
     return " ".join(f"{key}={value:.6f}" for key, value in sorted(values.items()))
 
 
+def _update_tensor_sums(
+    total: dict[str, torch.Tensor],
+    values: dict[str, object],
+    device: torch.device,
+) -> None:
+    """在 device 上累加 loss 分项, 避免每个 batch 触发 CPU 同步。"""
+    for key, value in values.items():
+        if isinstance(value, torch.Tensor):
+            scalar = value.detach()
+            if scalar.device != device:
+                scalar = scalar.to(device=device, non_blocking=True)
+        else:
+            scalar = torch.tensor(float(value), device=device)
+        total[key] = total.get(key, torch.zeros((), device=device)) + scalar
+
+
+def _tensor_average_to_float(total: dict[str, torch.Tensor], count: int) -> dict[str, float]:
+    """epoch 末把 device 上的累加器一次性转成 Python float。"""
+    if not total:
+        return {}
+    divisor = max(count, 1)
+    keys = sorted(total)
+    stacked = torch.stack([total[key] / divisor for key in keys])
+    values = stacked.detach().cpu().tolist()
+    return {key: float(value) for key, value in zip(keys, values)}
+
+
+def configure_torch_runtime(cfg: SNNConfig) -> None:
+    """配置 CUDA 后端, 用稳定输入尺寸换取更高吞吐。"""
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = bool(cfg.tf32)
+    torch.backends.cudnn.allow_tf32 = bool(cfg.tf32)
+    torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
+
+
+def _prepare_device_batch(
+    batch: dict[str, object],
+    device: torch.device,
+) -> dict[str, torch.Tensor | None]:
+    """把一个 CPU batch 整理成训练直接消费的 device batch。"""
+    labels = batch.get("label")
+    device_labels = (
+        labels.to(device, non_blocking=True)
+        if isinstance(labels, torch.Tensor)
+        else None
+    )
+
+    keepalive: torch.Tensor | None = None
+    model_input = batch.get("model_input")
+    if isinstance(model_input, torch.Tensor):
+        device_input = model_input.to(device, non_blocking=True)
+    else:
+        frames = batch["frames"]
+        if not isinstance(frames, torch.Tensor):
+            raise TypeError("batch['frames'] must be a torch.Tensor")
+        device_frames = frames.to(device, non_blocking=True)
+        device_input = prepare_model_input(device_frames)
+        keepalive = device_frames
+
+    return {
+        "model_input": device_input,
+        "label": device_labels,
+        "_keepalive": keepalive,
+    }
+
+
+class CudaBatchPrefetcher:
+    """用独立 CUDA stream 预取下一批数据, 降低主计算 stream 等待。"""
+
+    def __init__(
+        self,
+        data_loader: DataLoader,
+        device: torch.device,
+    ) -> None:
+        self._iterator = iter(data_loader)
+        self._device = device
+        self._stream = torch.cuda.Stream(device=device)
+        self._next_batch: dict[str, torch.Tensor | None] | None = None
+        self._preload()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> dict[str, torch.Tensor | None]:
+        if self._next_batch is None:
+            raise StopIteration
+
+        current_stream = torch.cuda.current_stream(self._device)
+        current_stream.wait_stream(self._stream)
+        batch = self._next_batch
+        for value in batch.values():
+            if isinstance(value, torch.Tensor):
+                value.record_stream(current_stream)
+
+        self._preload()
+        return batch
+
+    def _preload(self) -> None:
+        try:
+            batch = next(self._iterator)
+        except StopIteration:
+            self._next_batch = None
+            return
+
+        with torch.cuda.stream(self._stream):
+            self._next_batch = _prepare_device_batch(batch, self._device)
+
+
+def _iter_device_batches(
+    data_loader: DataLoader,
+    device: torch.device,
+    cfg: SNNConfig,
+):
+    """按配置返回已搬到目标设备的 batch 迭代器。"""
+    if device.type == "cuda" and cfg.cuda_prefetch:
+        return CudaBatchPrefetcher(data_loader, device)
+
+    def generator():
+        for batch in data_loader:
+            yield _prepare_device_batch(batch, device)
+
+    return generator()
+
+
 def _sync_if_cuda(device: torch.device) -> None:
     """同步 CUDA, 让阶段耗时更接近真实 GPU 执行时间。"""
     if device.type == "cuda":
@@ -103,29 +225,28 @@ def train_one_epoch(
 ) -> tuple[float, dict[str, float]]:
     """训练一个 epoch, 返回平均总 loss 与各子 loss。"""
     model.train()
-    total_loss = 0.0
-    loss_sums: dict[str, float] = {}
+    total_loss = torch.zeros((), device=device)
+    loss_sums: dict[str, torch.Tensor] = {}
     num_steps = 0
     use_amp = cfg.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     grad_accum_steps = max(1, int(cfg.grad_accum_steps))
+    progress_interval = max(1, int(cfg.progress_interval))
 
-    progress = tqdm(data_loader, desc=f"train {epoch:03d}", leave=False)
+    device_batches = _iter_device_batches(data_loader, device, cfg)
+    progress = tqdm(device_batches, total=len(data_loader), desc=f"train {epoch:03d}", leave=False)
     optimizer.zero_grad(set_to_none=True)
     for batch_index, batch in enumerate(progress):
         stage_times: dict[str, float] | None = {} if batch_index < trace_steps else None
         if stage_times is not None:
-            _stamp(stage_times, "batch_start", device)
+            _stamp(stage_times, "batch_ready", device)
 
-        frames = batch["frames"].to(device, non_blocking=True)
+        model_input = batch["model_input"]
         labels = batch.get("label")
-        labels = labels.to(device, non_blocking=True) if labels is not None else None
+        if not isinstance(model_input, torch.Tensor):
+            raise TypeError("device batch must contain tensor model_input")
         if stage_times is not None:
-            _stamp(stage_times, "to_device", device)
-
-        model_input = prepare_model_input(frames).to(device, non_blocking=True)
-        if stage_times is not None:
-            _stamp(stage_times, "prepare_input", device)
+            _stamp(stage_times, "input_ready", device)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             result = model(model_input)
@@ -167,14 +288,17 @@ def train_one_epoch(
                 if stage_times is not None:
                     _stamp(stage_times, "optimizer_step", device)
 
-        loss_value = float(loss.detach().cpu().item())
-        reduced_loss_items = reduce_loss_dict(loss_items)
+        detached_loss = loss.detach()
         if stage_times is not None:
             _stamp(stage_times, "batch_done", device)
-        total_loss += loss_value
-        update_average(loss_sums, reduced_loss_items)
+        total_loss = total_loss + detached_loss
+        _update_tensor_sums(loss_sums, loss_items, device)
         num_steps += 1
-        progress.set_postfix(loss=f"{loss_value:.4f}")
+
+        is_last = batch_index + 1 == len(data_loader)
+        if batch_index % progress_interval == 0 or is_last:
+            loss_value = float(detached_loss.cpu().item())
+            progress.set_postfix(loss=f"{loss_value:.4f}")
 
         if stage_times is not None:
             names = list(stage_times)
@@ -187,7 +311,8 @@ def train_one_epoch(
                 + " ".join(f"{key}={value:.3f}s" for key, value in durations.items())
             )
 
-    return total_loss / max(num_steps, 1), divide_average(loss_sums, num_steps)
+    avg_loss = float((total_loss / max(num_steps, 1)).detach().cpu().item())
+    return avg_loss, _tensor_average_to_float(loss_sums, num_steps)
 
 
 @torch.no_grad()
@@ -197,38 +322,44 @@ def validate_one_epoch(
     criterion: torch.nn.Module,
     metrics,
     device: torch.device,
+    cfg: SNNConfig,
     epoch: int,
 ) -> tuple[float, dict[str, float], dict[str, float]]:
     """验证一个 epoch, 返回 loss、子 loss 和图像指标。"""
     model.eval()
-    total_loss = 0.0
-    loss_sums: dict[str, float] = {}
-    metric_sums: dict[str, float] = {}
+    total_loss = torch.zeros((), device=device)
+    loss_sums: dict[str, torch.Tensor] = {}
+    metric_sums: dict[str, torch.Tensor] = {}
     num_steps = 0
+    progress_interval = max(1, int(cfg.progress_interval))
 
-    progress = tqdm(data_loader, desc=f"val {epoch:03d}", leave=False)
-    for batch in progress:
-        frames = batch["frames"].to(device, non_blocking=True)
+    device_batches = _iter_device_batches(data_loader, device, cfg)
+    progress = tqdm(device_batches, total=len(data_loader), desc=f"val {epoch:03d}", leave=False)
+    for batch_index, batch in enumerate(progress):
+        model_input = batch["model_input"]
         labels = batch.get("label")
-        labels = labels.to(device, non_blocking=True) if labels is not None else None
+        if not isinstance(model_input, torch.Tensor):
+            raise TypeError("device batch must contain tensor model_input")
 
-        model_input = prepare_model_input(frames).to(device, non_blocking=True)
         result = model(model_input)
         loss, loss_items = criterion(result, labels)
 
         if labels is not None:
-            update_average(metric_sums, metrics.compute(result, labels))
+            _update_tensor_sums(metric_sums, metrics.compute_tensors(result, labels), device)
 
-        loss_value = float(loss.detach().cpu().item())
-        total_loss += loss_value
-        update_average(loss_sums, reduce_loss_dict(loss_items))
+        detached_loss = loss.detach()
+        total_loss = total_loss + detached_loss
+        _update_tensor_sums(loss_sums, loss_items, device)
         num_steps += 1
-        progress.set_postfix(loss=f"{loss_value:.4f}")
+        is_last = batch_index + 1 == len(data_loader)
+        if batch_index % progress_interval == 0 or is_last:
+            loss_value = float(detached_loss.cpu().item())
+            progress.set_postfix(loss=f"{loss_value:.4f}")
 
     return (
-        total_loss / max(num_steps, 1),
-        divide_average(loss_sums, num_steps),
-        divide_average(metric_sums, num_steps),
+        float((total_loss / max(num_steps, 1)).detach().cpu().item()),
+        _tensor_average_to_float(loss_sums, num_steps),
+        _tensor_average_to_float(metric_sums, num_steps),
     )
 
 
@@ -272,6 +403,7 @@ def main() -> None:
     if args.save_every is not None:
         cfg = cfg.clone_with(save_every=args.save_every)
     seed_everything(cfg.seed)
+    configure_torch_runtime(cfg)
 
     train_loader, val_loader, test_loader, dataset = cfg.build_dataloaders()
     device = cfg.resolved_device()
@@ -343,6 +475,7 @@ def main() -> None:
             criterion,
             metrics,
             device,
+            cfg,
             epoch,
         )
         scheduler.step()

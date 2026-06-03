@@ -21,6 +21,7 @@ import csv
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -324,6 +325,50 @@ def raw2frame(
     return np.transpose(grouped, (0, 2, 1)).astype(np.uint16, copy=False)
 
 
+def read_raw_group(
+    filename: str | Path,
+    *,
+    group_index: int,
+    pages_per_group: int,
+    total_pages: int,
+) -> np.ndarray:
+    """只读取单个 raw group, 返回未裁剪的 ``[4096, P]`` 数组。
+
+    随机训练时如果每次都读取完整 raw 文件, DataLoader worker 很容易成为
+    GPU 的等待点。该函数按 group 的字节偏移直接读取连续 page, 更适合
+    shuffle 后的分组级采样。
+    """
+    filename = Path(filename)
+    if not filename.is_file():
+        raise FileNotFoundError(f"raw file not found: {filename}")
+    if pages_per_group <= 0:
+        raise ValueError("pages_per_group must be a positive integer")
+    if total_pages <= 0:
+        raise ValueError("total_pages must be a positive integer")
+    if group_index < 0:
+        raise ValueError("group_index must be non-negative")
+
+    start_page = int(group_index) * int(pages_per_group)
+    end_page = start_page + int(pages_per_group)
+    if end_page > int(total_pages):
+        raise IndexError(
+            f"group_index {group_index} exceeds total_pages={total_pages} "
+            f"with pages_per_group={pages_per_group}"
+        )
+
+    count = int(pages_per_group) * NUM_PIXELS
+    byte_offset = start_page * NUM_PIXELS * RAW_VALUE_BYTES
+    with filename.open("rb") as file_obj:
+        file_obj.seek(byte_offset)
+        flat_data = np.fromfile(file_obj, dtype=np.uint16, count=count)
+    if flat_data.size != count:
+        raise IOError(f"File too short for group {group_index}: {filename}")
+
+    frames = flat_data.reshape(pages_per_group, 64, 64)
+    flat_frames = frames.reshape(pages_per_group, NUM_PIXELS)
+    return flat_frames.T.astype(np.uint16, copy=False)
+
+
 def n3_filter(points: np.ndarray, min_count: int) -> np.ndarray:
     """按重复次数过滤点云行, 输出 ``[x, y, tof, count]``。"""
     if points.size == 0:
@@ -469,6 +514,7 @@ class SpadRawGroupDataset(Dataset):
         shuffle_pages: bool = False,
         active_point: int = 1,
         cache_size: int = 2,
+        raw_load_mode: str = "group",
         raw_metadata: Sequence[Mapping[str, Any]] | None = None,
         samples: Sequence[RawGroupSample] | None = None,
         raw_group_transform: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
@@ -494,6 +540,9 @@ class SpadRawGroupDataset(Dataset):
         self.shuffle_pages = bool(shuffle_pages)
         self.active_point = int(active_point)
         self.cache_size = max(0, int(cache_size))
+        self.raw_load_mode = str(raw_load_mode).lower()
+        if self.raw_load_mode not in {"group", "file_cache"}:
+            raise ValueError("raw_load_mode must be 'group' or 'file_cache'")
         self.raw_group_transform = raw_group_transform
         self.transform = transform
         self.label_transform = label_transform
@@ -542,10 +591,19 @@ class SpadRawGroupDataset(Dataset):
                 self._group_cache.popitem(last=False)
         return grouped
 
+    def _load_raw_group(self, sample: RawGroupSample) -> np.ndarray:
+        if self.raw_load_mode == "group":
+            return read_raw_group(
+                sample.raw_path,
+                group_index=sample.group_index,
+                pages_per_group=self.pages_per_group,
+                total_pages=sample.total_pages,
+            )
+        return self._load_raw_groups(sample)[sample.group_index]
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.samples[index]
-        grouped = self._load_raw_groups(sample)
-        raw_group_tof = grouped[sample.group_index]
+        raw_group_tof = self._load_raw_group(sample)
 
         if self.raw_group_transform is not None:
             group_tof, label_group_tof = self.raw_group_transform(raw_group_tof)
@@ -593,12 +651,18 @@ class SpadRawGroupDataset(Dataset):
         return item
 
 
-def spad_time_first_collate(batch: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def spad_time_first_collate(
+    batch: Sequence[dict[str, Any]],
+    *,
+    include_model_input: bool = False,
+) -> dict[str, Any]:
     """把样本列表整理为时间维优先的 SNN batch。
 
     Returns:
         ``frames`` 形状为 ``[P, B, 1, 64, 64]``。如果存在标签,
-        ``label`` 形状为 ``[B, 2, 64, 64]``。
+        ``label`` 形状为 ``[B, 2, 64, 64]``。当 ``include_model_input=True``
+        时额外生成 ``model_input=[B, 4096, P]``，把形状整理工作放到
+        DataLoader worker 中完成。
     """
     if not batch:
         raise ValueError("batch must not be empty")
@@ -611,6 +675,8 @@ def spad_time_first_collate(batch: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "group_index": torch.tensor([item["group_index"] for item in batch], dtype=torch.long),
         "total_pages": torch.tensor([item["total_pages"] for item in batch], dtype=torch.long),
     }
+    if include_model_input:
+        collated["model_input"] = time_first_to_model_input(frames).contiguous()
     if "metadata" in batch[0]:
         collated["metadata"] = [item.get("metadata", {}) for item in batch]
     if "fog_level" in batch[0]:
@@ -630,6 +696,9 @@ def make_spad_dataloader(
     shuffle: bool = False,
     num_workers: int = 0,
     pin_memory: bool | None = None,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    include_model_input: bool = False,
     seed: int = DEFAULT_SEED,
     drop_last: bool = False,
 ) -> DataLoader:
@@ -639,17 +708,25 @@ def make_spad_dataloader(
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
 
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-        collate_fn=spad_time_first_collate,
-        worker_init_fn=seed_worker if num_workers > 0 else None,
-        generator=generator,
-    )
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": drop_last,
+        "collate_fn": (
+            partial(spad_time_first_collate, include_model_input=True)
+            if include_model_input
+            else spad_time_first_collate
+        ),
+        "worker_init_fn": seed_worker if num_workers > 0 else None,
+        "generator": generator,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def split_indices(
@@ -710,9 +787,13 @@ def create_spad_dataloaders(
     page_dropout_prob: float = 0.1,
     active_point: int = 1,
     cache_size: int = 2,
+    raw_load_mode: str = "group",
     recursive: bool = False,
     num_workers: int = 0,
     pin_memory: bool | None = None,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    include_model_input: bool = False,
     drop_last: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader, SpadRawGroupDataset]:
     """从 raw 文件或目录构建 train/val/test DataLoader。
@@ -740,6 +821,7 @@ def create_spad_dataloaders(
         shuffle_pages=False,
         active_point=active_point,
         cache_size=cache_size,
+        raw_load_mode=raw_load_mode,
         raw_metadata=raw_metadata,
     )
     train_indices, val_indices, test_indices = split_indices(
@@ -747,17 +829,15 @@ def create_spad_dataloaders(
         split_ratios=split_ratios,
         seed=seed,
     )
-    train_transform = (
-        SpadRawTrainAugmentation(
+    train_transform = None
+    if augment_train or page_dropout:
+        train_transform = SpadRawTrainAugmentation(
             t_max=time_threshold,
-            tof_shift_max=tof_shift_max,
-            tof_shift_prob=tof_shift_prob,
+            tof_shift_max=tof_shift_max if augment_train else 0,
+            tof_shift_prob=tof_shift_prob if augment_train else 0.0,
             page_dropout=page_dropout,
             page_dropout_prob=page_dropout_prob,
         )
-        if augment_train
-        else None
-    )
     train_dataset = SpadRawGroupDataset(
         raw_paths=raw_paths,
         pages_per_group=pages_per_group,
@@ -768,6 +848,7 @@ def create_spad_dataloaders(
         shuffle_pages=shuffle_pages,
         active_point=active_point,
         cache_size=cache_size,
+        raw_load_mode=raw_load_mode,
         raw_metadata=raw_metadata,
         samples=[dataset.samples[index] for index in train_indices],
         raw_group_transform=train_transform,
@@ -779,6 +860,9 @@ def create_spad_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        include_model_input=include_model_input,
         seed=seed,
         drop_last=drop_last,
     )
@@ -788,6 +872,9 @@ def create_spad_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        include_model_input=include_model_input,
         seed=seed + 1,
     )
     test_loader = make_spad_dataloader(
@@ -796,6 +883,9 @@ def create_spad_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        include_model_input=include_model_input,
         seed=seed + 2,
     )
     return train_loader, val_loader, test_loader, dataset
@@ -817,9 +907,13 @@ def create_spad_dataloader(
     shuffle_pages: bool = False,
     active_point: int = 1,
     cache_size: int = 2,
+    raw_load_mode: str = "group",
     recursive: bool = False,
     num_workers: int = 0,
     pin_memory: bool | None = None,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    include_model_input: bool = False,
     drop_last: bool = False,
 ) -> tuple[DataLoader, SpadRawGroupDataset]:
     """从 raw 文件或目录构建单个 DataLoader。"""
@@ -844,6 +938,7 @@ def create_spad_dataloader(
         shuffle_pages=shuffle_pages,
         active_point=active_point,
         cache_size=cache_size,
+        raw_load_mode=raw_load_mode,
         raw_metadata=raw_metadata,
     )
     loader = make_spad_dataloader(
@@ -852,6 +947,9 @@ def create_spad_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        include_model_input=include_model_input,
         seed=seed,
         drop_last=drop_last,
     )

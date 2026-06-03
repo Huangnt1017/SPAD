@@ -449,15 +449,15 @@ class ImageMetrics:
         self.ssim_kernel_size = ssim_kernel_size
 
     @torch.no_grad()
-    def compute(self, result, gt):
-        """计算全部图像质量指标.
+    def compute_tensors(self, result, gt):
+        """计算全部图像质量指标, 返回 device 上的标量张量。
 
         Args:
             result: model output dict with 'output' [B, 2, H, W]
             gt:     [B, 2, H, W] (ch0=depth, ch1=intensity)
 
         Returns:
-            dict: 各通道各指标的标量值
+            dict: 各通道各指标的标量张量
         """
         d_pred = result["output"][:, 0:1]           # [B, 1, H, W]
         i_pred = result["output"][:, 1:2]           # [B, 1, H, W]
@@ -473,14 +473,14 @@ class ImageMetrics:
         d_pred_norm = d_pred / self.depth_range
         d_gt_norm = d_gt / self.depth_range
         d_err = (d_pred_norm - d_gt_norm) * mask
-        scores["depth_mae"] = d_err.abs().sum().item() / num_valid.item()
-        d_mse = (d_err ** 2).sum().item() / num_valid.item()
-        scores["depth_rmse"] = math.sqrt(d_mse)
+        scores["depth_mae"] = d_err.abs().sum() / num_valid
+        d_mse = (d_err ** 2).sum() / num_valid
+        scores["depth_rmse"] = torch.sqrt(d_mse)
         scores["depth_ssim"] = _compute_ssim(
             d_pred_norm, d_gt_norm, mask=mask,
             kernel_size=self.ssim_kernel_size,
             data_range=1.0,
-        ).item()
+        )
         # PSNR = 10 * log10(1^2 / MSE), 归一化后 data_range=1.0
         scores["depth_psnr"] = self._psnr(d_mse, 1.0)
 
@@ -488,22 +488,43 @@ class ImageMetrics:
         i_pred_norm = i_pred / self.intensity_range
         i_gt_norm = i_gt / self.intensity_range
         i_err = (i_pred_norm - i_gt_norm) * mask
-        scores["intensity_mae"] = i_err.abs().sum().item() / num_valid.item()
-        i_mse = (i_err ** 2).sum().item() / num_valid.item()
-        scores["intensity_rmse"] = math.sqrt(i_mse)
+        scores["intensity_mae"] = i_err.abs().sum() / num_valid
+        i_mse = (i_err ** 2).sum() / num_valid
+        scores["intensity_rmse"] = torch.sqrt(i_mse)
         scores["intensity_ssim"] = _compute_ssim(
             i_pred_norm, i_gt_norm, mask=mask,
             kernel_size=self.ssim_kernel_size,
             data_range=1.0,
-        ).item()
+        )
         # PSNR = 10 * log10(1^2 / MSE)
         scores["intensity_psnr"] = self._psnr(i_mse, 1.0)
 
         return scores
 
+    @torch.no_grad()
+    def compute(self, result, gt):
+        """计算全部图像质量指标, 返回 Python float, 兼容测试脚本。"""
+        tensor_scores = self.compute_tensors(result, gt)
+        return {
+            key: float(value.detach().cpu().item())
+            for key, value in tensor_scores.items()
+        }
+
     @staticmethod
     def _psnr(mse, data_range):
         """标准 PSNR 公式: 10 * log10(MAX^2 / MSE). MSE≈0 时返回 inf."""
+        if isinstance(mse, torch.Tensor):
+            data_range_tensor = torch.as_tensor(
+                data_range,
+                dtype=mse.dtype,
+                device=mse.device,
+            )
+            psnr = 10.0 * torch.log10(data_range_tensor ** 2 / mse.clamp_min(1e-10))
+            return torch.where(
+                mse < 1e-10,
+                torch.full_like(psnr, float("inf")),
+                psnr,
+            )
         if mse < 1e-10:
             return float("inf")
         return 10.0 * math.log10(data_range ** 2 / mse)

@@ -36,9 +36,58 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pages-per-group", type=int, default=None, help="每个样本使用的 raw page 数 P")
     parser.add_argument("--total-pages", type=int, default=None, help="每个 raw 文件最多读取的 page 数")
     parser.add_argument("--time-threshold", type=int, default=None, help="有效 ToF 上限, 超过后视为无效")
+    parser.add_argument(
+        "--raw-load-mode",
+        choices=["group", "file_cache"],
+        default=None,
+        help="raw 读取模式: group 只读当前分组; file_cache 读取并缓存整文件",
+    )
     parser.add_argument("--split-ratios", nargs=3, type=float, default=None, metavar=("TRAIN", "VAL", "TEST"), help="train/val/test 划分比例, 三项之和必须为 1")
     parser.add_argument("--batch-size", type=int, default=None, help="批大小")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker 数")
+    pin_memory_group = parser.add_mutually_exclusive_group()
+    pin_memory_group.add_argument(
+        "--pin-memory",
+        dest="pin_memory",
+        action="store_true",
+        default=None,
+        help="DataLoader 使用 pinned memory 加速 CPU 到 CUDA 拷贝",
+    )
+    pin_memory_group.add_argument(
+        "--no-pin-memory",
+        dest="pin_memory",
+        action="store_false",
+        help="关闭 DataLoader pinned memory",
+    )
+    persistent_workers_group = parser.add_mutually_exclusive_group()
+    persistent_workers_group.add_argument(
+        "--persistent-workers",
+        dest="persistent_workers",
+        action="store_true",
+        default=None,
+        help="num_workers > 0 时保持 DataLoader worker 常驻",
+    )
+    persistent_workers_group.add_argument(
+        "--no-persistent-workers",
+        dest="persistent_workers",
+        action="store_false",
+        help="每个 epoch 结束后关闭 DataLoader worker",
+    )
+    parser.add_argument("--prefetch-factor", type=int, default=None, help="每个 DataLoader worker 预取的 batch 数")
+    precompute_group = parser.add_mutually_exclusive_group()
+    precompute_group.add_argument(
+        "--precompute-model-input",
+        dest="precompute_model_input",
+        action="store_true",
+        default=None,
+        help="在 DataLoader worker 中预先生成 model_input=[B,4096,P]",
+    )
+    precompute_group.add_argument(
+        "--no-precompute-model-input",
+        dest="precompute_model_input",
+        action="store_false",
+        help="在训练循环中从 frames 生成 model_input",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="训练 epoch 数")
     parser.add_argument("--lr", type=float, default=None, help="学习率")
     parser.add_argument("--weight-decay", type=float, default=None, help="AdamW 权重衰减")
@@ -62,6 +111,12 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--C", type=int, default=None, help="模型主干通道数")
     parser.add_argument("--chunk-size", type=int, default=None, help="按时间维切块的 chunk 大小")
     parser.add_argument("--spike-mode", choices=["plif", "lif", "if"], default=None, help="脉冲神经元类型")
+    parser.add_argument(
+        "--spike-backend",
+        choices=["auto", "cupy", "torch"],
+        default=None,
+        help="spikingjelly 神经元后端; auto 在 CUDA 可用时优先 cupy",
+    )
     parser.add_argument("--num-blocks", type=int, default=None, help="SpikeBlock 数量")
     parser.add_argument("--refine-mid", type=int, default=None, help="深度/强度精修头的中间通道数")
     sequence_group = parser.add_mutually_exclusive_group()
@@ -126,8 +181,74 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--recursive", action="store_true", help="递归搜索数据目录")
     parser.add_argument("--no-label", action="store_true", help="关闭弱标签生成")
     parser.add_argument("--normalize-input", action="store_true", help="按 time_threshold 归一化输入")
-    parser.add_argument("--shuffle-pages", action="store_true", help="打乱单个样本内部的 page 顺序")
-    parser.add_argument("--amp", action="store_true", help="启用 CUDA autocast 混合精度")
+    parser.add_argument(
+        "--augment-train",
+        action="store_true",
+        help="训练集启用 raw group 级 ToF shift 增强",
+    )
+    parser.add_argument("--tof-shift-max", type=int, default=None, help="ToF shift 最大整数偏移, 默认 15")
+    parser.add_argument("--tof-shift-prob", type=float, default=None, help="每个训练样本执行 ToF shift 的概率")
+    parser.add_argument("--page-dropout", action="store_true", help="训练集随机丢弃整页 raw page")
+    parser.add_argument("--page-dropout-prob", type=float, default=None, help="PageDropout 中每页被置 0 的概率")
+    parser.add_argument("--shuffle-pages", action="store_true", help="训练集打乱单个样本内部的 page 顺序")
+    parser.add_argument("--page-shuffle", action="store_true", help="--shuffle-pages 的同义开关")
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument(
+        "--amp",
+        dest="amp",
+        action="store_true",
+        default=None,
+        help="启用 CUDA autocast 混合精度",
+    )
+    amp_group.add_argument(
+        "--no-amp",
+        dest="amp",
+        action="store_false",
+        help="关闭 CUDA autocast 混合精度",
+    )
+    tf32_group = parser.add_mutually_exclusive_group()
+    tf32_group.add_argument(
+        "--tf32",
+        dest="tf32",
+        action="store_true",
+        default=None,
+        help="允许 Ampere/Ada GPU 使用 TF32 matmul/conv",
+    )
+    tf32_group.add_argument(
+        "--no-tf32",
+        dest="tf32",
+        action="store_false",
+        help="关闭 TF32",
+    )
+    benchmark_group = parser.add_mutually_exclusive_group()
+    benchmark_group.add_argument(
+        "--cudnn-benchmark",
+        dest="cudnn_benchmark",
+        action="store_true",
+        default=None,
+        help="固定输入尺寸时启用 cuDNN benchmark",
+    )
+    benchmark_group.add_argument(
+        "--no-cudnn-benchmark",
+        dest="cudnn_benchmark",
+        action="store_false",
+        help="关闭 cuDNN benchmark",
+    )
+    cuda_prefetch_group = parser.add_mutually_exclusive_group()
+    cuda_prefetch_group.add_argument(
+        "--cuda-prefetch",
+        dest="cuda_prefetch",
+        action="store_true",
+        default=None,
+        help="训练/验证时用独立 CUDA stream 预取下一批",
+    )
+    cuda_prefetch_group.add_argument(
+        "--no-cuda-prefetch",
+        dest="cuda_prefetch",
+        action="store_false",
+        help="关闭 CUDA stream batch 预取",
+    )
+    parser.add_argument("--progress-interval", type=int, default=None, help="进度条每 N 个 batch 同步一次 loss")
 
 
 def config_from_args(args: argparse.Namespace) -> SNNConfig:
@@ -144,9 +265,14 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "pages_per_group",
         "total_pages",
         "time_threshold",
+        "raw_load_mode",
         "split_ratios",
         "batch_size",
         "num_workers",
+        "pin_memory",
+        "persistent_workers",
+        "prefetch_factor",
+        "precompute_model_input",
         "epochs",
         "lr",
         "weight_decay",
@@ -165,6 +291,7 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "C",
         "chunk_size",
         "spike_mode",
+        "spike_backend",
         "num_blocks",
         "refine_mid",
         "return_sequence",
@@ -182,6 +309,14 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "ssim_smooth_kernel_size",
         "gt_use_mask",
         "ssim_use_mask",
+        "tof_shift_max",
+        "tof_shift_prob",
+        "page_dropout_prob",
+        "amp",
+        "tf32",
+        "cudnn_benchmark",
+        "cuda_prefetch",
+        "progress_interval",
     ):
         if hasattr(args, key):
             value = getattr(args, key)
@@ -198,11 +333,12 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         updates["return_label"] = False
     if getattr(args, "normalize_input", False):
         updates["normalize_input"] = True
-    if getattr(args, "shuffle_pages", False):
+    if getattr(args, "augment_train", False):
+        updates["augment_train"] = True
+    if getattr(args, "page_dropout", False):
+        updates["page_dropout"] = True
+    if getattr(args, "shuffle_pages", False) or getattr(args, "page_shuffle", False):
         updates["shuffle_pages"] = True
-    if getattr(args, "amp", False):
-        updates["amp"] = True
-
     _apply_legacy_output_dir(updates)
     return cfg.clone_with(**updates)
 
@@ -247,9 +383,14 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "pages_per_group",
         "total_pages",
         "time_threshold",
+        "raw_load_mode",
         "split_ratios",
         "batch_size",
         "num_workers",
+        "pin_memory",
+        "persistent_workers",
+        "prefetch_factor",
+        "precompute_model_input",
         "epochs",
         "lr",
         "weight_decay",
@@ -268,6 +409,7 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "C",
         "chunk_size",
         "spike_mode",
+        "spike_backend",
         "num_blocks",
         "refine_mid",
         "return_sequence",
@@ -285,6 +427,14 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "ssim_smooth_kernel_size",
         "gt_use_mask",
         "ssim_use_mask",
+        "tof_shift_max",
+        "tof_shift_prob",
+        "page_dropout_prob",
+        "amp",
+        "tf32",
+        "cudnn_benchmark",
+        "cuda_prefetch",
+        "progress_interval",
     ):
         if hasattr(args, key):
             value = getattr(args, key)
@@ -301,11 +451,12 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         updates["return_label"] = False
     if getattr(args, "normalize_input", False):
         updates["normalize_input"] = True
-    if getattr(args, "shuffle_pages", False):
+    if getattr(args, "augment_train", False):
+        updates["augment_train"] = True
+    if getattr(args, "page_dropout", False):
+        updates["page_dropout"] = True
+    if getattr(args, "shuffle_pages", False) or getattr(args, "page_shuffle", False):
         updates["shuffle_pages"] = True
-    if getattr(args, "amp", False):
-        updates["amp"] = True
-
     _apply_legacy_output_dir(updates)
     return cfg.clone_with(**updates)
 

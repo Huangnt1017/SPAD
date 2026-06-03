@@ -31,7 +31,7 @@ from spikingjelly.activation_based import neuron, functional
 # ─── cupy backend 探测 ────────────────────────────────────
 
 def _probe_cupy_backend() -> bool:
-    """模块加载时探测 cupy backend 是否真正可用.
+    """探测 cupy backend 是否真正可用.
 
     仅 import cupy 不够: cupy 14.x 在缺少 pytest / CUDA_PATH 时
     import 可能成功但实际运算会抛异常. 因此构造一个 IFNode 并跑一次
@@ -52,8 +52,15 @@ def _probe_cupy_backend() -> bool:
         return False
 
 
-# 模块级常量: 仅在 CUDA 可用时才尝试探测, 避免 CPU 环境启动延迟
-_CUPY_AVAILABLE: bool = _probe_cupy_backend() if torch.cuda.is_available() else False
+_CUPY_AVAILABLE: bool | None = None
+
+
+def _cupy_backend_available() -> bool:
+    """懒加载探测 cupy backend, 避免导入模块时无意义接触 CUDA。"""
+    global _CUPY_AVAILABLE
+    if _CUPY_AVAILABLE is None:
+        _CUPY_AVAILABLE = _probe_cupy_backend() if torch.cuda.is_available() else False
+    return _CUPY_AVAILABLE
 
 
 # ─── 神经元工厂 ───────────────────────────────────────────
@@ -62,24 +69,41 @@ def build_node(
     spike_mode: str = "plif",
     tau: float = 2.0,
     v_threshold: float = 0.5,
+    spike_backend: str = "auto",
 ) -> nn.Module:
     """构造 activation_based 脉冲神经元节点.
 
     新版 API 不需要 timestep 参数; step_mode='m' 表示多步模式,
     输入形状为 [T, B, *], 神经元内部自动沿 T 维展开.
 
-    若 cupy backend 探测通过 (_CUPY_AVAILABLE=True), 自动使用
-    backend='cupy' 加速 GPU 上的脉冲计算; 否则回退到 backend='torch'.
+    ``spike_backend='auto'`` 时, 若 cupy backend 探测通过, 自动使用
+    backend='cupy' 加速 GPU 上的脉冲计算;
+    否则回退到 backend='torch'。显式传入 ``torch`` 可用于 CPU 冒烟测试或
+    对比 cupy kernel 开销。
 
     Args:
         spike_mode:   神经元类型 ("plif" / "lif" / "if")
         tau:          膜时间常数 (lif/plif 有效)
         v_threshold:  发放阈值
+        spike_backend: "auto" / "cupy" / "torch"
 
     Returns:
         配置好 step_mode='m' 的神经元模块
     """
-    backend = "cupy" if _CUPY_AVAILABLE else "torch"
+    backend_choice = str(spike_backend).lower()
+    if backend_choice == "auto":
+        backend = "cupy" if _cupy_backend_available() else "torch"
+    elif backend_choice == "cupy":
+        if not _cupy_backend_available():
+            raise RuntimeError(
+                "spike_backend='cupy' was requested, but the official "
+                "spikingjelly cupy backend is not available in this process."
+            )
+        backend = "cupy"
+    elif backend_choice == "torch":
+        backend = "torch"
+    else:
+        raise ValueError("spike_backend must be 'auto', 'cupy' or 'torch'")
     common = dict(v_threshold=v_threshold, detach_reset=True,
                   step_mode="m", backend=backend)
     if spike_mode == "plif":
@@ -311,11 +335,11 @@ class SpikeBlock(nn.Module):
         spike_mode: 神经元类型
     """
 
-    def __init__(self, C: int, spike_mode: str):
+    def __init__(self, C: int, spike_mode: str, spike_backend: str = "auto"):
         super().__init__()
-        self.spike_in = build_node(spike_mode)
+        self.spike_in = build_node(spike_mode, spike_backend=spike_backend)
         self.ms_dsconv = MultiScaleDSConv(C)
-        self.spike_mid = build_node(spike_mode)
+        self.spike_mid = build_node(spike_mode, spike_backend=spike_backend)
         self.pw = nn.Conv2d(C, C, 1, bias=False)
         self.bn = nn.BatchNorm2d(C)
 
@@ -410,11 +434,20 @@ class _Stem(nn.Module):
         spike_mode: 用于 stem 内部脉冲层的神经元类型
     """
 
-    def __init__(self, C_enc: int, C: int, spike_mode: str):
+    def __init__(
+        self,
+        C_enc: int,
+        C: int,
+        spike_mode: str,
+        spike_backend: str = "auto",
+    ):
         super().__init__()
         self.conv1 = nn.Conv2d(C_enc, C, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(C)
-        self.spike = build_node(spike_mode)             # step_mode='m', 需要 [T,B,C,H,W]
+        self.spike = build_node(
+            spike_mode,
+            spike_backend=spike_backend,
+        )                                               # step_mode='m', 需要 [T,B,C,H,W]
         self.conv2 = nn.Conv2d(C, C, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(C)
 
@@ -445,12 +478,12 @@ class _GateHead(nn.Module):
         spike_mode: 神经元类型
     """
 
-    def __init__(self, C: int, spike_mode: str):
+    def __init__(self, C: int, spike_mode: str, spike_backend: str = "auto"):
         super().__init__()
-        self.spike1 = build_node(spike_mode)
+        self.spike1 = build_node(spike_mode, spike_backend=spike_backend)
         self.conv1 = nn.Conv2d(C, C // 2, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(C // 2)
-        self.spike2 = build_node(spike_mode)
+        self.spike2 = build_node(spike_mode, spike_backend=spike_backend)
         self.conv2 = nn.Conv2d(C // 2, 1, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -503,6 +536,7 @@ class SPADSpikeNet(nn.Module):
         lut_init: str = "sinusoidal",
         refine_mid: int = 8,
         return_sequence: bool = True,
+        spike_backend: str = "auto",
     ):
         super().__init__()
         self.C = C
@@ -511,6 +545,7 @@ class SPADSpikeNet(nn.Module):
         self.n_freq = n_freq
         self.encoding_mode = encoding_mode
         self.return_sequence = bool(return_sequence)
+        self.spike_backend = str(spike_backend).lower()
 
         if encoding_mode == "lut":
             self.tof_embedding = LearnableTofEmbedding(
@@ -522,11 +557,14 @@ class SPADSpikeNet(nn.Module):
             self.tof_embedding = None
             C_enc = 2 * n_freq + 1                      # 默认 17
 
-        self.stem = _Stem(C_enc, C, spike_mode)
+        self.stem = _Stem(C_enc, C, spike_mode, spike_backend=self.spike_backend)
         self.blocks = nn.ModuleList(
-            [SpikeBlock(C, spike_mode) for _ in range(num_blocks)]
+            [
+                SpikeBlock(C, spike_mode, spike_backend=self.spike_backend)
+                for _ in range(num_blocks)
+            ]
         )
-        self.gate_head = _GateHead(C, spike_mode)
+        self.gate_head = _GateHead(C, spike_mode, spike_backend=self.spike_backend)
         self.refine = SpatialRefineHead(mid=refine_mid, depth_range=t_max)
 
     def _encode_chunk(
@@ -741,7 +779,7 @@ def run_5d_memory_benchmark() -> None:
     props = torch.cuda.get_device_properties(0)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Total memory: {props.total_memory / 1024**3:.1f} GB")
-    print(f"cupy backend: {'available (backend=cupy)' if _CUPY_AVAILABLE else 'unavailable, fallback to torch'}")
+    print(f"cupy backend: {'available (backend=cupy)' if _cupy_backend_available() else 'unavailable, fallback to torch'}")
     print("Benchmark input: [T, B, C, 64, 64]")
     print("Network path: stem -> SpikeBlocks -> gate_head -> temporal aggregation -> refine")
     print(f"Mode: {'forward + backward' if measure_backward else 'forward only'}")
@@ -874,7 +912,7 @@ if False and __name__ == "__main__":
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    print(f"cupy backend: {'可用 (backend=cupy)' if _CUPY_AVAILABLE else '不可用, 回退到 torch'}")
+    print(f"cupy backend: {'可用 (backend=cupy)' if _cupy_backend_available() else '不可用, 回退到 torch'}")
 
     # 小尺寸输入: H=W=16 (256像素), P=16帧, chunk=16
     # 用于快速验证 forward/backward 正确性, 不测显存上限

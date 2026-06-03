@@ -12,7 +12,8 @@ __pycache__/
 
 # Checkpoints (太大)
 checkpoints/*.pth
-
+checkpoints/*.json
+checkpoints/SNN/
 # 日志
 logs/*.log
 logs/*.png
@@ -27,3 +28,4 @@ logs/test1/
 
 # 项目说明
 .understand-anything/
+.understand-anything/*.json

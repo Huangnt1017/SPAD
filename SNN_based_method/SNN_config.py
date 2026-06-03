@@ -87,6 +87,9 @@ class SNNConfig:
     cache_size: int = 2
     """Dataset 在内存中缓存的 raw 分组数组数量。"""
 
+    raw_load_mode: str = "group"
+    """raw 分组读取模式: ``group`` 只读当前 group, ``file_cache`` 缓存整文件。"""
+
     split_ratios: tuple[float, float, float] = (0.8, 0.2, 0.0)
     """train/val/test 划分比例。"""
 
@@ -94,6 +97,15 @@ class SNNConfig:
     batch_size: int = 4
     num_workers: int = 4
     pin_memory: Optional[bool] = None
+    persistent_workers: bool = True
+    """num_workers > 0 时保持 DataLoader worker 常驻, 减少 epoch 间空窗。"""
+
+    prefetch_factor: int = 4
+    """每个 DataLoader worker 预取的 batch 数; 仅 num_workers > 0 时生效。"""
+
+    precompute_model_input: bool = False
+    """是否在 DataLoader worker 中额外生成 ``model_input=[B,4096,P]``。"""
+
     drop_last: bool = False
     seed: int = 42
 
@@ -113,6 +125,9 @@ class SNNConfig:
     C: int = 32
     chunk_size: int = 32
     spike_mode: str = "plif"
+    spike_backend: str = "auto"
+    """spikingjelly 神经元后端: ``auto`` 优先 cupy, 也可显式 ``cupy``/``torch``。"""
+
     num_blocks: int = 2
     refine_mid: int = 8
     return_sequence: bool = True
@@ -153,6 +168,17 @@ class SNNConfig:
     """梯度累积步数; 实际等效 batch_size = batch_size * grad_accum_steps。"""
 
     amp: bool = False
+    tf32: bool = True
+    """允许 Ampere/Ada GPU 使用 TF32 加速 matmul/conv。"""
+
+    cudnn_benchmark: bool = True
+    """输入尺寸固定时启用 cuDNN benchmark, 选择更快卷积实现。"""
+
+    cuda_prefetch: bool = True
+    """CUDA 训练/验证时用独立 stream 预取下一批, 降低数据搬运空窗。"""
+
+    progress_interval: int = 20
+    """训练/验证进度条每 N 个 batch 同步一次 loss, 降低 CPU-GPU 同步频率。"""
 
     # ---- 运行时 / 实验产物 ----
     device: str = "auto"
@@ -170,12 +196,20 @@ class SNNConfig:
     save_every: int = 1
 
     def __post_init__(self) -> None:
-        """把旧后端名归一化为官方 activation_based 实现。"""
+        """把旧后端名归一化为官方 activation_based 实现, 并校验枚举项。"""
         backend = str(self.model_backend).lower()
         if backend in {"legacy", "clock", "clock_driven"}:
             self.model_backend = "new"
         elif backend in {"activation", "activation_based"}:
             self.model_backend = "new"
+
+        self.raw_load_mode = str(self.raw_load_mode).lower()
+        if self.raw_load_mode not in {"group", "file_cache"}:
+            raise ValueError("raw_load_mode must be 'group' or 'file_cache'")
+
+        self.spike_backend = str(self.spike_backend).lower()
+        if self.spike_backend not in {"auto", "cupy", "torch"}:
+            raise ValueError("spike_backend must be 'auto', 'cupy' or 'torch'")
 
     @property
     def t_max(self) -> int:
@@ -213,6 +247,7 @@ class SNNConfig:
             C=self.C,
             chunk_size=self.chunk_size,
             spike_mode=self.spike_mode,
+            spike_backend=self.spike_backend,
             t_max=self.time_threshold,
             n_freq=self.n_freq,
             num_blocks=self.num_blocks,
@@ -283,9 +318,13 @@ class SNNConfig:
             page_dropout_prob=self.page_dropout_prob,
             active_point=self.active_point,
             cache_size=self.cache_size,
+            raw_load_mode=self.raw_load_mode,
             recursive=self.recursive,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
+            include_model_input=self.precompute_model_input,
             drop_last=self.drop_last,
         )
 
@@ -308,12 +347,16 @@ class SNNConfig:
             seed=self.seed,
             return_label=self.return_label,
             normalize=self.normalize_input,
-            shuffle_pages=self.shuffle_pages,
+            shuffle_pages=False,
             active_point=self.active_point,
             cache_size=self.cache_size,
+            raw_load_mode=self.raw_load_mode,
             recursive=self.recursive,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
+            include_model_input=self.precompute_model_input,
             drop_last=False,
         )
 
@@ -359,6 +402,11 @@ class SNNConfig:
             f"time_threshold={self.time_threshold}, batch_size={self.batch_size}"
         )
         lines.append(
+            f"  dataloader: num_workers={self.num_workers}, pin_memory={self.pin_memory}, "
+            f"persistent_workers={self.persistent_workers}, prefetch_factor={self.prefetch_factor}, "
+            f"precompute_model_input={self.precompute_model_input}, raw_load_mode={self.raw_load_mode}"
+        )
+        lines.append(
             f"  augment_train={self.augment_train}, tof_shift_max={self.tof_shift_max}, "
             f"tof_shift_prob={self.tof_shift_prob}, page_dropout={self.page_dropout}, "
             f"page_dropout_prob={self.page_dropout_prob}, shuffle_pages={self.shuffle_pages}"
@@ -366,7 +414,8 @@ class SNNConfig:
         lines.append(
             f"  model_backend={self.model_backend}, encoding={self.encoding_mode}, "
             f"C_enc={self.C_enc}, C={self.C}, chunk_size={self.chunk_size}, "
-            f"refine_mid={self.refine_mid}, return_sequence={self.return_sequence}"
+            f"spike_backend={self.spike_backend}, refine_mid={self.refine_mid}, "
+            f"return_sequence={self.return_sequence}"
         )
         lines.append(
             f"  loss_weights: gt={self.w_gt}, ssim={self.w_ssim}, "
@@ -375,6 +424,10 @@ class SNNConfig:
         lines.append(
             f"  epochs={self.epochs}, lr={self.lr}, weight_decay={self.weight_decay}, "
             f"grad_accum_steps={self.grad_accum_steps}, device={self.resolved_device()}"
+        )
+        lines.append(
+            f"  runtime: amp={self.amp}, tf32={self.tf32}, cuda_prefetch={self.cuda_prefetch}, "
+            f"cudnn_benchmark={self.cudnn_benchmark}, progress_interval={self.progress_interval}"
         )
         lines.append(f"  log_dir={self.log_dir}, checkpoint_dir={self.checkpoint_dir}")
         return "\n".join(lines)
