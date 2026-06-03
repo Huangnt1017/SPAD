@@ -24,3 +24,6 @@ logs/test1/
 *.zip
 *.tar.gz
 *.doc
+
+# 项目说明
+.understand-anything/
