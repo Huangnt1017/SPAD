@@ -20,14 +20,23 @@ ensure_project_root_on_path()
 from SNN_based_method.SNN_config import SNNConfig
 from SNN_based_method.scripts.data import time_first_to_model_input
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     """向 argparse 解析器添加 SNNConfig 的通用命令行覆盖参数。"""
     parser.add_argument("--config", default=None, help="SNNConfig JSON 配置文件路径")
     parser.add_argument("--data-paths", nargs="+", default=None, help="raw 文件或包含 raw 文件的目录")
+    parser.add_argument("--csv-paths", nargs="+", default=None, help="CSV 样本清单路径, 需包含 file_path 列")
+    parser.add_argument(
+        "--skip-missing-csv-raw",
+        action="store_true",
+        help="CSV 中列出的 raw 文件缺失时跳过该行; 默认严格报错",
+    )
     parser.add_argument("--pages-per-group", type=int, default=None, help="每个样本使用的 raw page 数 P")
     parser.add_argument("--total-pages", type=int, default=None, help="每个 raw 文件最多读取的 page 数")
     parser.add_argument("--time-threshold", type=int, default=None, help="有效 ToF 上限, 超过后视为无效")
+    parser.add_argument("--split-ratios", nargs=3, type=float, default=None, metavar=("TRAIN", "VAL", "TEST"), help="train/val/test 划分比例, 三项之和必须为 1")
     parser.add_argument("--batch-size", type=int, default=None, help="批大小")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker 数")
     parser.add_argument("--epochs", type=int, default=None, help="训练 epoch 数")
@@ -35,7 +44,9 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--weight-decay", type=float, default=None, help="AdamW 权重衰减")
     parser.add_argument("--grad-clip", type=float, default=None, help="梯度裁剪最大范数")
     parser.add_argument("--device", default=None, help="运行设备: auto/cpu/cuda")
-    parser.add_argument("--output-dir", default=None, help="实验产物输出目录")
+    parser.add_argument("--log-dir", default=None, help="训练日志、测试结果输出目录")
+    parser.add_argument("--checkpoint-dir", default=None, help="训练 checkpoint 输出目录")
+    parser.add_argument("--output-dir", default=None, help="旧版统一实验产物输出目录")
     parser.add_argument("--run-name", default=None, help="本次运行名称")
     parser.add_argument("--checkpoint", dest="checkpoint_path", default=None, help="checkpoint 路径")
     parser.add_argument("--model-backend", choices=["new", "legacy"], default=None, help="模型后端: new 或 legacy")
@@ -63,9 +74,11 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
     updates: dict[str, Any] = {}
     for key in (
         "data_paths",
+        "csv_paths",
         "pages_per_group",
         "total_pages",
         "time_threshold",
+        "split_ratios",
         "batch_size",
         "num_workers",
         "epochs",
@@ -73,6 +86,8 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "weight_decay",
         "grad_clip",
         "device",
+        "log_dir",
+        "checkpoint_dir",
         "output_dir",
         "run_name",
         "checkpoint_path",
@@ -89,9 +104,13 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
             value = getattr(args, key)
             if value is not None:
                 updates[key] = value
+    if getattr(args, "data_paths", None) is not None and getattr(args, "csv_paths", None) is None:
+        updates["csv_paths"] = None
 
     if getattr(args, "recursive", False):
         updates["recursive"] = True
+    if getattr(args, "skip_missing_csv_raw", False):
+        updates["skip_missing_csv_raw"] = True
     if getattr(args, "no_label", False):
         updates["return_label"] = False
     if getattr(args, "normalize_input", False):
@@ -101,6 +120,7 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
     if getattr(args, "amp", False):
         updates["amp"] = True
 
+    _apply_legacy_output_dir(updates)
     return cfg.clone_with(**updates)
 
 
@@ -125,7 +145,14 @@ def config_from_checkpoint_and_args(args: argparse.Namespace) -> SNNConfig:
 
     args_without_config = argparse.Namespace(**vars(args))
     args_without_config.config = None
-    return _apply_arg_overrides(cfg, args_without_config)
+    cfg = _apply_arg_overrides(cfg, args_without_config)
+    if (
+        getattr(args, "checkpoint_path", None)
+        and not getattr(args, "config", None)
+        and getattr(args, "run_name", None) is None
+    ):
+        cfg = cfg.clone_with(run_name=None)
+    return cfg
 
 
 def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
@@ -133,9 +160,11 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
     updates: dict[str, Any] = {}
     for key in (
         "data_paths",
+        "csv_paths",
         "pages_per_group",
         "total_pages",
         "time_threshold",
+        "split_ratios",
         "batch_size",
         "num_workers",
         "epochs",
@@ -143,6 +172,8 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "weight_decay",
         "grad_clip",
         "device",
+        "log_dir",
+        "checkpoint_dir",
         "output_dir",
         "run_name",
         "checkpoint_path",
@@ -159,9 +190,13 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
             value = getattr(args, key)
             if value is not None:
                 updates[key] = value
+    if getattr(args, "data_paths", None) is not None and getattr(args, "csv_paths", None) is None:
+        updates["csv_paths"] = None
 
     if getattr(args, "recursive", False):
         updates["recursive"] = True
+    if getattr(args, "skip_missing_csv_raw", False):
+        updates["skip_missing_csv_raw"] = True
     if getattr(args, "no_label", False):
         updates["return_label"] = False
     if getattr(args, "normalize_input", False):
@@ -171,16 +206,54 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
     if getattr(args, "amp", False):
         updates["amp"] = True
 
+    _apply_legacy_output_dir(updates)
     return cfg.clone_with(**updates)
 
 
-def make_run_dir(cfg: SNNConfig, prefix: str) -> Path:
-    """创建带时间戳的运行目录。"""
+def _apply_legacy_output_dir(updates: dict[str, Any]) -> None:
+    """兼容旧版 ``--output-dir``: 未显式指定时同时覆盖日志和 checkpoint 根目录。"""
+    if "output_dir" not in updates:
+        return
+    if "log_dir" not in updates:
+        updates["log_dir"] = updates["output_dir"]
+    if "checkpoint_dir" not in updates:
+        updates["checkpoint_dir"] = updates["output_dir"]
+
+
+def resolve_output_root(path: str | Path) -> Path:
+    """把输出根目录解析为绝对路径; 相对路径以项目根目录为基准。"""
+    output_root = Path(path)
+    if not output_root.is_absolute():
+        output_root = _PROJECT_ROOT / output_root
+    return output_root
+
+
+def build_run_name(cfg: SNNConfig, prefix: str) -> str:
+    """生成运行目录名; 未指定 ``run_name`` 时使用前缀和时间戳。"""
     run_name = cfg.run_name
     if not run_name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"{prefix}_{timestamp}"
-    run_dir = Path(cfg.output_dir) / run_name
+    return run_name
+
+
+def make_run_dir(cfg: SNNConfig, prefix: str) -> Path:
+    """创建旧版统一运行目录; 新代码优先使用日志/checkpoint 专用目录。"""
+    run_dir = resolve_output_root(cfg.output_dir) / build_run_name(cfg, prefix)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def make_log_run_dir(cfg: SNNConfig, prefix: str, *, run_name: str | None = None) -> Path:
+    """创建日志、summary 和预测结果的运行目录。"""
+    run_dir = resolve_output_root(cfg.log_dir) / (run_name or build_run_name(cfg, prefix))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def make_checkpoint_run_dir(cfg: SNNConfig, prefix: str, *, run_name: str | None = None) -> Path:
+    """创建 checkpoint 的运行目录。"""
+    run_dir = resolve_output_root(cfg.checkpoint_dir) / (run_name or build_run_name(cfg, prefix))
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 

@@ -39,13 +39,19 @@ class SNNConfig:
     data_paths: list[str] | None = None
     """raw 文件路径, 或包含 ``.raw`` 文件的目录。"""
 
-    pages_per_group: int = 500
+    csv_paths: list[str] | None = None
+    """可选 CSV 样本清单路径; 存在时按 ``file_path`` 列选择 raw 文件。"""
+
+    skip_missing_csv_raw: bool = False
+    """CSV 中 raw 文件缺失时是否跳过; 默认严格报错, 避免静默丢样本。"""
+
+    pages_per_group: int = 64 * 8
     """单个训练样本包含的 raw page 数, 即 ``P``。"""
 
     total_pages: Optional[int] = None
     """每个 raw 文件使用的 page 数; ``None`` 表示使用全部完整分组。"""
 
-    time_threshold: int = 150
+    time_threshold: int = 128
     """大于该 ToF bin 的值视为无效并置 0。"""
 
     recursive: bool = False
@@ -66,11 +72,11 @@ class SNNConfig:
     cache_size: int = 2
     """Dataset 在内存中缓存的 raw 分组数组数量。"""
 
-    split_ratios: tuple[float, float, float] = (0.7, 0.2, 0.1)
+    split_ratios: tuple[float, float, float] = (0.8, 0.2, 0.0)
     """train/val/test 划分比例。"""
 
     # ---- Dataloader ----
-    batch_size: int = 4
+    batch_size: int = 8
     num_workers: int = 0
     pin_memory: Optional[bool] = None
     drop_last: bool = False
@@ -90,7 +96,7 @@ class SNNConfig:
     """``new`` 使用 SNN_new.py; ``legacy`` 使用 SNN.py。"""
 
     C: int = 32
-    chunk_size: int = 128
+    chunk_size: int = 64
     spike_mode: str = "plif"
     num_blocks: int = 3
     refine_mid: int = 8
@@ -109,7 +115,7 @@ class SNNConfig:
     rho_target: float = 0.15
     beta_smooth: float = 5.0
     ssim_kernel_size: int = 7
-    depth_range: float = 150.0
+    depth_range: float = 128.0
     intensity_range: float = 1.0
 
     # ---- 优化器 / 调度器 ----
@@ -121,7 +127,15 @@ class SNNConfig:
 
     # ---- 运行时 / 实验产物 ----
     device: str = "auto"
+    log_dir: str = "logs/SNN"
+    """训练日志、测试 summary 和预测结果的输出根目录。"""
+
+    checkpoint_dir: str = "checkpoints/SNN"
+    """训练 checkpoint 的输出根目录。"""
+
     output_dir: str = "SNN_based_method/artifacts"
+    """旧版统一输出目录; 新脚本优先使用 ``log_dir`` 和 ``checkpoint_dir``。"""
+
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
     save_every: int = 1
@@ -207,6 +221,8 @@ class SNNConfig:
 
         return create_spad_dataloaders(
             self.data_paths,
+            csv_paths=self.csv_paths,
+            skip_missing_csv_raw=self.skip_missing_csv_raw,
             pages_per_group=self.pages_per_group,
             total_pages=self.total_pages,
             time_threshold=self.time_threshold,
@@ -233,6 +249,8 @@ class SNNConfig:
 
         return create_spad_dataloader(
             self.data_paths,
+            csv_paths=self.csv_paths,
+            skip_missing_csv_raw=self.skip_missing_csv_raw,
             pages_per_group=self.pages_per_group,
             total_pages=self.total_pages,
             time_threshold=self.time_threshold,
@@ -254,6 +272,7 @@ class SNNConfig:
         """导出可 JSON 序列化的字典。"""
         data = asdict(self)
         data["data_paths"] = _as_list(self.data_paths)
+        data["csv_paths"] = _as_list(self.csv_paths)
         data["split_ratios"] = list(self.split_ratios)
         return data
 
@@ -285,6 +304,7 @@ class SNNConfig:
         """返回适合打印的人类可读配置摘要。"""
         lines = ["SNNConfig:"]
         lines.append(f"  data_paths={self.data_paths}")
+        lines.append(f"  csv_paths={self.csv_paths}")
         lines.append(
             f"  pages_per_group={self.pages_per_group}, "
             f"time_threshold={self.time_threshold}, batch_size={self.batch_size}"
@@ -297,6 +317,7 @@ class SNNConfig:
             f"  epochs={self.epochs}, lr={self.lr}, weight_decay={self.weight_decay}, "
             f"device={self.resolved_device()}"
         )
+        lines.append(f"  log_dir={self.log_dir}, checkpoint_dir={self.checkpoint_dir}")
         return "\n".join(lines)
 
 

@@ -41,7 +41,7 @@ GT:   [B, 2, 64, 64]   fog_level=0 末段直方图峰值 (含噪 → 弱监督)
 ### 3.2 正弦编码
 
 ```python
-def encode_tof(tof, valid, n_freq=8, t_max=150):
+def encode_tof(tof, valid, n_freq=8, t_max=128):
     v = valid.float().unsqueeze(1)
     t = (tof.float() / t_max).unsqueeze(1) * v
     channels = [v]
@@ -63,7 +63,7 @@ def encode_tof(tof, valid, n_freq=8, t_max=150):
 在相同通道数（8 对 = 17 通道）下对比 5 种方案：
 
 ```
-评估 (t_max=150, fog_bin=40, target_bin=60):
+评估 (t_max=128, fog_bin=40, target_bin=60):
   cos: 余弦相似度 (越接近 0 越正交 → 越好区分)
   L2:  欧氏距离 (越大越好区分)
   adj: 相邻 bin 平均 L2 (分辨率, 越大越好)
@@ -427,7 +427,7 @@ _Stem.forward(x: [T,B,C_enc,H,W]):
 
 ```python
 from SNN_based_method.SNN_new import SPADSpikeNet
-model = SPADSpikeNet(C=32, chunk_size=128, spike_mode="plif")
+model = SPADSpikeNet(C=32, chunk_size=64, spike_mode="plif")
 model = SPADSpikeNet(encoding_mode="lut", embed_dim=16, lut_init="rbf")
 out = model(raw_data)         # raw_data [B,4096,P] → out["output"] [B,2,64,64]
 ```

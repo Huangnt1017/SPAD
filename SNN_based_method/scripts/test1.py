@@ -27,7 +27,7 @@ from SNN_based_method.scripts.runtime import (
     add_config_arguments,
     config_from_checkpoint_and_args,
     load_checkpoint,
-    make_run_dir,
+    make_log_run_dir,
     prepare_model_input,
     reset_spiking_state,
 )
@@ -126,7 +126,8 @@ def run_single_test(
         info["label_intensity_max"] = float(label[:, 1:2].max().item())
 
     if save_prediction:
-        run_dir = make_run_dir(cfg, "test1")
+        run_dir = make_log_run_dir(cfg, "test1")
+        cfg.save(run_dir / "config.json")
         np.save(run_dir / "output.npy", output.numpy())
         with (run_dir / "summary.json").open("w", encoding="utf-8") as file_obj:
             json.dump(info, file_obj, indent=2, ensure_ascii=False)

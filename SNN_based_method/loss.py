@@ -100,7 +100,7 @@ def _compute_ssim(pred, target, mask=None, kernel_size=11, sigma=1.5,
 class WeakGTLoss(nn.Module):
     """L1 loss against noisy GT after normalizing channels to comparable ranges."""
 
-    def __init__(self, w_depth=1.0, w_intensity=1.0, depth_range=150.0, intensity_range=1.0):
+    def __init__(self, w_depth=1.0, w_intensity=1.0, depth_range=128.0, intensity_range=1.0):
         super().__init__()
         self.w_depth = w_depth
         self.w_intensity = w_intensity
@@ -133,7 +133,7 @@ class GatedMomentVarianceLoss(nn.Module):
     timestamps around predicted depth is large, the gate is selecting wrong photons.
     """
 
-    def __init__(self, sigma_target=4.0, depth_range=150.0):
+    def __init__(self, sigma_target=4.0, depth_range=128.0):
         super().__init__()
         self.sigma2 = (float(sigma_target) / float(depth_range)) ** 2
         self.depth_range = float(depth_range)
@@ -189,7 +189,7 @@ class SSIMLoss(nn.Module):
     """
 
     def __init__(self, w_depth=1.0, w_intensity=1.0,
-                 kernel_size=7, depth_range=150.0, intensity_range=1.0):
+                 kernel_size=7, depth_range=128.0, intensity_range=1.0):
         super().__init__()
         self.w_depth = w_depth
         self.w_intensity = w_intensity
@@ -231,7 +231,7 @@ class IntensityAwareSmoothnessLoss(nn.Module):
     and can have discontinuities where intensity jumps (target boundary).
     """
 
-    def __init__(self, beta=5.0, depth_range=150.0, intensity_range=1.0):
+    def __init__(self, beta=5.0, depth_range=128.0, intensity_range=1.0):
         super().__init__()
         self.beta = beta
         self.depth_range = float(depth_range)
@@ -283,7 +283,7 @@ class SPADImagingLoss(nn.Module):
         rho_target=0.15,
         beta_smooth=5.0,
         ssim_kernel_size=7,
-        depth_range=150.0,
+        depth_range=128.0,
         intensity_range=1.0,
     ):
         super().__init__()
@@ -371,7 +371,7 @@ class ImageMetrics:
     """图像质量评估工具, 计算 depth 和 intensity 的 MAE / RMSE / SSIM / PSNR.
 
     用法:
-        metrics = ImageMetrics(depth_range=150.0)
+        metrics = ImageMetrics(depth_range=128.0)
         scores = metrics.compute(result, gt)
         # scores = {"depth_mae": ..., "depth_rmse": ..., "depth_ssim": ..., "depth_psnr": ...,
         #           "intensity_mae": ..., ...}
@@ -379,7 +379,7 @@ class ImageMetrics:
     所有计算在有效像素 (d_gt > 0) 上进行, 无效区域被 mask 排除.
     """
 
-    def __init__(self, depth_range=150.0, intensity_range=1.0, ssim_kernel_size=7):
+    def __init__(self, depth_range=128.0, intensity_range=1.0, ssim_kernel_size=7):
         """
         Args:
             depth_range: depth 数据动态范围, 用于 SSIM 和 PSNR

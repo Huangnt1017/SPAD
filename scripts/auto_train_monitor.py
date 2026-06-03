@@ -244,22 +244,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 # 无参运行时使用的自动训练队列。需要调整顺序时只改这里。
 AUTO_TRAIN_MODELS: list[str] = [
-    "dgcnn",
     "pointnet",
     "pointnet2",
     "pointnet2msg",
     "pointbert",
     "pointmae",
-
     "pointtransformer",
     "pointtransv2",
     "pointtransv3",
     "pointmlp",
     "pointmlpelite",
     "upp",
-    "spt",
-    "graph_residual",
-	"graph_residual_gcn",
 ]
 
 def main_without_cli() -> None:

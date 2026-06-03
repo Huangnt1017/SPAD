@@ -23,7 +23,7 @@ from SNN_based_method.scripts.runtime import (
     config_from_checkpoint_and_args,
     divide_average,
     load_checkpoint,
-    make_run_dir,
+    make_log_run_dir,
     prepare_model_input,
     reduce_loss_dict,
     reset_spiking_state,
@@ -50,7 +50,8 @@ def run_test(
     load_checkpoint(cfg.checkpoint_path, model, map_location=device)
     model.eval()
 
-    run_dir = make_run_dir(cfg, "test")
+    run_dir = make_log_run_dir(cfg, "test")
+    cfg.save(run_dir / "config.json")
     prediction_dir = run_dir / "predictions"
     if save_predictions:
         prediction_dir.mkdir(parents=True, exist_ok=True)

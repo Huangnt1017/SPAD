@@ -17,10 +17,12 @@ batch 堆叠成时间维优先格式:
 from __future__ import annotations
 
 import random
+import csv
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -88,6 +90,122 @@ def collect_raw_paths(
 
     unique_paths = {str(path.resolve()): path.resolve() for path in raw_paths}
     return [unique_paths[key] for key in sorted(unique_paths)]
+
+
+def _as_path_list(paths: str | Path | Sequence[str | Path]) -> list[Path]:
+    """把单个路径或路径序列统一为 ``Path`` 列表。"""
+    if isinstance(paths, (str, Path)):
+        return [Path(paths)]
+    return [Path(path) for path in paths]
+
+
+def _raw_path_candidates(file_path_value: str | Path) -> list[Path]:
+    """根据 CSV 中的 ``file_path`` 字段生成可能的 raw 文件名。"""
+    value_path = Path(str(file_path_value).strip())
+    candidates = [value_path]
+    if value_path.suffix.lower() != ".raw":
+        candidates.append(value_path.with_suffix(".raw"))
+
+    unique: dict[str, Path] = {}
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in unique:
+            unique[key] = candidate
+    return list(unique.values())
+
+
+def _resolve_csv_raw_path(
+    file_path_value: str | Path,
+    *,
+    csv_path: Path,
+    data_roots: Sequence[Path],
+) -> Path:
+    """把 CSV 中的文件名解析到真实存在的 ``.raw`` 路径。"""
+    if str(file_path_value).strip() == "":
+        raise ValueError(f"Empty file_path in CSV: {csv_path}")
+
+    candidates = _raw_path_candidates(file_path_value)
+    search_roots = [csv_path.parent]
+    for data_root in data_roots:
+        root = data_root if data_root.is_dir() else data_root.parent
+        if root not in search_roots:
+            search_roots.append(root)
+
+    attempted: list[Path] = []
+    for candidate in candidates:
+        if candidate.is_absolute():
+            attempted.append(candidate)
+            if candidate.is_file():
+                return candidate.resolve()
+            continue
+
+        for root in search_roots:
+            resolved = root / candidate
+            attempted.append(resolved)
+            if resolved.is_file():
+                return resolved.resolve()
+
+    attempted_text = ", ".join(str(path) for path in attempted[:6])
+    raise FileNotFoundError(
+        f"Cannot resolve CSV raw file '{file_path_value}' from {csv_path}. "
+        f"Tried: {attempted_text}"
+    )
+
+
+def collect_raw_records(
+    paths: str | Path | Sequence[str | Path],
+    *,
+    csv_paths: str | Path | Sequence[str | Path] | None = None,
+    recursive: bool = False,
+    skip_missing_csv_raw: bool = False,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """收集 raw 文件及可选 CSV 元信息。
+
+    当 ``csv_paths`` 非空时，CSV 的 ``file_path`` 列是样本清单，只读取 CSV
+    中列出的 raw 文件，并把 ``fog_level`` / ``target_class`` 等列作为元信息
+    带入 batch。否则保持旧行为：从 ``paths`` 直接收集 ``.raw`` 文件。
+    """
+    if not csv_paths:
+        return [(path, {}) for path in collect_raw_paths(paths, recursive=recursive)]
+
+    data_roots = _as_path_list(paths)
+    csv_path_list = _as_path_list(csv_paths)
+    records: list[tuple[Path, dict[str, Any]]] = []
+
+    for csv_path_value in csv_path_list:
+        csv_path = csv_path_value.resolve()
+        if not csv_path.is_file():
+            raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+            reader = csv.DictReader(file_obj)
+            if reader.fieldnames is None or "file_path" not in reader.fieldnames:
+                raise ValueError(f"CSV must contain a file_path column: {csv_path}")
+
+            for row_index, row in enumerate(reader, start=2):
+                try:
+                    raw_path = _resolve_csv_raw_path(
+                        row.get("file_path", ""),
+                        csv_path=csv_path,
+                        data_roots=data_roots,
+                    )
+                except FileNotFoundError as exc:
+                    if skip_missing_csv_raw:
+                        warnings.warn(str(exc), RuntimeWarning, stacklevel=2)
+                        continue
+                    raise
+                metadata = {
+                    key: value
+                    for key, value in row.items()
+                    if key is not None and value is not None
+                }
+                metadata["csv_path"] = str(csv_path)
+                metadata["csv_row"] = row_index
+                records.append((raw_path, metadata))
+
+    if not records:
+        raise ValueError(f"no CSV raw records were found in: {csv_path_list}")
+    return records
 
 
 def infer_groupable_total_pages(
@@ -339,6 +457,7 @@ class SpadRawGroupDataset(Dataset):
         shuffle_pages: bool = False,
         active_point: int = 1,
         cache_size: int = 2,
+        raw_metadata: Sequence[Mapping[str, Any]] | None = None,
         samples: Sequence[RawGroupSample] | None = None,
         transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         label_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
@@ -351,6 +470,8 @@ class SpadRawGroupDataset(Dataset):
         self.raw_paths = [Path(path).resolve() for path in raw_paths]
         if not self.raw_paths:
             raise ValueError("raw_paths must not be empty")
+        if raw_metadata is not None and len(raw_metadata) != len(self.raw_paths):
+            raise ValueError("raw_metadata length must match raw_paths length")
 
         self.pages_per_group = int(pages_per_group)
         self.total_pages = total_pages
@@ -362,6 +483,14 @@ class SpadRawGroupDataset(Dataset):
         self.cache_size = max(0, int(cache_size))
         self.transform = transform
         self.label_transform = label_transform
+        if raw_metadata is None:
+            metadata_items: Sequence[Mapping[str, Any]] = [{} for _ in self.raw_paths]
+        else:
+            metadata_items = raw_metadata
+        self.raw_metadata_by_path = {
+            str(path): dict(metadata)
+            for path, metadata in zip(self.raw_paths, metadata_items)
+        }
 
         if samples is None:
             self.samples = build_group_samples(
@@ -423,6 +552,13 @@ class SpadRawGroupDataset(Dataset):
             "group_index": sample.group_index,
             "total_pages": sample.total_pages,
         }
+        metadata = self.raw_metadata_by_path.get(sample.raw_path, {})
+        if metadata:
+            item["metadata"] = metadata
+            if "fog_level" in metadata:
+                item["fog_level"] = metadata["fog_level"]
+            if "target_class" in metadata:
+                item["target_class"] = metadata["target_class"]
 
         if self.return_label:
             label = build_weak_label_from_group(
@@ -455,6 +591,12 @@ def spad_time_first_collate(batch: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "group_index": torch.tensor([item["group_index"] for item in batch], dtype=torch.long),
         "total_pages": torch.tensor([item["total_pages"] for item in batch], dtype=torch.long),
     }
+    if "metadata" in batch[0]:
+        collated["metadata"] = [item.get("metadata", {}) for item in batch]
+    if "fog_level" in batch[0]:
+        collated["fog_level"] = [item.get("fog_level") for item in batch]
+    if "target_class" in batch[0]:
+        collated["target_class"] = [item.get("target_class") for item in batch]
 
     if "label" in batch[0]:
         collated["label"] = torch.stack([item["label"] for item in batch], dim=0).contiguous()
@@ -530,6 +672,8 @@ def split_indices(
 def create_spad_dataloaders(
     paths: str | Path | Sequence[str | Path],
     *,
+    csv_paths: str | Path | Sequence[str | Path] | None = None,
+    skip_missing_csv_raw: bool = False,
     pages_per_group: int,
     total_pages: int | None = None,
     time_threshold: int = 150,
@@ -550,9 +694,16 @@ def create_spad_dataloaders(
 
     返回的 loader 都会产出 ``batch["frames"]``，形状为 ``[P, B, 1, 64, 64]``。
     """
-    raw_paths = collect_raw_paths(paths, recursive=recursive)
-    if not raw_paths:
+    raw_records = collect_raw_records(
+        paths,
+        csv_paths=csv_paths,
+        recursive=recursive,
+        skip_missing_csv_raw=skip_missing_csv_raw,
+    )
+    if not raw_records:
         raise ValueError(f"no .raw files found in paths: {paths}")
+    raw_paths = [record[0] for record in raw_records]
+    raw_metadata = [record[1] for record in raw_records]
 
     dataset = SpadRawGroupDataset(
         raw_paths=raw_paths,
@@ -564,6 +715,7 @@ def create_spad_dataloaders(
         shuffle_pages=shuffle_pages,
         active_point=active_point,
         cache_size=cache_size,
+        raw_metadata=raw_metadata,
     )
     train_indices, val_indices, test_indices = split_indices(
         len(dataset),
@@ -602,6 +754,8 @@ def create_spad_dataloaders(
 def create_spad_dataloader(
     paths: str | Path | Sequence[str | Path],
     *,
+    csv_paths: str | Path | Sequence[str | Path] | None = None,
+    skip_missing_csv_raw: bool = False,
     pages_per_group: int,
     total_pages: int | None = None,
     time_threshold: int = 150,
@@ -619,9 +773,16 @@ def create_spad_dataloader(
     drop_last: bool = False,
 ) -> tuple[DataLoader, SpadRawGroupDataset]:
     """从 raw 文件或目录构建单个 DataLoader。"""
-    raw_paths = collect_raw_paths(paths, recursive=recursive)
-    if not raw_paths:
+    raw_records = collect_raw_records(
+        paths,
+        csv_paths=csv_paths,
+        recursive=recursive,
+        skip_missing_csv_raw=skip_missing_csv_raw,
+    )
+    if not raw_records:
         raise ValueError(f"no .raw files found in paths: {paths}")
+    raw_paths = [record[0] for record in raw_records]
+    raw_metadata = [record[1] for record in raw_records]
 
     dataset = SpadRawGroupDataset(
         raw_paths=raw_paths,
@@ -633,6 +794,7 @@ def create_spad_dataloader(
         shuffle_pages=shuffle_pages,
         active_point=active_point,
         cache_size=cache_size,
+        raw_metadata=raw_metadata,
     )
     loader = make_spad_dataloader(
         dataset,
@@ -650,10 +812,10 @@ if __name__ == "__main__":
     # 使用示例:
     # loader, dataset = create_spad_dataloader(
     #     r"E:\path\to\raw_dir",
-    #     pages_per_group=500,
-    #     time_threshold=150,
-    #     batch_size=4,
+    #     pages_per_group=512,
+    #     time_threshold=128,
+    #     batch_size=8,
     # )
     # batch = next(iter(loader))
-    # print(batch["frames"].shape)  # torch.Size([500, 4, 1, 64, 64])
+    # print(batch["frames"].shape)  # torch.Size([512, 8, 1, 64, 64])
     pass

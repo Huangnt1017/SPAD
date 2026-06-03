@@ -97,7 +97,7 @@ def encode_tof(
     tof: torch.Tensor,
     valid: torch.Tensor,
     n_freq: int = 8,
-    t_max: int = 150,
+    t_max: int = 128,
 ) -> torch.Tensor:
     """正弦位置编码: 将整数 tof 映射为多频率 sin/cos 特征.
 
@@ -142,7 +142,7 @@ class LearnableTofEmbedding(nn.Module):
 
     def __init__(
         self,
-        t_max: int = 150,
+        t_max: int = 128,
         embed_dim: int = 16,
         init_mode: str = "sinusoidal",
         n_freq_init: int = 8,
@@ -317,7 +317,7 @@ class SpatialRefineHead(nn.Module):
         depth_range: depth 输出最大 ToF bin
     """
 
-    def __init__(self, mid: int = 8, depth_range: float = 150.0):
+    def __init__(self, mid: int = 8, depth_range: float = 128.0):
         super().__init__()
         self.depth_range = float(depth_range)
         self.net = nn.Sequential(
@@ -456,7 +456,7 @@ class SPADSpikeNet(nn.Module):
         C: int = 32,
         chunk_size: int = 128,
         spike_mode: str = "plif",
-        t_max: int = 150,
+        t_max: int = 128,
         n_freq: int = 8,
         num_blocks: int = 3,
         encoding_mode: str = "sinusoidal",
@@ -858,7 +858,7 @@ if False and __name__ == "__main__":
                 n_params = sum(p.numel() for p in model.parameters())
 
                 # [B, H*W, P] 小尺寸输入
-                fake_data = torch.randint(0, 160, (batch_size, H * W, P), device=device).float()
+                fake_data = torch.randint(0, 140, (batch_size, H * W, P), device=device).float()
                 result = model(fake_data)
                 loss = result["output"].mean()
                 if "lut_smooth" in result:

@@ -64,7 +64,7 @@ def build_node(timestep, spike_mode="plif", tau=2.0, v_threshold=0.5):
 
 # ─── Encoding ────────────────────────────────────────────
 
-def encode_tof(tof, valid, n_freq=8, t_max=150):
+def encode_tof(tof, valid, n_freq=8, t_max=128):
     """正弦位置编码: 将整数 tof 映射为多频率 sin/cos 特征.
 
     Args:
@@ -111,7 +111,7 @@ class LearnableTofEmbedding(nn.Module):
         max_norm: embedding 最大 L2 范数约束 (None=不限)
     """
 
-    def __init__(self, t_max: int = 150, embed_dim: int = 16,
+    def __init__(self, t_max: int = 128, embed_dim: int = 16,
                  init_mode: str = "sinusoidal", n_freq_init: int = 8,
                  max_norm: float = None):
         super().__init__()
@@ -250,19 +250,51 @@ class SpikeBlock(nn.Module):
 
 
 class SpatialRefineHead(nn.Module):
-    """Lightweight CNN to smooth per-pixel gate noise. Residual: learns correction only."""
+    """置信度门控残差 CNN, 将输出约束在有效范围内。
 
-    def __init__(self, mid=8):
+    粗估 [depth, intensity] 先归一化到 [0, 1], 与置信度通道拼接后送入
+    轻量子网络得到残差; 残差按置信度缩放后加回粗估, 最终反归一化深度。
+    无置信度输入时等价于单位置信度 (全精修)。
+    """
+
+    def __init__(self, mid=8, depth_range=128.0):
         super().__init__()
+        self.depth_range = float(depth_range)
+        # 输入通道: 归一化 depth + intensity + confidence = 3
         self.net = nn.Sequential(
-            nn.Conv2d(2, mid, 3, padding=1, bias=False),
+            nn.Conv2d(3, mid, 3, padding=1, bias=False),
             nn.BatchNorm2d(mid),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid, 2, 3, padding=1, bias=False),
         )
 
-    def forward(self, x):
-        return x + self.net(x)
+    def forward(self, coarse, confidence=None):
+        """用可选置信度 [0, 1] 精修粗估的 [depth, intensity]。
+
+        Args:
+            coarse:      [B, 2, H, W] 粗估深度和强度
+            confidence:  [B, 1, H, W] or None, 置信度图
+
+        Returns:
+            [B, 2, H, W] 精修后的 depth 和 intensity
+        """
+        if confidence is None:
+            confidence = torch.ones_like(coarse[:, 0:1])
+        confidence = confidence.clamp(0.0, 1.0)
+        # 归一化到 [0, 1]: depth 除以 depth_range, intensity 直接 clamp
+        coarse_norm = torch.cat(
+            [
+                (coarse[:, 0:1] / self.depth_range).clamp(0.0, 1.0),
+                coarse[:, 1:2].clamp(0.0, 1.0),
+            ],
+            dim=1,
+        )
+        # 残差按置信度缩放: 置信度低的位置精修幅度小, 保留粗估
+        residual = self.net(torch.cat([coarse_norm, confidence], dim=1))
+        output_norm = (coarse_norm + residual * confidence).clamp(0.0, 1.0)
+        depth = output_norm[:, 0:1] * self.depth_range
+        intensity = output_norm[:, 1:2]
+        return torch.cat([depth, intensity], dim=1)
 
 
 # ─── Main Model ──────────────────────────────────────────
@@ -282,8 +314,8 @@ class SPADSpikeNet(nn.Module):
         lut_init:       LUT 初始化方式 ("sinusoidal" / "rbf" / "random")
     """
 
-    def __init__(self, C=32, chunk_size=128, spike_mode="plif",
-                 t_max=150, n_freq=8, num_blocks=3,
+    def __init__(self, C=32, chunk_size=64, spike_mode="plif",
+                 t_max=128, n_freq=8, num_blocks=3,
                  encoding_mode="sinusoidal", embed_dim=16,
                  lut_init="sinusoidal"):
         super().__init__()
@@ -323,7 +355,7 @@ class SPADSpikeNet(nn.Module):
             nn.Conv2d(C // 2, 1, 1, bias=True),
         )
 
-        self.refine = SpatialRefineHead()
+        self.refine = SpatialRefineHead(depth_range=t_max)
 
     def _forward_chunk(self, data_chunk):
         """Process one chunk: [T, B, H, W] -> gate [T, B, 1, H, W]."""
@@ -401,9 +433,11 @@ class SPADSpikeNet(nn.Module):
 
         depth = weighted_sum / (weight_sum + 1e-6)
         intensity = weight_sum / P
+        # 置信度: gate 权重之和越大表示累积证据越充分, 用 sigmoid 型饱和映射到 [0, 1]
+        confidence = (weight_sum / (weight_sum + 1.0)).clamp(0.0, 1.0)
 
         coarse = torch.cat([depth, intensity], dim=1)           # [B, 2, H, W]
-        output = self.refine(coarse)                            # [B, 2, H, W]
+        output = self.refine(coarse, confidence)                # [B, 2, H, W]
 
         functional.reset_net(self)
 
@@ -413,6 +447,7 @@ class SPADSpikeNet(nn.Module):
             "intensity": output[:, 1:2],
             "depth_coarse": depth,
             "intensity_coarse": intensity,
+            "confidence": confidence,
             "gate": torch.cat(all_gates, dim=0),
             "tof": torch.cat(all_tofs, dim=0),
             "valid": torch.cat(all_valids, dim=0),
@@ -430,8 +465,8 @@ class SPADSpikeNet(nn.Module):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    P, B, C = 500, 2, 32
-    chunk = 128
+    P, B, C = 512, 2, 32
+    chunk = 64
 
     configs = [
         {"encoding_mode": "sinusoidal"},
@@ -451,7 +486,7 @@ if __name__ == "__main__":
         n_params = sum(p.numel() for p in model.parameters())
         print(f"Parameters: {n_params:,}")
 
-        fake_data = torch.randint(0, 160, (B, 4096, P), device=device).float()
+        fake_data = torch.randint(0, 140, (B, 4096, P), device=device).float()
         result = model(fake_data)
 
         for k, v in result.items():

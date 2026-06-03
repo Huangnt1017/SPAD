@@ -20,10 +20,12 @@ from SNN_based_method.scripts.data import seed_everything
 from SNN_based_method.scripts.runtime import (
     add_config_arguments,
     append_jsonl,
+    build_run_name,
     config_from_args,
     divide_average,
     load_checkpoint,
-    make_run_dir,
+    make_checkpoint_run_dir,
+    make_log_run_dir,
     prepare_model_input,
     reduce_loss_dict,
     reset_spiking_state,
@@ -170,9 +172,13 @@ def main() -> None:
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_val_loss = float(checkpoint.get("metrics", {}).get("best_val_loss", best_val_loss))
 
-    run_dir = make_run_dir(cfg, "train")
-    log_path = run_dir / "train.jsonl"
-    cfg.save(run_dir / "config.json")
+    run_name = build_run_name(cfg, "train")
+    cfg = cfg.clone_with(run_name=run_name)
+    log_run_dir = make_log_run_dir(cfg, "train", run_name=run_name)
+    checkpoint_run_dir = make_checkpoint_run_dir(cfg, "train", run_name=run_name)
+    log_path = log_run_dir / "train.jsonl"
+    cfg.save(log_run_dir / "config.json")
+    cfg.save(checkpoint_run_dir / "config.json")
     append_jsonl(
         log_path,
         {
@@ -182,7 +188,8 @@ def main() -> None:
         },
     )
     print(cfg.summary())
-    print(f"run_dir={run_dir}")
+    print(f"log_run_dir={log_run_dir}")
+    print(f"checkpoint_run_dir={checkpoint_run_dir}")
 
     for epoch in range(start_epoch, cfg.epochs + 1):
         train_loss, train_items = train_one_epoch(
@@ -222,7 +229,7 @@ def main() -> None:
         append_jsonl(log_path, epoch_record)
 
         save_checkpoint(
-            run_dir / "last.pth",
+            checkpoint_run_dir / "last.pth",
             model=model,
             optimizer=optimizer,
             epoch=epoch,
@@ -231,7 +238,7 @@ def main() -> None:
         )
         if is_best:
             save_checkpoint(
-                run_dir / "best.pth",
+                checkpoint_run_dir / "best.pth",
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
@@ -240,7 +247,7 @@ def main() -> None:
             )
         if cfg.save_every > 0 and epoch % cfg.save_every == 0:
             save_checkpoint(
-                run_dir / f"epoch_{epoch:03d}.pth",
+                checkpoint_run_dir / f"epoch_{epoch:03d}.pth",
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,

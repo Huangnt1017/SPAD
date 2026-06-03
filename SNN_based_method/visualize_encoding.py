@@ -7,8 +7,8 @@
 4. 对比不同 ToF bin 经过编码后的频率响应和区分度。
 
 用法示例:
-    python SNN_based_method/visualize_encoding.py --data_path <txt文件路径> --n_freq 8 --t_max 150
-    python SNN_based_method/visualize_encoding.py --raw_path <raw文件路径> --pages_per_group 500 --time_threshold 150 --plot_group_num 1
+    python SNN_based_method/visualize_encoding.py --data_path <txt文件路径> --n_freq 8 --t_max 128
+    python SNN_based_method/visualize_encoding.py --raw_path <raw文件路径> --pages_per_group 512 --time_threshold 128 --plot_group_num 1
 """
 
 import argparse
@@ -134,7 +134,8 @@ def load_raw_group_from_binary(
 def parse_freqs_arg(freqs_arg: Optional[str], n_freq: int) -> List[int]:
     """Parse frequency list or preset name into a list of ints."""
     if not freqs_arg:
-        return list(range(1, n_freq + 1))
+        # 默认使用非均匀预设 B (n_freq=8 时) 或等差序列
+        return list(FREQ_PRESETS["B"]) if n_freq == 8 else list(range(1, n_freq + 1))
 
     key = freqs_arg.strip().upper()
     if key in FREQ_PRESETS:
@@ -187,6 +188,7 @@ def plot_single_frame_raw(
     frame_idx: int,
     save_dir: Optional[str],
     target_bin: int = 60,
+    t_max: int = 128,
 ):
     """可视化单帧原始 tof 热力图.
 
@@ -195,16 +197,17 @@ def plot_single_frame_raw(
         frame_idx: 帧号
         save_dir: 保存目录
         target_bin: 目标真实距离对应的 tof bin, 用于在分布图上标注
+        t_max: 最大有效 ToF bin
     """
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
 
     # 原始 tof (含 0)
-    im0 = axes[0].imshow(frame.numpy(), cmap="turbo", vmin=0, vmax=150)
+    im0 = axes[0].imshow(frame.numpy(), cmap="turbo", vmin=0, vmax=t_max)
     axes[0].set_title(f"原始 ToF (帧 #{frame_idx})")
     plt.colorbar(im0, ax=axes[0], label="bin")
 
     # 有效性 mask
-    valid = ((frame >= 1) & (frame <= 150)).float()
+    valid = ((frame >= 1) & (frame <= t_max)).float()
     axes[1].imshow(valid.numpy(), cmap="gray", vmin=0, vmax=1)
     valid_ratio = valid.mean().item() * 100
     axes[1].set_title(f"有效像素 mask ({valid_ratio:.1f}%)")
@@ -363,9 +366,13 @@ def plot_multi_frame_aggregation(
     fog_lo, fog_hi = fog_range
     target_lo, target_hi = target_bin - 5, target_bin + 5
 
-    # 选取若干快照帧数
-    checkpoints = [1, 5, 10, 50, 100, min(200, P), min(500, P), P]
-    checkpoints = sorted(set(cp for cp in checkpoints if cp <= P))
+    # 选取若干快照帧数: 按百分比覆盖早期密集采样 + 后期稀疏采样
+    percent_points = [1, 5, 10, 20, 30, 50, 75, 100]
+    checkpoints = [
+        max(1, min(P, int(round(P * percent / 100.0))))
+        for percent in percent_points
+    ]
+    checkpoints = sorted(set(checkpoints))
 
     # 累积计算 (gate=1 for valid, depth = weighted mean of tof)
     weighted_sum = torch.zeros(H, W)
@@ -386,15 +393,16 @@ def plot_multi_frame_aggregation(
 
     for p_idx in range(P):
         frame = frames[p_idx]                                   # [H, W]
-        valid = ((frame >= 1) & (frame <= t_max)).float()
+        valid_mask = (frame >= 1) & (frame <= t_max)
+        valid = valid_mask.float()
         tof = frame.float() * valid
 
         weighted_sum += tof * valid
         weight_sum += valid
 
-        # 统计光子归属
-        is_fog = ((frame >= fog_lo) & (frame <= fog_hi)).sum().item()
-        is_target = ((frame >= target_lo) & (frame <= target_hi)).sum().item()
+        # 统计光子归属 (仅在有效像素内计数)
+        is_fog = (valid_mask & (frame >= fog_lo) & (frame <= fog_hi)).sum().item()
+        is_target = (valid_mask & (frame >= target_lo) & (frame <= target_hi)).sum().item()
         is_valid = valid.sum().item()
         fog_count_running += is_fog
         target_count_running += is_target
@@ -673,12 +681,12 @@ def demo_without_cli() -> None:
     """Run a no-CLI demo with explicit parameters and keep plots open."""
     raw_path = r"E:\essay\硕士\研一\SPAD数据\0825\2025-08-25_16-50-11_Delay-0_Width-200.raw"
     pages_per_group = 2000
-    time_threshold = 150
+    time_threshold = 128
     plot_group_num = 20
     total_pages = 48000
 
     freqs = FREQ_PRESETS["C"]
-    t_max = 150
+    t_max = 128
     target_bin = 60
     frame_idx = 0
     save_dir = None
@@ -712,9 +720,9 @@ def main():
                         help="raw.txt 数据文件路径")
     parser.add_argument("--raw_path", type=str, default=None,
                         help="raw 原始文件路径 (提供后将忽略 data_path)")
-    parser.add_argument("--pages_per_group", type=int, default=500,
+    parser.add_argument("--pages_per_group", type=int, default=512,
                         help="每组页数 (用于 raw 读取)")
-    parser.add_argument("--time_threshold", type=int, default=150,
+    parser.add_argument("--time_threshold", type=int, default=128,
                         help="有效 ToF 上限 (用于 raw 读取)")
     parser.add_argument("--total_pages", type=int, default=None,
                         help="raw 读取的总页数 (默认自动对齐)")
@@ -723,7 +731,7 @@ def main():
     parser.add_argument("--n_freq", type=int, default=8, help="频率对数 (默认 8)")
     parser.add_argument("--freqs", type=str, default=None,
                         help="频率列表或预设(A/B/C/D/E), 例如 '1,2,4,6,8,12,16,24'")
-    parser.add_argument("--t_max", type=int, default=150, help="最大有效 bin (默认 150)")
+    parser.add_argument("--t_max", type=int, default=128, help="最大有效 bin (默认 128)")
     parser.add_argument("--target_bin", type=int, default=60,
                         help="目标真实距离对应的 tof bin (默认 60)")
     parser.add_argument("--frame_idx", type=int, default=0, help="用于单帧可视化的帧号")
@@ -758,7 +766,7 @@ def main():
 
     # 1. 单帧原始 tof (标注雾区 / 目标区)
     print("[1/6] 单帧原始 tof 热力图...")
-    plot_single_frame_raw(frame, frame_idx, args.save_dir, target_bin=args.target_bin)
+    plot_single_frame_raw(frame, frame_idx, args.save_dir, target_bin=args.target_bin, t_max=args.t_max)
 
     # 2. 编码后各通道
     print("[2/6] 编码后 17 通道可视化...")

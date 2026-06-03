@@ -899,7 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="graph_residual",
+		default="upp",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -964,7 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="Disable train dataset augmentation")
 	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in val/test dataset")
 	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable val/test dataset augmentation")
-	parser.set_defaults(augment_train=True, augment_eval=True, amp=True, tf32=True, spt_use_encoder=True, spt_use_moe_lif=True, auto_balance=False)
+	parser.set_defaults(augment_train=True, augment_eval=True, amp=False, tf32=False, spt_use_encoder=True, spt_use_moe_lif=True, auto_balance=False)
 	return parser
 #CUDA AMP 会在部分算子里使用半精度，通常是 FP16，比如：Conv / Linear / MatMul / 部分归一化相关算子，同时用 GradScaler 避免 FP16 梯度下溢。它的目标是加速和省显存，不保证和纯 FP32 完全一致。
 #TF32 是 NVIDIA Ampere/Ada GPU 上对 FP32 matmul/conv 的加速格式。它仍然用 FP32 存储和 FP32 输出，但乘法内部精度降低，mantissa 比标准 FP32 少。
