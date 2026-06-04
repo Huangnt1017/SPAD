@@ -579,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument(  # 模型路径
 		"--checkpoint", type=str,
-		default=r"D:\\PYproject\\SPAD\\checkpoints\\graph_residual_gcn_20260602_154755_454174_last.pth",
+		default=r"D:\\PYproject\\SPAD\\checkpoints\\CLS\\graph_residual_gcn_20260602_154755_454174_last.pth",
 		help="训练 checkpoint 路径 (须为 bbox-refactor 之后的 3 维 box_head ckpt)",
 	)
 	parser.add_argument(  # 模型名称
@@ -592,9 +592,9 @@ def build_parser() -> argparse.ArgumentParser:
 			"graph_residual", "graph_residual_gcn",   # 自研模型
 		],
 	)
-	parser.add_argument("--output-dir", type=str, default=r"D:\PYproject\SPAD\logs\test1",
+	parser.add_argument("--output-dir", type=str, default=r"D:\PYproject\SPAD\logs\CLS\test1",
 	                    help="输出图像保存目录, 文件名=<pred_class>_<ckpt_stem>_<YYYYMMDD_HHMM>.png")
-	parser.add_argument("--log-dir", type=str, default="logs")
+	parser.add_argument("--log-dir", type=str, default="logs/CLS")
 	parser.add_argument(
 		"--seed", type=int, default=None,
 		help="可选随机 seed; 默认 None = 每次都不同 (适合反复 click Run 看不同增强样本); "
@@ -623,21 +623,21 @@ if __name__ == "__main__":
 	#   $env:PYTHONPATH = "D:\PYproject\SPAD"
 	#   & "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\test1.py" `
 	#       --model dgcnn `
-	#       --checkpoint "D:\PYproject\SPAD\checkpoints\dgcnn_xxx_best.pth" `
+	#       --checkpoint "D:\PYproject\SPAD\checkpoints\CLS\dgcnn_xxx_best.pth" `
 	#       --input "D:\PYproject\SPADdata\2025-04-30-dpc\A\sample_0001.txt"
 	#
 	# 常用参数 (完整列表见 build_parser):
 	#   --input <path>       必填, 单个 .txt 点云路径 (或 .npy/.npz)
 	#   --checkpoint <path>  必填, 训练产出的 best.pth
 	#   --model <name>       与 ckpt 一致 (默认 dgcnn); choices 与 test.py 对齐
-	#   --output-dir <dir>   输出 PNG 目录 (默认 logs/test1)
+	#   --output-dir <dir>   输出 PNG 目录 (默认 logs/CLS/test1)
 	#                        文件名 = <pred_class>_<ckpt_stem>_<YYYYMMDD_HHMM>.png
 	#                        例: U_pointnet_20260522_003326_448064_best_202605220205.png
 	#   --no-augment         关闭增强 (默认开)
 	#   --seed 42            固定 seed (默认 None = 每次随机, 反复点 Run 增强结果不同)
 	#
 	# 输出:
-	#   logs/test1_<时间戳>.log                    pred class / score / pred_box / gt_box 数值
+	#   logs/CLS/test1_<时间戳>.log                pred class / score / pred_box / gt_box 数值
 	#   <output-dir>/<pred_class>_<ckpt_stem>_<YYYYMMDD_HHMM>.png
 	#                                             增强后的点云 + pred bbox(红) + gt bbox(绿) + fog bbox(灰)
 	main()

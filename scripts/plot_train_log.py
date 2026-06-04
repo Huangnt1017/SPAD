@@ -1,7 +1,7 @@
 """
 SPAD 训练日志 → 曲线图脚本。
 
-输入: scripts/train.py 输出的 ``logs/train_<model>_<timestamp>.log``。
+输入: scripts/train.py 输出的 ``logs/CLS/train_<model>_<timestamp>.log``。
 日志中每个 epoch 写两行 (与 scripts/train.py run_epoch 末尾的 logger.info 一一对应):
     ``... | Epoch [E/T] | train_loss=X train_top1=Y train_top3=Z |
                           val_loss=A val_top1=B val_top3=C``
@@ -246,7 +246,7 @@ if __name__ == "__main__":
     # 输出: curve_<model>_<timestamp>.png, 存到 log 同目录
     # ====================================================================
     log_patterns = [
-        r"D:\PYproject\SPAD\logs\train_graph_residual_20260522_050314_945951.log",
+        r"D:\PYproject\SPAD\logs\CLS\train_graph_residual_20260522_050314_945951.log",
     ]
     output_dir = ""  # 留空则存到 log 同目录; 指定路径如 r"D:\figs"
 
@@ -273,13 +273,13 @@ if __name__ == "__main__":
 
     # ====================================================================
     # 多 log 横向对比: 多个模型的 val 曲线叠到同一张图
-    # 输出: compare_<时间戳>.png, 默认存到 logs/ 目录
+    # 输出: compare_<时间戳>.png, 默认存到 logs/CLS/ 目录
     # ====================================================================
     # compare_patterns = [
-    #     r"D:\PYproject\SPAD\logs\train_pointnet_20260522_003326_448064.log",
-    #     r"D:\PYproject\SPAD\logs\train_graph_residual_20260522_050314_945951.log",
+    #     r"D:\PYproject\SPAD\logs\CLS\train_pointnet_20260522_003326_448064.log",
+    #     r"D:\PYproject\SPAD\logs\CLS\train_graph_residual_20260522_050314_945951.log",
     # ]
-    # compare_output_dir = ""  # 留空存到 logs/; 指定路径如 r"D:\figs"
+    # compare_output_dir = ""  # 留空存到 logs/CLS/; 指定路径如 r"D:\figs"
     # compare_split = "val"    # "val" 或 "train"
     #
     # compare_logs = _expand_logs(compare_patterns)
@@ -287,7 +287,7 @@ if __name__ == "__main__":
     #     compare_parsed = [parse_log(p) for p in compare_logs]
     #     compare_parsed = [d for d in compare_parsed if d["epochs"]]
     #     if compare_parsed:
-    #         cmp_dir = Path(compare_output_dir).resolve() if compare_output_dir else Path("logs").resolve()
+    #         cmp_dir = Path(compare_output_dir).resolve() if compare_output_dir else Path("logs/CLS").resolve()
     #         cmp_path = cmp_dir / f"compare_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
     #         plot_compare(compare_parsed, cmp_path, split=compare_split)
     #         logger.info("Saved comparison plot to %s", cmp_path)

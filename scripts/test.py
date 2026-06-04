@@ -719,7 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
 	# 测试参数主要控制 checkpoint、数据源、batch 大小以及是否对 eval 集做增强。
 	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification evaluation")
 	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
-	parser.add_argument("--checkpoint", type=str, default=r"D:\PYproject\SPAD\checkpoints\dgcnn_20260426_183404_669391_best.pth", help="Path to trained checkpoint")
+	parser.add_argument("--checkpoint", type=str, default=r"D:\PYproject\SPAD\checkpoints\CLS\dgcnn_20260426_183404_669391_best.pth", help="Path to trained checkpoint")
 	parser.add_argument(
 		"--model",
 		type=str,
@@ -742,8 +742,8 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in eval dataset")
 	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable eval dataset augmentation")
 	parser.add_argument("--device", type=str, default="cuda", help="auto/cpu/cuda")
-	parser.add_argument("--log-dir", type=str, default="logs")
-	parser.add_argument("--output-dir", type=str, default="logs")
+	parser.add_argument("--log-dir", type=str, default="logs/CLS")
+	parser.add_argument("--output-dir", type=str, default="logs/CLS")
 	parser.add_argument("--box-space", type=str, default="absolute", choices=["absolute", "normalized"], help="How to interpret box head outputs")
 	# 混淆矩阵默认归一化输出 (每行求和=1, 颜色直接反映 recall 强弱); 用 --no-normalize-cm 关闭。
 	# 与 --augment-eval / --no-augment-eval 同款双 dest 模式, 与 train.py 风格保持一致。

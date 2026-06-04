@@ -45,8 +45,8 @@ class AutoTrainConfig:
     poll_seconds: int = 30
     python_exe: Path = Path(sys.executable)
     data_root: Optional[Path] = None
-    log_dir: Path = PROJECT_ROOT / "logs"
-    save_dir: Path = PROJECT_ROOT / "checkpoints"
+    log_dir: Path = PROJECT_ROOT / "logs" / "CLS"
+    save_dir: Path = PROJECT_ROOT / "checkpoints" / "CLS"
     state_file: Path = STATE_FILE
     monitor_log: Path = MONITOR_LOG
     dry_run: bool = False
@@ -215,8 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=int, default=30, help="Seconds between process checks.")
     parser.add_argument("--python-exe", type=Path, default=Path(sys.executable), help="Python executable for training.")
     parser.add_argument("--data-root", type=Path, default=None, help="Optional data root override.")
-    parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "logs", help="Training log directory.")
-    parser.add_argument("--save-dir", type=Path, default=PROJECT_ROOT / "checkpoints", help="Checkpoint directory.")
+    parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "logs" / "CLS", help="Training log directory.")
+    parser.add_argument("--save-dir", type=Path, default=PROJECT_ROOT / "checkpoints" / "CLS", help="Checkpoint directory.")
     parser.add_argument("--state-file", type=Path, default=STATE_FILE, help="Monitor state JSON path.")
     parser.add_argument("--dry-run", action="store_true", help="Print the queue without launching training.")
     return parser
@@ -266,8 +266,8 @@ def main_without_cli() -> None:
         poll_seconds=30,
         python_exe=Path(sys.executable),
         data_root=None,
-        log_dir=PROJECT_ROOT / "logs",
-        save_dir=PROJECT_ROOT / "checkpoints",
+        log_dir=PROJECT_ROOT / "logs" / "CLS",
+        save_dir=PROJECT_ROOT / "checkpoints" / "CLS",
         state_file=STATE_FILE,
         monitor_log=MONITOR_LOG,
         dry_run=False,

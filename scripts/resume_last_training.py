@@ -10,7 +10,7 @@ CLI 运行示例（PowerShell）:
     # 只检查将要恢复的日志与 checkpoint，不真正启动训练。
     python scripts/resume_last_training.py --dry-run
 
-    # 恢复 SPT 最近一次未完成训练。
+    # 恢复分类 SPT 最近一次未完成训练。
     python scripts/resume_last_training.py --model spt
 
     # 恢复 SPT，并把目标总 epoch 覆盖为 150。
@@ -32,9 +32,9 @@ CLI 运行示例（PowerShell）:
     --model:
         可选。限制只恢复某个模型；默认恢复 ``spt``，如需恢复其它模型再显式指定。
     --log-dir:
-        训练日志目录。支持绝对路径或相对项目根目录的路径，默认 ``logs``。
+        训练日志目录。支持绝对路径或相对项目根目录的路径，默认 ``logs/CLS``。
     --save-dir:
-        checkpoint 目录。支持绝对路径或相对项目根目录的路径，默认 ``checkpoints``。
+        checkpoint 目录。支持绝对路径或相对项目根目录的路径，默认 ``checkpoints/CLS``。
     --epochs:
         可选。覆盖恢复后的目标总 epoch；不提供时使用 checkpoint 中保存的训练参数。
         真正启动训练时，目标 epoch 必须大于 checkpoint epoch。
@@ -48,8 +48,8 @@ CLI 运行示例（PowerShell）:
         和数据目录，不启动训练。
 
 输入输出约定:
-    输入日志形如 ``logs/train_<model>_<timestamp>.log``。
-    输入 checkpoint 形如 ``checkpoints/<model>_<timestamp>_last.pth``。
+    输入日志形如 ``logs/CLS/train_<model>_<timestamp>.log``。
+    输入 checkpoint 形如 ``checkpoints/CLS/<model>_<timestamp>_last.pth``。
     接续训练只使用 ``_last.pth``，不从 ``_best.pth`` 兜底恢复。
     输出由 ``scripts.train.run_training`` 生成；恢复时追加写入原日志，并沿用原
     timestamp 覆盖/刷新同一组 ``_best.pth`` / ``_last.pth`` checkpoint。
@@ -93,8 +93,8 @@ class ScriptConfig:
     """CLI 与非 CLI 共享的恢复配置。"""
 
     model: Optional[str] = "spt"
-    log_dir: Path = Path("logs")
-    save_dir: Path = Path("checkpoints")
+    log_dir: Path = Path("logs/CLS")
+    save_dir: Path = Path("checkpoints/CLS")
     epochs: Optional[int] = None
     batch_size: Optional[int] = None
     include_finished: bool = False
@@ -340,14 +340,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("logs"),
-        help="Training log directory, absolute or relative to the project root. Default: logs.",
+        default=Path("logs/CLS"),
+        help="Training log directory, absolute or relative to the project root. Default: logs/CLS.",
     )
     parser.add_argument(
         "--save-dir",
         type=Path,
-        default=Path("checkpoints"),
-        help="Checkpoint directory, absolute or relative to the project root. Default: checkpoints.",
+        default=Path("checkpoints/CLS"),
+        help="Checkpoint directory, absolute or relative to the project root. Default: checkpoints/CLS.",
     )
     parser.add_argument(
         "--epochs",
@@ -413,8 +413,8 @@ def run_with_config(config: ScriptConfig) -> Optional[dict[str, str]]:
 
 def resume_latest_training(
     model: str = "spt",
-    log_dir: str | Path = "logs",
-    save_dir: str | Path = "checkpoints",
+    log_dir: str | Path = "logs/CLS",
+    save_dir: str | Path = "checkpoints/CLS",
     epochs: Optional[int] = None,
     batch_size: Optional[int] = None,
     include_finished: bool = False,
@@ -477,8 +477,8 @@ def main_without_cli() -> None:
     # ===== 可编辑参数区 =====
     # model_name="spt" 表示恢复 SPT；改成 None 可扫描所有模型。
     model_name: Optional[str] = "spt"
-    log_dir = Path("logs")
-    save_dir = Path("checkpoints")
+    log_dir = Path("logs/CLS")
+    save_dir = Path("checkpoints/CLS")
     target_epochs: Optional[int] = 100
     batch_size: Optional[int] = None
     include_finished = True
@@ -517,8 +517,8 @@ if __name__ == "__main__":
     # 接续cli：& "D:\Anaconda3\envs\torchnew\python.exe" "D:\PYproject\SPAD\scripts\resume_last_training.py" --model spt
     # 常用参数:
     #   --model <name>          只恢复指定模型；默认 spt。
-    #   --log-dir logs          训练日志目录，支持相对项目根目录或绝对路径。
-    #   --save-dir checkpoints  checkpoint 目录，只查找 *_last.pth。
+    #   --log-dir logs/CLS          训练日志目录，支持相对项目根目录或绝对路径。
+    #   --save-dir checkpoints/CLS  checkpoint 目录，只查找 *_last.pth。
     #   --epochs 150            覆盖目标总 epoch，必须大于 checkpoint epoch。
     #   --batch-size 16         覆盖 batch size，不填则沿用 checkpoint 中保存的值。
     #   --include-finished      允许选择日志已达到目标 epoch 的训练。
@@ -530,9 +530,9 @@ if __name__ == "__main__":
     #       目标 epoch、batch size、data root、best_val_score 和 best_val_top1。
     #   真正训练:
     #       复用 scripts.train.run_training，追加写入原
-    #       logs/train_<model>_<timestamp>.log，并刷新同 timestamp 的
-    #       checkpoints/<model>_<timestamp>_best.pth 和
-    #       checkpoints/<model>_<timestamp>_last.pth。
+    #       logs/CLS/train_<model>_<timestamp>.log，并刷新同 timestamp 的
+    #       checkpoints/CLS/<model>_<timestamp>_best.pth 和
+    #       checkpoints/CLS/<model>_<timestamp>_last.pth。
     if len(sys.argv) > 1:
         raise SystemExit(main())
     main_without_cli()

@@ -20,17 +20,17 @@ $python = "D:\anaconda3\envs\torchnew\python.exe"
 & $python scripts/train.py --model graph_residual_gcn --batch-size 32 --epochs 100
 
 # 从 checkpoint 继续训练
-& $python scripts/train.py --model dgcnn --resume checkpoints/dgcnn_last.pth
+& $python scripts/train.py --model dgcnn --resume checkpoints/CLS/dgcnn_last.pth
 ```
 
 ### Testing / Evaluation
 
 ```powershell
 # 测试集评估 (分类 + 3D Box AP)
-& $python scripts/test.py --checkpoint checkpoints/dgcnn_best.pth
+& $python scripts/test.py --checkpoint checkpoints/CLS/dgcnn_best.pth
 
 # 单样本推理 + 可视化
-& $python scripts/test1.py --checkpoint checkpoints/dgcnn_best.pth
+& $python scripts/test1.py --checkpoint checkpoints/CLS/dgcnn_best.pth
 ```
 
 ### Available Models
@@ -71,7 +71,8 @@ SPAD/
 │   ├── checkpoint.py  # checkpoint 保存/加载
 │   └── transformer_blocks.py  # ViT 原语集中定义
 ├── SNN_based_method/  # 脉冲神经网络变体 (独立子项目)
-└── checkpoints/       # 训练输出
+├── logs/              # 训练/测试日志输出，按 CLS/SNN 分组
+└── checkpoints/       # checkpoint 输出，按 CLS/SNN 分组
 ```
 
 ---

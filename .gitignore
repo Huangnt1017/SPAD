@@ -10,23 +10,25 @@ __pycache__/
 .idea/
 .vscode/
 
-# Checkpoints (太大)
-checkpoints/*.pth
-checkpoints/*.json
-checkpoints/SNN/
-# 日志
-logs/*.log
-logs/*.png
-logs/*.json
-logs/test1/
-logs/SNN
-
-*.csv
+# 训练/测试产物
+logs/
+checkpoints/
 *.log
+*.pth
+*.pt
+*.ckpt
+*.json
+*.png
+*.jpg
+*.jpeg
+*.npy
+*.npz
+
+# 数据与压缩包
+*.csv
 *.zip
 *.tar.gz
 *.doc
 
 # 项目说明
 .understand-anything/
-.understand-anything/*.json

@@ -14,8 +14,8 @@ Parameter notes:
 
 Input/output contract:
     输入数据目录沿用 utils.data 的 SPAD 多任务数据格式；每个样本输出点云 (N,4) 与单目标 bbox。
-    输出包含 logs/train_<model>_<timestamp>_foldXX.log、每折 checkpoint，以及
-    logs/kfold_<model>_<timestamp>_summary.json。
+    输出包含 logs/CLS/train_<model>_<timestamp>_foldXX.log、每折 checkpoint，以及
+    logs/CLS/kfold_<model>_<timestamp>_summary.json。
 """
 
 from __future__ import annotations
@@ -652,10 +652,10 @@ if __name__ == "__main__":
     #   --box-loss-weight 10.0    默认复用 train.py 的 box/depth 加权配置。
     #
     # Outputs:
-    #   logs/train_<model>_<timestamp>_foldXX.log
-    #   checkpoints/<model>_<timestamp>_foldXX_best.pth
-    #   checkpoints/<model>_<timestamp>_foldXX_last.pth
-    #   logs/kfold_<model>_<timestamp>_summary.json
+    #   logs/CLS/train_<model>_<timestamp>_foldXX.log
+    #   checkpoints/CLS/<model>_<timestamp>_foldXX_best.pth
+    #   checkpoints/CLS/<model>_<timestamp>_foldXX_last.pth
+    #   logs/CLS/kfold_<model>_<timestamp>_summary.json
     if len(sys.argv) > 1:
         raise SystemExit(main())
     main_without_cli()

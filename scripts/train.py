@@ -935,8 +935,8 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--num-workers", type=int, default=0)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--device", type=str, default="cuda", help="auto/cpu/cuda")
-	parser.add_argument("--log-dir", type=str, default="logs")
-	parser.add_argument("--save-dir", type=str, default="checkpoints")
+	parser.add_argument("--log-dir", type=str, default="logs/CLS")
+	parser.add_argument("--save-dir", type=str, default="checkpoints/CLS")
 	parser.add_argument("--resume", type=str, default="", help="checkpoint path to resume")
 	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="Label source mode")
 	parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="Classification loss weight when auto-balance is disabled")
@@ -1000,7 +1000,7 @@ if __name__ == "__main__":
 	#   --num-workers 0         DataLoader worker 数 (>0 时自动启用 persistent_workers)
 	#
 	# 输出:
-	#   logs/train_<model>_<timestamp>.log     每 epoch 两行: 分类 + box 指标
-	#   checkpoints/<model>_<timestamp>_best.pth  val 最优 ckpt
-	#   checkpoints/<model>_<timestamp>_last.pth  最后一个 epoch ckpt
+	#   logs/CLS/train_<model>_<timestamp>.log     每 epoch 两行: 分类 + box 指标
+	#   checkpoints/CLS/<model>_<timestamp>_best.pth  val 最优 ckpt
+	#   checkpoints/CLS/<model>_<timestamp>_last.pth  最后一个 epoch ckpt
 	main()

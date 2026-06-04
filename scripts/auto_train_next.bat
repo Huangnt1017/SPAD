@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-set "LOG_FILE=D:\PYproject\SPAD\logs\train_pointtransv2_20260528_005554_877505.log"
+set "LOG_FILE=D:\PYproject\SPAD\logs\CLS\train_pointtransv2_20260528_005554_877505.log"
 set "PYTHON=D:\anaconda3\envs\pytorch\python.exe"
 set "TRAIN_PY=D:\PYproject\SPAD\scripts\train.py"
 set "PYTHONPATH=D:\PYproject\SPAD"

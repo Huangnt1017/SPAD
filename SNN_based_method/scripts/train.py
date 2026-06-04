@@ -672,3 +672,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# 接续训练命令示例:
+# & D:/Anaconda3/envs/torchnew/python.exe d:/PYproject/SPAD/SNN_based_method/scripts/train.py --resume-run-dir d:/PYproject/SPAD/checkpoints/SNN/train_20260604_113734
