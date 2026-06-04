@@ -3,6 +3,10 @@ import numpy as np
 import json
 from typing import Tuple, List, Dict, Optional
 
+
+AUGMENT_SEED_STRIDE = 1_000_003
+"""不同增强副本之间的随机种子步长，选用大素数降低重复采样概率。"""
+
 def load_xyzi(file_path: str) -> np.ndarray:
     """Read xyzi txt as numpy array (Utility)"""
     try:
@@ -20,15 +24,43 @@ def save_xyzi(data: np.ndarray, save_path: str):
 
 
 def _randint_inclusive(low: int, high: int, generator: Optional[torch.Generator] = None) -> int:
-    """Sample an integer from [low, high] with an optional deterministic generator."""
+    """从闭区间 [low, high] 采样整数，可传入确定性随机生成器。"""
     if low > high:
         raise ValueError(f"Invalid randint range: [{low}, {high}]")
     return int(torch.randint(low, high + 1, (1,), generator=generator).item())
+
+
+def resolve_num_aug(num_aug: int, apply_augment: bool = True) -> int:
+    """规范化单个样本的增强副本数。
+
+    Args:
+        num_aug: 启用增强时，每个原始样本生成的增强样本份数。
+        apply_augment: 当前数据集是否启用增强；关闭增强时固定返回 1。
+
+    Returns:
+        Dataset 索引展开时使用的有效副本数。
+
+    Raises:
+        ValueError: 启用增强但 num_aug 不是正整数。
+    """
+    if not apply_augment:
+        return 1
+
+    try:
+        value = int(num_aug)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"num_aug must be a positive integer when augmentation is enabled, got: {num_aug}") from exc
+
+    if value <= 0:
+        raise ValueError(f"num_aug must be positive when augmentation is enabled, got: {num_aug}")
+    return value
+
 
 def augment_pytorch_batch(
     points: torch.Tensor,
     label_class: Optional[str] = None,
     seed: Optional[int] = None,
+    num_aug: int = 1,
 ) -> Tuple[torch.Tensor, Optional[List[Dict]]]:
     """
     Batch augmentation for SPAD point clouds.
@@ -45,16 +77,34 @@ def augment_pytorch_batch(
 
     Args:
         points: Input point clouds (B, N, 4).
-        label_class: Class name string. If None, metadata is not returned.
+        label_class: 类别名称，仅写入增强元信息。
         seed: Optional base seed. If provided, each sample i uses (seed + i),
               which guarantees deterministic augmentation across runs.
+        num_aug: 每个输入样本生成的增强副本数。
 
     Returns:
-        augmented_points: (B, N, 4) Tensor.
-        metadata: List of dicts (if label_class provided) else None.
+        augmented_points: (B * num_aug, N, 4) 张量。
+        metadata: 与 augmented_points 对齐的元信息列表。
     """
     if points.ndim != 3 or points.shape[-1] < 4:
         raise ValueError(f"points shape must be (B, N, >=4), got {tuple(points.shape)}")
+
+    effective_num_aug = resolve_num_aug(num_aug, apply_augment=True)
+    if effective_num_aug > 1:
+        aug_batches: List[torch.Tensor] = []
+        meta_batches: List[Dict] = []
+        for aug_index in range(effective_num_aug):
+            aug_seed = None if seed is None else int(seed) + aug_index * AUGMENT_SEED_STRIDE
+            aug_points, aug_meta = augment_pytorch_batch(
+                points,
+                label_class=label_class,
+                seed=aug_seed,
+                num_aug=1,
+            )
+            aug_batches.append(aug_points)
+            if aug_meta is not None:
+                meta_batches.extend(aug_meta)
+        return torch.cat(aug_batches, dim=0), meta_batches
 
     device = points.device
     B, N, _ = points.shape

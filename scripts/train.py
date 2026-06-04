@@ -689,6 +689,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		seed=args.seed,
 		augment_train=args.augment_train,
 		augment_eval=args.augment_eval,
+		num_aug=args.num_aug,
 		label_mode=args.label_mode,
 	)
 
@@ -722,7 +723,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("num_classes=%d", num_classes)
 	logger.info("split train/val/test = %d / %d / %d", len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset))
 	logger.info("label_mode=%s", args.label_mode)
-	logger.info("augment_train=%s augment_eval=%s", args.augment_train, args.augment_eval)
+	logger.info("augment_train=%s augment_eval=%s num_aug=%d", args.augment_train, args.augment_eval, args.num_aug)
 	logger.info("amp=%s tf32=%s", use_amp, args.tf32)
 	logger.info("loss_auto_balance=%s", args.auto_balance)
 	logger.info(
@@ -923,6 +924,7 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument("--epochs", type=int, default=100)
 	parser.add_argument("--batch-size", type=int, default=32)
+	parser.add_argument("--num-aug", type=int, default=5, help="Number of augmented copies generated per original train sample when augmentation is enabled")
 	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
 	parser.add_argument("--lr", type=float, default=1e-3)
 	parser.add_argument("--min-lr", type=float, default=1e-5)
@@ -991,6 +993,7 @@ if __name__ == "__main__":
 	#   --lr 1e-3 --min-lr 1e-5 余弦退火上下界
 	#   --weight-decay 1e-4     AdamW 权重衰减
 	#   --label-mode raw        raw=用文件夹/文件名标签; generated=用增强生成的标签
+	#   --num-aug 1             每个训练原始样本生成的增强样本份数；3 表示训练集扩为 3 倍
 	#   --amp / --no-amp        CUDA 混合精度 (默认开)
 	#   --tf32 / --no-tf32      Ampere/Ada GPU TF32 加速 (默认开)
 	#   --augment-eval          验证/测试时开启增强 (默认关)

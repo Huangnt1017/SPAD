@@ -81,8 +81,8 @@ class SNNConfig:
     augment_train: bool = True
     """是否在训练集启用 raw group 级数据增强。"""
 
-    num_aug: int = 1
-    """每个训练样本额外生成的增强样本份数。"""
+    num_aug: int = 2
+    """每个训练样本额外生成的增强样本份数，仅训练集。"""
 
     keep_original_sample: bool = False
     """训练增强展开时是否保留 ``aug_index=0`` 的原始样本。"""
@@ -90,13 +90,13 @@ class SNNConfig:
     tof_shift_max: int = 20
     """训练增强的最大整数 ToF 偏移; 增强后小于 1 或大于 time_threshold 的值置 0。"""
 
-    tof_shift_prob: float = 1.0
+    tof_shift_prob: float = 0.9
     """训练增强中每个样本执行 ToF 偏移的概率。"""
 
     page_dropout: bool = False
     """训练增强中是否随机丢弃整页 raw page。"""
 
-    page_dropout_prob: float = 0.1
+    page_dropout_prob: float = 0
     """PageDropout 中每页被置 0 的概率。"""
 
     active_point: int = 1
@@ -113,7 +113,7 @@ class SNNConfig:
 
     # ---- Dataloader ----
     batch_size: int = 8
-    num_workers: int = 6
+    num_workers: int = 8
     pin_memory: Optional[bool] = None
     persistent_workers: bool = True
     """num_workers > 0 时保持 DataLoader worker 常驻, 减少 epoch 间空窗。"""

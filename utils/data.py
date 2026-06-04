@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Tuple, Optional
 import random
 from pathlib import Path
-from utils.data_augment import augment_pytorch_batch
+from utils.data_augment import AUGMENT_SEED_STRIDE, augment_pytorch_batch, resolve_num_aug
 
 """
 数据处理相关工具函数和数据集类
@@ -425,6 +425,7 @@ class SPADMultiTaskDataset(Dataset):
         num_points: Optional[int] = None,
         seed: int = SEED,
         apply_augment: bool = True,
+        num_aug: int = 1,
         label_mode: str = "generated",
     ):
         """
@@ -434,6 +435,7 @@ class SPADMultiTaskDataset(Dataset):
             num_points: 固定点数（采样或补齐）。
             seed: 数据增强与采样的随机种子。
             apply_augment: 是否应用增强。
+            num_aug: 启用增强时，每个原始样本展开出的增强样本份数。
             label_mode: "raw" 或 "generated"。
 
         Raises:
@@ -444,13 +446,14 @@ class SPADMultiTaskDataset(Dataset):
         self.num_points = num_points
         self.seed = int(seed)
         self.apply_augment = apply_augment
+        self.num_aug = resolve_num_aug(num_aug, apply_augment=apply_augment)
         self.label_mode = label_mode
 
         if self.label_mode not in {"generated", "raw"}:
             raise ValueError(f"label_mode must be 'generated' or 'raw', got: {self.label_mode}")
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.samples) * self.num_aug
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -461,10 +464,25 @@ class SPADMultiTaskDataset(Dataset):
             points_tensor: 点云张量，形状为 (N, 4)。
             label_tensor: 目标标签张量，形状为 (M, 7)。
         """
-        sample = self.samples[idx]
+        dataset_len = len(self)
+        if idx < 0:
+            idx += dataset_len
+        if idx < 0 or idx >= dataset_len:
+            raise IndexError(f"Dataset index out of range: {idx}")
+
+        if self.apply_augment:
+            sample_idx = idx // self.num_aug
+            aug_index = idx % self.num_aug
+        else:
+            sample_idx = idx
+            aug_index = 0
+
+        sample = self.samples[sample_idx]
         points = load_point_cloud_auto(str(sample["path"]))
 
-        sample_seed = self.seed + idx * 9973
+        # 同一原始样本的多个增强副本保持相同点采样，只改变增强随机种子。
+        sample_seed = self.seed + sample_idx * 9973
+        augment_seed = sample_seed + aug_index * AUGMENT_SEED_STRIDE
 
         if self.num_points is not None and self.num_points > 0:
             target_n = int(self.num_points)
@@ -493,7 +511,12 @@ class SPADMultiTaskDataset(Dataset):
         if self.apply_augment:
             # augment_pytorch_batch 需要输入形状 (B, N, 4)
             points_tensor = torch.from_numpy(points).unsqueeze(0)
-            aug_points, aug_meta_list = augment_pytorch_batch(points_tensor, label_class=raw_label_name, seed=sample_seed)
+            aug_points, aug_meta_list = augment_pytorch_batch(
+                points_tensor,
+                label_class=raw_label_name,
+                seed=augment_seed,
+                num_aug=1,
+            )
             points = aug_points.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
             aug_meta = aug_meta_list[0] if aug_meta_list is not None else {}
         else:
@@ -569,6 +592,7 @@ def create_dataloaders(
     seed: int = SEED,
     augment_train: bool = True,
     augment_eval: bool = True,
+    num_aug: int = 1,
     label_mode: str = "raw",
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
     """
@@ -577,6 +601,7 @@ def create_dataloaders(
     标签规则：
     - 默认 label_mode='raw'，使用样本父目录名称作为类别标签。
     - label_mode='generated' 时，使用增强后目标位置映射得到 A-Z 标签（仅当类映射包含该标签时有效）。
+    - num_aug 仅展开训练集；验证/测试集即使启用增强也只保留单个增强视图，避免评估样本数随训练设置变化。
 
     Raises:
         ValueError: 训练集禁用增强或样本数量不足。
@@ -650,12 +675,15 @@ def create_dataloaders(
     if not augment_train:
         raise ValueError("Training data must use augmentation; set augment_train=True.")
 
+    train_num_aug = resolve_num_aug(num_aug, apply_augment=True)
+
     train_dataset = SPADMultiTaskDataset(
         train_samples,
         class_to_idx,
         num_points=num_points,
         seed=seed + 11,
         apply_augment=True,
+        num_aug=train_num_aug,
         label_mode=label_mode,
     )
     val_dataset = SPADMultiTaskDataset(
@@ -664,6 +692,7 @@ def create_dataloaders(
         num_points=num_points,
         seed=seed + 29,
         apply_augment=augment_eval,
+        num_aug=1,
         label_mode=label_mode,
     )
     test_dataset = SPADMultiTaskDataset(
@@ -672,6 +701,7 @@ def create_dataloaders(
         num_points=num_points,
         seed=seed + 47,
         apply_augment=augment_eval,
+        num_aug=1,
         label_mode=label_mode,
     )
 

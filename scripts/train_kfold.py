@@ -162,6 +162,7 @@ def build_loader(
     args: argparse.Namespace,
     seed: int,
     apply_augment: bool,
+    num_aug: int,
     shuffle: bool,
 ) -> DataLoader:
     """从显式样本列表构建 DataLoader，避免复用普通训练的 split cache。"""
@@ -171,6 +172,7 @@ def build_loader(
         num_points=args.num_points,
         seed=seed,
         apply_augment=apply_augment,
+        num_aug=num_aug,
         label_mode=args.label_mode,
     )
 
@@ -259,6 +261,7 @@ def train_one_fold(
             args=args,
             seed=fold_seed + 11,
             apply_augment=True,
+            num_aug=args.num_aug,
             shuffle=True,
         )
         val_loader = build_loader(
@@ -267,6 +270,7 @@ def train_one_fold(
             args=args,
             seed=fold_seed + 29,
             apply_augment=args.augment_eval,
+            num_aug=1,
             shuffle=False,
         )
 
@@ -308,7 +312,7 @@ def train_one_fold(
         logger.info("num_classes=%d", num_classes)
         logger.info("split train/val = %d / %d", len(train_loader.dataset), len(val_loader.dataset))
         logger.info("label_mode=%s", args.label_mode)
-        logger.info("augment_train=%s augment_eval=%s", True, args.augment_eval)
+        logger.info("augment_train=%s augment_eval=%s num_aug=%d", True, args.augment_eval, args.num_aug)
         logger.info("amp=%s tf32=%s", use_amp, args.tf32)
         logger.info("loss_auto_balance=%s", args.auto_balance)
         logger.info(

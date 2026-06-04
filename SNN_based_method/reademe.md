@@ -14,6 +14,8 @@ SNN_based_method/
     train.py            训练入口
     test.py             批量测试入口
     test1.py            单 raw group 推理入口
+    generate_precomputed_labels.py
+                        预生成类别级 label 池
     data.py             raw/csv 数据集与 DataLoader
     augment.py          raw group 级数据增强
     runtime.py          CLI、日志、checkpoint、公用运行时工具
@@ -46,6 +48,15 @@ D:\PYproject\SPADdata\0917\917group.csv
 
 CSV 需要包含 `file_path` 列。训练脚本在无 `--data-paths` 参数时自动使用 0825/0826；测试脚本在未显式指定测试路径时自动切到 0917。
 
+CSV 若用于预生成 label，还需要包含：
+
+```text
+fog_level
+target_class
+```
+
+`fog_level=0` 的 raw 被视为 clean label 来源，`target_class` 用于把同类样本映射到同一个 label 池。
+
 ## 3. 输出位置
 
 训练日志：
@@ -72,6 +83,15 @@ D:\PYproject\SPAD\logs\SNN\test_YYYYMMDD_HHMMSS\
   summary.json
   predictions\*.npy    # 仅 --save-predictions 时生成
 ```
+
+预生成 label 池：
+
+```text
+D:\PYproject\SPADdata\0825\label\128\A\A_0.npy ... A_4.npy
+D:\PYproject\SPADdata\0826\label\128\A\A_0.npy ... A_4.npy
+```
+
+其中 `128` 是当前 `pages_per_group`。如果训练改成 `--pages-per-group 64`，会检查或生成 `label\64\...`，不会混用不同 P 的 label。
 
 训练日志只输出一个 `.log` 文件。开头记录主要配置，之后每个 epoch 输出：
 
@@ -254,14 +274,20 @@ functional.reset_net(self)
 
 ## 7. 推荐训练命令
 
-直接使用默认 0825/0826 训练：
+直接点击或无参数运行 `train.py` 即可使用默认 0825/0826 训练数据。训练开始前会自动检查当前 `pages_per_group` 对应的 label 池，缺失时先生成，完整存在时直接训练：
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py
+```
+
+显式指定常用训练参数：
 
 ```powershell
 D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py `
   --pages-per-group 128 `
-  --batch-size 4 `
+  --batch-size 8 `
   --grad-accum-steps 8 `
-  --num-workers 6 `
+  --num-workers 8 `
   --persistent-workers `
   --prefetch-factor 4 `
   --raw-load-mode group `
@@ -273,23 +299,34 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
   --spike-backend auto
 ```
 
-显式指定训练路径：
+显式指定训练路径和 CSV：
 
 ```powershell
 D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py `
   --data-paths D:\PYproject\SPADdata\0825 D:\PYproject\SPADdata\0826 `
   --csv-paths D:\PYproject\SPADdata\0825\0825-group.csv D:\PYproject\SPADdata\0826\0826-group.csv `
   --pages-per-group 128 `
-  --batch-size 4 `
+  --batch-size 8 `
   --grad-accum-steps 8
 ```
 
-从 checkpoint 继续训练：
+从训练 run 文件夹继续训练，自动读取其中的 `last.pth` 和 `config.json`：
 
 ```powershell
 D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py `
-  --checkpoint D:\PYproject\SPAD\checkpoints\SNN\train_YYYYMMDD_HHMMSS\last.pth
+  --resume-run-dir D:\PYproject\SPAD\checkpoints\SNN\train_YYYYMMDD_HHMMSS `
+  --epochs 40
 ```
+
+也可以直接指定 checkpoint：
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py `
+  --checkpoint D:\PYproject\SPAD\checkpoints\SNN\train_YYYYMMDD_HHMMSS\last.pth `
+  --epochs 40
+```
+
+续训时 `--epochs` 表示总目标 epoch，不是额外训练多少轮。例如 checkpoint 已保存到 epoch 20，若要继续训练 20 轮，应设置 `--epochs 40`。
 
 如需定位 DataLoader 或 GPU 等待点：
 
@@ -297,7 +334,56 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py --trace-steps 5
 ```
 
-## 8. 测试命令
+## 8. 预生成 label 池
+
+默认训练启用 `use_precomputed_labels=True`。训练脚本会在构建 DataLoader 前检查 label 池：
+
+```text
+<dataset>\label\<pages_per_group>\<class>\<class>_0.npy
+...
+<dataset>\label\<pages_per_group>\<class>\<class>_4.npy
+```
+
+当前规则：
+
+```text
+1. 只使用 CSV 中 fog_level=0 的 raw 作为 label 来源。
+2. 每个数据集、每个 target_class 只取一个 clean raw。
+3. 每个 class 只取该 clean raw 的最后 5 个完整 group。
+4. 每个 label 保存为 float32, shape=(2,64,64)。
+5. 训练时同一 target_class 的样本随机抽取这 5 个 label 之一。
+6. 若训练增强做 ToF shift，预生成 label 的 depth 通道会同步平移。
+```
+
+通道约定：
+
+```text
+label[0] = depth, 单位 ToF bin
+label[1] = intensity, 范围 [0,1]
+```
+
+手动 dry-run 查看将生成哪些 label，不写文件：
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\generate_precomputed_labels.py `
+  --data-paths D:\PYproject\SPADdata\0825 D:\PYproject\SPADdata\0826 `
+  --csv-paths D:\PYproject\SPADdata\0825\0825-group.csv D:\PYproject\SPADdata\0826\0826-group.csv `
+  --pages-per-group 128 `
+  --dry-run
+```
+
+手动生成 label：
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\generate_precomputed_labels.py `
+  --data-paths D:\PYproject\SPADdata\0825 D:\PYproject\SPADdata\0826 `
+  --csv-paths D:\PYproject\SPADdata\0825\0825-group.csv D:\PYproject\SPADdata\0826\0826-group.csv `
+  --pages-per-group 128
+```
+
+无参数运行 `generate_precomputed_labels.py` 默认是 dry-run，避免误写数据。实际训练不需要手动先运行这个脚本；`train.py` 会自动检查和生成。
+
+## 9. 测试命令
 
 批量测试默认使用 0917：
 
@@ -324,7 +410,23 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
   --save-prediction
 ```
 
-## 9. 关键配置
+使用 `--save-prediction` 时，`test1.py` 会保存模型输出和 `visualize_encoding.py` 中最大值法 baseline 的图片对比：
+
+```text
+D:\PYproject\SPAD\logs\SNN\test1_YYYYMMDD_HHMMSS\
+  config.json
+  summary.json
+  images\
+    model_depth.png
+    model_intensity.png
+    max_method_depth.png
+    max_method_intensity.png
+    model_vs_max_method.png
+```
+
+`summary.json` 同时记录模型输出与最大值法的 depth/intensity 差异统计。
+
+## 10. 关键配置
 
 常用数据参数：
 
@@ -334,14 +436,17 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 | `time_threshold` | `128` | 大于该 ToF 的值置 `0` |
 | `raw_load_mode` | `group` | 直接读取当前 group, 减少整文件读取开销 |
 | `split_ratios` | `0.8,0.2,0.0` | 训练/验证/测试划分 |
-| `batch_size` | `4` | 单步 batch |
+| `batch_size` | `8` | 单步 batch |
 | `grad_accum_steps` | `8` | 梯度累积, 等效 batch 为 `batch_size * grad_accum_steps` |
+| `use_precomputed_labels` | `True` | 优先读取预生成 label 池 |
+| `precomputed_label_dir_name` | `label` | label 池父目录名 |
+| `precomputed_labels_per_class` | `5` | 每个类别随机抽取的 label 数量 |
 
 常用加速参数：
 
 | 参数 | 推荐 | 说明 |
 |---|---:|---|
-| `num_workers` | `4` 到 `8` | DataLoader worker 数 |
+| `num_workers` | `8` | DataLoader worker 数 |
 | `persistent_workers` | 开 | 减少 epoch 间 worker 重建 |
 | `prefetch_factor` | `4` | 每个 worker 预取 batch 数 |
 | `pin_memory` | 开 | 加速 CPU 到 CUDA 拷贝 |
@@ -357,33 +462,34 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 | `model_backend` | `new` | 官方 `activation_based` 实现 |
 | `spike_backend` | `auto` | CUDA 可用时优先 cupy, 否则 torch |
 | `encoding_mode` | `sinusoidal` | ToF 编码, 可选 `lut` |
-| `C` | `32` | 主干通道数 |
+| `C` | `16` | 主干通道数 |
 | `chunk_size` | `32` | 时间维分块大小, 影响显存 |
 | `num_blocks` | `2` | SpikeBlock 数量 |
 | `refine_mid` | `8` | 深度/强度精修头中间通道 |
 | `return_sequence` | `True` | 训练 var/sparse loss 时需要 |
 
-## 10. 数据增强
+## 11. 数据增强
 
 训练增强只作用于训练集。
 
 ToF shift：
 
 ```powershell
---augment-train --num-aug 3 --keep-original-sample --tof-shift-max 15 --tof-shift-prob 1.0
+--augment-train --num-aug 2 --no-keep-original-sample --tof-shift-max 20 --tof-shift-prob 0.9
 ```
 
 逻辑：
 
 ```text
-1. 默认每个训练样本保留原始 1 份, 额外生成 num_aug 份增强样本
-2. 使用 --no-keep-original-sample 可只保留增强样本, 不保留 aug_index=0 的原始样本
-3. 若 num_aug=3 且保留原始样本, 训练集样本数变为原始训练集的 4 倍
-4. 若 num_aug=3 且不保留原始样本, 训练集样本数变为原始训练集的 3 倍
-5. 增强发生在原始 raw group 上, 先于 time_threshold 裁剪
-6. 对所有非零 ToF 加同一个随机整数 delta, delta 属于 [-15, 15]
-7. 增强后小于 1 或大于 time_threshold 的值置 0
-8. 输入 group 和 label group 同步 shift
+1. 当前默认 augment_train=True, num_aug=2, keep_original_sample=False
+2. 默认每个训练样本只保留 2 份增强样本, 不保留 aug_index=0 原始样本
+3. 使用 --keep-original-sample 可额外保留原始样本
+4. 若 num_aug=2 且保留原始样本, 训练集样本数变为原始训练集的 3 倍
+5. 若 num_aug=2 且不保留原始样本, 训练集样本数变为原始训练集的 2 倍
+6. 增强发生在原始 raw group 上, 先于 time_threshold 裁剪
+7. 对所有非零 ToF 加同一个随机整数 delta, delta 属于 [-20, 20]
+8. 增强后小于 1 或大于 time_threshold 的值置 0
+9. 输入 group 和 label group 同步 shift
 ```
 
 PageDropout：
@@ -392,7 +498,7 @@ PageDropout：
 --page-dropout --page-dropout-prob 0.1
 ```
 
-逻辑：随机把整页 raw page 置 `0`，只改变输入 photon 密度，不改变标签。
+逻辑：随机把整页 raw page 置 `0`，只改变输入 photon 密度，不改变标签。当前默认 `page_dropout=False`，`page_dropout_prob=0`。
 
 Page shuffle：
 
@@ -404,7 +510,7 @@ Page shuffle：
 
 逻辑：随机打乱单个样本内部的 `P` 维 page 顺序。标签由未打乱的 group 统计生成，不受 page 顺序影响。
 
-## 11. Loss 和指标
+## 12. Loss 和指标
 
 训练 loss：
 
@@ -433,7 +539,7 @@ w_lut_norm=0.005
 
 日志中 `train_items` 和 `val_items` 会记录各个 loss 分项，`val_metrics` 会记录 depth/intensity 的 MAE、RMSE、SSIM、PSNR。
 
-## 12. 模型状态
+## 13. 模型状态
 
 `SPADSpikeNet.forward()` 内部保留两类状态操作：
 
@@ -453,7 +559,7 @@ intensity_net  精修 intensity
 
 两个分支都使用 coarse depth、coarse intensity 和 confidence 作为输入，并由 confidence 控制残差幅度。
 
-## 13. 显存和速度建议
+## 14. 显存和速度建议
 
 优先调这些参数：
 
