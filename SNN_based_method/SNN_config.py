@@ -60,16 +60,34 @@ class SNNConfig:
     return_label: bool = True
     """是否从分组 raw 数据生成弱标签 ``[B, 2, 64, 64]``。"""
 
+    use_precomputed_labels: bool = True
+    """是否优先读取 CSV 对应的预生成 ``.npy`` 标签。"""
+
+    require_precomputed_labels: bool = False
+    """预生成标签缺失时是否直接报错; 默认回退为在线弱标签生成。"""
+
+    precomputed_label_dir_name: str = "label"
+    """预生成标签目录名; 相对路径按 CSV 所在目录解析。"""
+
+    precomputed_labels_per_class: int = 5
+    """每个 ``target_class`` 预生成并随机抽取的 label 数量。"""
+
     normalize_input: bool = False
     """是否在 Dataset 内将 ToF 输入除以 ``time_threshold``。"""
 
     shuffle_pages: bool = False
     """训练时是否随机打乱每个样本内部的 P 维; val/test 不使用。"""
 
-    augment_train: bool = False
+    augment_train: bool = True
     """是否在训练集启用 raw group 级数据增强。"""
 
-    tof_shift_max: int = 15
+    num_aug: int = 1
+    """每个训练样本额外生成的增强样本份数。"""
+
+    keep_original_sample: bool = False
+    """训练增强展开时是否保留 ``aug_index=0`` 的原始样本。"""
+
+    tof_shift_max: int = 20
     """训练增强的最大整数 ToF 偏移; 增强后小于 1 或大于 time_threshold 的值置 0。"""
 
     tof_shift_prob: float = 1.0
@@ -94,8 +112,8 @@ class SNNConfig:
     """train/val/test 划分比例。"""
 
     # ---- Dataloader ----
-    batch_size: int = 4
-    num_workers: int = 4
+    batch_size: int = 8
+    num_workers: int = 6
     pin_memory: Optional[bool] = None
     persistent_workers: bool = True
     """num_workers > 0 时保持 DataLoader worker 常驻, 减少 epoch 间空窗。"""
@@ -122,7 +140,7 @@ class SNNConfig:
     model_backend: str = "new"
     """模型后端; 本项目统一使用官方 ``spikingjelly.activation_based``。"""
 
-    C: int = 32
+    C: int = 16
     chunk_size: int = 32
     spike_mode: str = "plif"
     spike_backend: str = "auto"
@@ -206,6 +224,16 @@ class SNNConfig:
         self.raw_load_mode = str(self.raw_load_mode).lower()
         if self.raw_load_mode not in {"group", "file_cache"}:
             raise ValueError("raw_load_mode must be 'group' or 'file_cache'")
+
+        if str(self.precomputed_label_dir_name).strip() == "labels":
+            self.precomputed_label_dir_name = "label"
+
+        if self.require_precomputed_labels and not self.use_precomputed_labels:
+            raise ValueError(
+                "require_precomputed_labels=True requires use_precomputed_labels=True"
+            )
+        if self.precomputed_labels_per_class <= 0:
+            raise ValueError("precomputed_labels_per_class must be a positive integer")
 
         self.spike_backend = str(self.spike_backend).lower()
         if self.spike_backend not in {"auto", "cupy", "torch"}:
@@ -309,9 +337,15 @@ class SNNConfig:
             split_ratios=self.split_ratios,
             seed=self.seed,
             return_label=self.return_label,
+            use_precomputed_labels=self.use_precomputed_labels,
+            require_precomputed_labels=self.require_precomputed_labels,
+            precomputed_label_dir_name=self.precomputed_label_dir_name,
+            precomputed_labels_per_class=self.precomputed_labels_per_class,
             normalize=self.normalize_input,
             shuffle_pages=self.shuffle_pages,
             augment_train=self.augment_train,
+            num_aug=self.num_aug,
+            keep_original_sample=self.keep_original_sample,
             tof_shift_max=self.tof_shift_max,
             tof_shift_prob=self.tof_shift_prob,
             page_dropout=self.page_dropout,
@@ -346,6 +380,10 @@ class SNNConfig:
             shuffle=shuffle,
             seed=self.seed,
             return_label=self.return_label,
+            use_precomputed_labels=self.use_precomputed_labels,
+            require_precomputed_labels=self.require_precomputed_labels,
+            precomputed_label_dir_name=self.precomputed_label_dir_name,
+            precomputed_labels_per_class=self.precomputed_labels_per_class,
             normalize=self.normalize_input,
             shuffle_pages=False,
             active_point=self.active_point,
@@ -407,7 +445,16 @@ class SNNConfig:
             f"precompute_model_input={self.precompute_model_input}, raw_load_mode={self.raw_load_mode}"
         )
         lines.append(
-            f"  augment_train={self.augment_train}, tof_shift_max={self.tof_shift_max}, "
+            f"  labels: return_label={self.return_label}, "
+            f"use_precomputed_labels={self.use_precomputed_labels}, "
+            f"require_precomputed_labels={self.require_precomputed_labels}, "
+            f"precomputed_label_dir_name={self.precomputed_label_dir_name}, "
+            f"precomputed_labels_per_class={self.precomputed_labels_per_class}"
+        )
+        lines.append(
+            f"  augment_train={self.augment_train}, num_aug={self.num_aug}, "
+            f"keep_original_sample={self.keep_original_sample}, "
+            f"tof_shift_max={self.tof_shift_max}, "
             f"tof_shift_prob={self.tof_shift_prob}, page_dropout={self.page_dropout}, "
             f"page_dropout_prob={self.page_dropout_prob}, shuffle_pages={self.shuffle_pages}"
         )

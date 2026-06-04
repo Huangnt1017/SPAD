@@ -181,6 +181,49 @@ def data_to_frames(data: np.ndarray, h: int = 64, w: int = 64) -> torch.Tensor:
     return frames
 
 
+def build_max_count_label_from_group(
+    data: np.ndarray,
+    time_threshold: int,
+    *,
+    active_point: int = 1,
+) -> torch.Tensor:
+    """用最大计数法从 raw group 生成 ``[2, 64, 64]`` 图像。
+
+    对每个像素统计 ``1..time_threshold`` 内各 ToF bin 的出现次数, 选择
+    出现次数最多的 bin 作为 depth, 该次数除以 group 页数作为 intensity。
+    ``active_point`` 用于过滤出现次数太少的 bin, 与训练弱标签生成一致。
+    """
+    if data.ndim != 2 or data.shape[0] != 64 * 64:
+        raise ValueError(f"data must have shape [4096, P], got {data.shape}")
+    if time_threshold <= 0:
+        raise ValueError("time_threshold must be a positive integer")
+    if active_point <= 0:
+        raise ValueError("active_point must be a positive integer")
+
+    pages_per_group = data.shape[1]
+    label = np.zeros((2, 64, 64), dtype=np.float32)
+    if pages_per_group <= 0:
+        return torch.from_numpy(label)
+
+    group = data.astype(np.int32, copy=False)
+    for pixel_index in range(group.shape[0]):
+        values = group[pixel_index]
+        valid_values = values[(values >= 1) & (values <= int(time_threshold))]
+        if valid_values.size == 0:
+            continue
+        counts = np.bincount(valid_values, minlength=int(time_threshold) + 1)
+        counts[:1] = 0
+        best_count = int(counts.max())
+        if best_count < int(active_point):
+            continue
+        best_tof = int(counts.argmax())
+        y_idx = pixel_index // 64
+        x_idx = pixel_index % 64
+        label[0, y_idx, x_idx] = float(best_tof)
+        label[1, y_idx, x_idx] = min(best_count / float(pages_per_group), 1.0)
+    return torch.from_numpy(label)
+
+
 # ─── 可视化函数 ─────────────────────────────────────────────────
 
 def plot_single_frame_raw(

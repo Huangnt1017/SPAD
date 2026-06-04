@@ -180,11 +180,70 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--recursive", action="store_true", help="递归搜索数据目录")
     parser.add_argument("--no-label", action="store_true", help="关闭弱标签生成")
+    precomputed_labels_group = parser.add_mutually_exclusive_group()
+    precomputed_labels_group.add_argument(
+        "--use-precomputed-labels",
+        dest="use_precomputed_labels",
+        action="store_true",
+        default=None,
+        help="训练时优先读取 CSV 对应的预生成 .npy 标签",
+    )
+    precomputed_labels_group.add_argument(
+        "--no-precomputed-labels",
+        dest="use_precomputed_labels",
+        action="store_false",
+        help="关闭预生成 .npy 标签读取, 改为在线生成弱标签",
+    )
+    require_precomputed_group = parser.add_mutually_exclusive_group()
+    require_precomputed_group.add_argument(
+        "--require-precomputed-labels",
+        dest="require_precomputed_labels",
+        action="store_true",
+        default=None,
+        help="预生成标签缺失时直接报错, 不回退到在线弱标签",
+    )
+    require_precomputed_group.add_argument(
+        "--no-require-precomputed-labels",
+        dest="require_precomputed_labels",
+        action="store_false",
+        help="预生成标签缺失时允许回退到在线弱标签",
+    )
+    parser.add_argument(
+        "--precomputed-label-dir-name",
+        default=None,
+        help="预生成标签目录名; 相对路径按 CSV 所在目录解析, 默认 label",
+    )
+    parser.add_argument(
+        "--precomputed-labels-per-class",
+        type=int,
+        default=None,
+        help="每个 target_class 预生成并随机抽取的 label 数量, 默认 5",
+    )
     parser.add_argument("--normalize-input", action="store_true", help="按 time_threshold 归一化输入")
     parser.add_argument(
         "--augment-train",
         action="store_true",
         help="训练集启用 raw group 级 ToF shift 增强",
+    )
+    parser.add_argument(
+        "--num-aug",
+        type=int,
+        default=None,
+        help="每个训练样本额外生成的增强样本份数, 默认使用配置值",
+    )
+    original_sample_group = parser.add_mutually_exclusive_group()
+    original_sample_group.add_argument(
+        "--keep-original-sample",
+        dest="keep_original_sample",
+        action="store_true",
+        default=None,
+        help="训练增强展开时保留 aug_index=0 的原始样本",
+    )
+    original_sample_group.add_argument(
+        "--no-keep-original-sample",
+        dest="keep_original_sample",
+        action="store_false",
+        help="训练增强展开时不保留 aug_index=0 的原始样本",
     )
     parser.add_argument("--tof-shift-max", type=int, default=None, help="ToF shift 最大整数偏移, 默认 15")
     parser.add_argument("--tof-shift-prob", type=float, default=None, help="每个训练样本执行 ToF shift 的概率")
@@ -309,6 +368,12 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "ssim_smooth_kernel_size",
         "gt_use_mask",
         "ssim_use_mask",
+        "use_precomputed_labels",
+        "require_precomputed_labels",
+        "precomputed_label_dir_name",
+        "precomputed_labels_per_class",
+        "num_aug",
+        "keep_original_sample",
         "tof_shift_max",
         "tof_shift_prob",
         "page_dropout_prob",
@@ -427,6 +492,12 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "ssim_smooth_kernel_size",
         "gt_use_mask",
         "ssim_use_mask",
+        "use_precomputed_labels",
+        "require_precomputed_labels",
+        "precomputed_label_dir_name",
+        "precomputed_labels_per_class",
+        "num_aug",
+        "keep_original_sample",
         "tof_shift_max",
         "tof_shift_prob",
         "page_dropout_prob",
@@ -521,6 +592,7 @@ def save_checkpoint(
     *,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
+    scheduler: Any | None = None,
     epoch: int,
     cfg: SNNConfig,
     metrics: dict[str, Any],
@@ -535,6 +607,8 @@ def save_checkpoint(
     }
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler"] = scheduler.state_dict()
     torch.save(payload, path)
 
 
@@ -543,16 +617,24 @@ def load_checkpoint(
     model: torch.nn.Module,
     *,
     optimizer: torch.optim.Optimizer | None = None,
+    scheduler: Any | None = None,
     map_location: torch.device | str = "cpu",
 ) -> dict[str, Any]:
-    """加载 checkpoint 到模型, 并按需恢复优化器。"""
+    """加载 checkpoint 到模型, 并按需恢复优化器和学习率调度器。"""
     checkpoint = torch.load(path, map_location=map_location)
-    state_dict = checkpoint.get("model", checkpoint)
+    state_dict = checkpoint.get("model", checkpoint.get("model_state_dict", checkpoint))
     has_adapted_state = state_dict_needs_model_adaptation(state_dict, model)
     state_dict = adapt_state_dict_for_model(state_dict, model)
     model.load_state_dict(state_dict)
-    if optimizer is not None and "optimizer" in checkpoint and not has_adapted_state:
-        optimizer.load_state_dict(checkpoint["optimizer"])
+    optimizer_state = checkpoint.get("optimizer", checkpoint.get("optimizer_state_dict"))
+    if optimizer is not None and optimizer_state is not None and not has_adapted_state:
+        optimizer.load_state_dict(optimizer_state)
+    scheduler_state = checkpoint.get("scheduler", checkpoint.get("scheduler_state_dict"))
+    scheduler_loaded = False
+    if scheduler is not None and scheduler_state is not None and not has_adapted_state:
+        scheduler.load_state_dict(scheduler_state)
+        scheduler_loaded = True
+    checkpoint["_scheduler_loaded"] = scheduler_loaded
     return checkpoint
 
 

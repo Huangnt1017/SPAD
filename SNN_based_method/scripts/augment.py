@@ -108,12 +108,20 @@ class SpadRawTrainAugmentation:
             if page_dropout
             else None
         )
+        self.last_metadata: dict[str, int | bool] = {
+            "tof_shift_delta": 0,
+            "page_dropout": self.page_dropout is not None,
+        }
 
     def __call__(self, group_tof: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         input_group = group_tof
         label_group = group_tof
 
         delta = self.tof_shift.sample_delta()
+        self.last_metadata = {
+            "tof_shift_delta": int(delta),
+            "page_dropout": self.page_dropout is not None,
+        }
         if delta != 0:
             input_group = self.tof_shift.apply_delta(input_group, delta)
             label_group = self.tof_shift.apply_delta(label_group, delta)

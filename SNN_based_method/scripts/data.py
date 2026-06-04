@@ -41,6 +41,8 @@ except ImportError:
 NUM_PIXELS = 64 * 64
 RAW_VALUE_BYTES = 2
 DEFAULT_SEED = 42
+DEFAULT_LABEL_DIR_NAME = "label"
+DEFAULT_LABELS_PER_CLASS = 5
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,39 @@ class RawGroupSample:
     raw_path: str
     group_index: int
     total_pages: int
+
+
+@dataclass(frozen=True)
+class PrecomputedLabelInfo:
+    """一个类别对应的预生成标签池定位信息。"""
+
+    label_dir: Path
+    class_name: str
+
+
+def sanitize_label_class(value: object) -> str:
+    """把 CSV 类别值转换为可用于文件名的稳定字符串。"""
+    text = str(value).strip()
+    if not text:
+        raise ValueError("target_class must not be empty when using precomputed labels")
+    sanitized = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in text)
+    return sanitized or "unknown"
+
+
+def precomputed_label_path(info: PrecomputedLabelInfo, label_index: int) -> Path:
+    """按 ``类别_序号.npy`` 规则返回 label 池中的一个文件路径。"""
+    if label_index < 0:
+        raise IndexError("label_index must be non-negative")
+    return Path(info.label_dir) / f"{info.class_name}_{int(label_index)}.npy"
+
+
+def _label_pool_sort_key(path: Path) -> tuple[str, int, str]:
+    """按文件名中的末尾数字稳定排序 label 池。"""
+    stem = path.stem
+    suffix = stem.rsplit("_", 1)[-1]
+    if suffix.isdigit():
+        return (stem.removesuffix(f"_{suffix}"), int(suffix), stem)
+    return (stem, -1, stem)
 
 
 def seed_everything(seed: int = DEFAULT_SEED) -> None:
@@ -215,6 +250,64 @@ def collect_raw_records(
     if not records:
         raise ValueError(f"no CSV raw records were found in: {csv_path_list}")
     return records
+
+
+def _resolve_label_root(
+    raw_path: Path,
+    metadata: Mapping[str, Any],
+    label_dir_name: str | Path,
+    pages_per_group: int,
+) -> Path:
+    """解析预生成 label 根目录: ``label/<pages_per_group>``。"""
+    label_dir = Path(label_dir_name)
+    if label_dir.is_absolute():
+        root = label_dir
+    else:
+        csv_path_value = metadata.get("csv_path")
+        if csv_path_value:
+            root = Path(str(csv_path_value)).resolve().parent / label_dir
+        else:
+            root = raw_path.resolve().parent / label_dir
+    return root / str(int(pages_per_group))
+
+
+def attach_precomputed_label_metadata(
+    raw_records: Sequence[tuple[Path, Mapping[str, Any]]],
+    *,
+    pages_per_group: int,
+    total_pages: int | None = None,
+    label_dir_name: str | Path = DEFAULT_LABEL_DIR_NAME,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """为 CSV raw 记录补充类别级预生成 label 池定位信息。
+
+    label 目录结构为 ``<dataset>/label/<pages_per_group>/<class>/<class>_0.npy``。
+    训练时同一 ``target_class`` 的样本会从该类别目录中随机抽取一个 label。
+    """
+    updated_records: list[tuple[Path, dict[str, Any]]] = []
+
+    for raw_path_value, metadata_value in raw_records:
+        raw_path = Path(raw_path_value).resolve()
+        metadata = dict(metadata_value)
+        target_class = metadata.get("target_class")
+        if target_class is None or str(target_class).strip() == "":
+            updated_records.append((raw_path, metadata))
+            continue
+
+        label_root = _resolve_label_root(
+            raw_path,
+            metadata,
+            label_dir_name,
+            pages_per_group,
+        )
+        class_name = sanitize_label_class(target_class)
+        label_dir = label_root / class_name
+
+        metadata["precomputed_label_dir"] = str(label_dir)
+        metadata["precomputed_label_root"] = str(label_root)
+        metadata["precomputed_label_class"] = class_name
+        updated_records.append((raw_path, metadata))
+
+    return updated_records
 
 
 def infer_groupable_total_pages(
@@ -482,6 +575,38 @@ def build_weak_label_from_group(
     return torch.from_numpy(label)
 
 
+def apply_label_tof_shift(
+    label: torch.Tensor,
+    delta: int,
+    time_threshold: int,
+) -> torch.Tensor:
+    """对预生成 label 的 depth 通道应用与 ToF shift 一致的整数偏移。"""
+    if delta == 0:
+        return label
+    shifted = label.clone()
+    depth = shifted[0]
+    valid = depth > 0
+    depth[valid] = depth[valid] + float(delta)
+    invalid_after_shift = (depth < 1) | (depth > float(time_threshold))
+    depth[invalid_after_shift] = 0.0
+    shifted[1][invalid_after_shift] = 0.0
+    return shifted
+
+
+def _label_info_from_metadata(metadata: Mapping[str, Any]) -> PrecomputedLabelInfo | None:
+    """从样本 metadata 中解析预生成 label 定位信息。"""
+    required_keys = (
+        "precomputed_label_dir",
+        "precomputed_label_class",
+    )
+    if not all(key in metadata for key in required_keys):
+        return None
+    return PrecomputedLabelInfo(
+        label_dir=Path(str(metadata["precomputed_label_dir"])),
+        class_name=str(metadata["precomputed_label_class"]),
+    )
+
+
 class SpadRawGroupDataset(Dataset):
     """面向 SNN 训练的 SPAD raw 分组数据集。
 
@@ -500,6 +625,8 @@ class SpadRawGroupDataset(Dataset):
         cache_size: 在内存中缓存的 raw 分组数组数量。
         transform: 作用于 ``frames`` 的可选变换。
         label_transform: 作用于 ``label`` 的可选变换。
+        num_aug: 每个基础样本额外生成的增强样本份数。
+        keep_original_sample: 增强展开时是否保留 ``aug_index=0`` 的原始样本。
     """
 
     def __init__(
@@ -520,6 +647,11 @@ class SpadRawGroupDataset(Dataset):
         raw_group_transform: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
         transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         label_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        num_aug: int = 0,
+        keep_original_sample: bool = True,
+        use_precomputed_labels: bool = True,
+        require_precomputed_labels: bool = False,
+        precomputed_labels_per_class: int = DEFAULT_LABELS_PER_CLASS,
     ) -> None:
         if pages_per_group <= 0:
             raise ValueError("pages_per_group must be a positive integer")
@@ -544,6 +676,13 @@ class SpadRawGroupDataset(Dataset):
         if self.raw_load_mode not in {"group", "file_cache"}:
             raise ValueError("raw_load_mode must be 'group' or 'file_cache'")
         self.raw_group_transform = raw_group_transform
+        self.num_aug = max(0, int(num_aug))
+        self.keep_original_sample = bool(keep_original_sample)
+        self.use_precomputed_labels = bool(use_precomputed_labels)
+        self.require_precomputed_labels = bool(require_precomputed_labels)
+        self.precomputed_labels_per_class = int(precomputed_labels_per_class)
+        if self.precomputed_labels_per_class <= 0:
+            raise ValueError("precomputed_labels_per_class must be a positive integer")
         self.transform = transform
         self.label_transform = label_transform
         if raw_metadata is None:
@@ -556,17 +695,33 @@ class SpadRawGroupDataset(Dataset):
         }
 
         if samples is None:
-            self.samples = build_group_samples(
+            base_samples = build_group_samples(
                 raw_paths=self.raw_paths,
                 pages_per_group=self.pages_per_group,
                 total_pages=self.total_pages,
             )
         else:
-            self.samples = list(samples)
-            if not self.samples:
+            base_samples = list(samples)
+            if not base_samples:
                 raise ValueError("samples must not be empty")
 
+        self.samples: list[RawGroupSample] = []
+        self.sample_aug_indices: list[int] = []
+        effective_num_aug = self.num_aug if self.raw_group_transform is not None else 0
+        if not self.keep_original_sample and effective_num_aug <= 0:
+            raise ValueError(
+                "keep_original_sample=False requires raw_group_transform and num_aug > 0"
+            )
+        for sample in base_samples:
+            if self.keep_original_sample:
+                self.samples.append(sample)
+                self.sample_aug_indices.append(0)
+            for aug_index in range(1, effective_num_aug + 1):
+                self.samples.append(sample)
+                self.sample_aug_indices.append(aug_index)
+
         self._group_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._label_pool_cache: dict[str, list[Path]] = {}
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -601,12 +756,61 @@ class SpadRawGroupDataset(Dataset):
             )
         return self._load_raw_groups(sample)[sample.group_index]
 
+    def _load_precomputed_label(
+        self,
+        sample: RawGroupSample,
+        metadata: Mapping[str, Any],
+    ) -> torch.Tensor | None:
+        """按 target_class 从同类预生成 label 池中随机读取一个标签。"""
+        if not self.use_precomputed_labels:
+            return None
+        label_info = _label_info_from_metadata(metadata)
+        if label_info is None:
+            if self.require_precomputed_labels:
+                raise FileNotFoundError(
+                    f"precomputed label metadata is missing for raw file: {sample.raw_path}"
+                )
+            return None
+
+        cache_key = str(Path(label_info.label_dir).resolve())
+        label_paths = self._label_pool_cache.get(cache_key)
+        if label_paths is None:
+            expected_paths = [
+                precomputed_label_path(label_info, label_index)
+                for label_index in range(self.precomputed_labels_per_class)
+            ]
+            label_paths = [path for path in expected_paths if path.is_file()]
+            if len(label_paths) != len(expected_paths):
+                label_paths = []
+            self._label_pool_cache[cache_key] = label_paths
+
+        if not label_paths:
+            if self.require_precomputed_labels:
+                raise FileNotFoundError(
+                    f"precomputed label pool is incomplete for class "
+                    f"{label_info.class_name}: expected "
+                    f"{self.precomputed_labels_per_class} files in {label_info.label_dir}"
+                )
+            return None
+
+        label_path = random.choice(label_paths)
+        label_array = np.load(label_path)
+        if label_array.shape != (2, 64, 64):
+            raise ValueError(
+                f"precomputed label must have shape (2, 64, 64), "
+                f"got {label_array.shape}: {label_path}"
+            )
+        return torch.from_numpy(label_array.astype(np.float32, copy=False))
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.samples[index]
+        aug_index = self.sample_aug_indices[index]
         raw_group_tof = self._load_raw_group(sample)
 
-        if self.raw_group_transform is not None:
+        transform_metadata: Mapping[str, Any] = {}
+        if self.raw_group_transform is not None and aug_index > 0:
             group_tof, label_group_tof = self.raw_group_transform(raw_group_tof)
+            transform_metadata = getattr(self.raw_group_transform, "last_metadata", {})
         else:
             group_tof = clip_tof_to_valid_range(raw_group_tof, self.time_threshold)
             label_group_tof = group_tof
@@ -629,6 +833,8 @@ class SpadRawGroupDataset(Dataset):
             "raw_name": Path(sample.raw_path).stem,
             "group_index": sample.group_index,
             "total_pages": sample.total_pages,
+            "aug_index": aug_index,
+            "is_augmented": aug_index > 0,
         }
         metadata = self.raw_metadata_by_path.get(sample.raw_path, {})
         if metadata:
@@ -639,11 +845,16 @@ class SpadRawGroupDataset(Dataset):
                 item["target_class"] = metadata["target_class"]
 
         if self.return_label:
-            label = build_weak_label_from_group(
-                label_group_tof,
-                time_threshold=self.time_threshold,
-                active_point=self.active_point,
-            )
+            label = self._load_precomputed_label(sample, metadata)
+            if label is not None:
+                delta = int(transform_metadata.get("tof_shift_delta", 0))
+                label = apply_label_tof_shift(label, delta, self.time_threshold)
+            else:
+                label = build_weak_label_from_group(
+                    label_group_tof,
+                    time_threshold=self.time_threshold,
+                    active_point=self.active_point,
+                )
             if self.label_transform is not None:
                 label = self.label_transform(label)
             item["label"] = label
@@ -674,6 +885,8 @@ def spad_time_first_collate(
         "raw_name": [item["raw_name"] for item in batch],
         "group_index": torch.tensor([item["group_index"] for item in batch], dtype=torch.long),
         "total_pages": torch.tensor([item["total_pages"] for item in batch], dtype=torch.long),
+        "aug_index": torch.tensor([item.get("aug_index", 0) for item in batch], dtype=torch.long),
+        "is_augmented": torch.tensor([bool(item.get("is_augmented", False)) for item in batch], dtype=torch.bool),
     }
     if include_model_input:
         collated["model_input"] = time_first_to_model_input(frames).contiguous()
@@ -778,9 +991,15 @@ def create_spad_dataloaders(
     split_ratios: Sequence[float] = (0.7, 0.2, 0.1),
     seed: int = DEFAULT_SEED,
     return_label: bool = True,
+    use_precomputed_labels: bool = True,
+    require_precomputed_labels: bool = False,
+    precomputed_label_dir_name: str | Path = DEFAULT_LABEL_DIR_NAME,
+    precomputed_labels_per_class: int = DEFAULT_LABELS_PER_CLASS,
     normalize: bool = False,
     shuffle_pages: bool = False,
     augment_train: bool = False,
+    num_aug: int = 3,
+    keep_original_sample: bool = True,
     tof_shift_max: int = 15,
     tof_shift_prob: float = 1.0,
     page_dropout: bool = False,
@@ -808,6 +1027,13 @@ def create_spad_dataloaders(
     )
     if not raw_records:
         raise ValueError(f"no .raw files found in paths: {paths}")
+    if use_precomputed_labels or require_precomputed_labels:
+        raw_records = attach_precomputed_label_metadata(
+            raw_records,
+            pages_per_group=pages_per_group,
+            total_pages=total_pages,
+            label_dir_name=precomputed_label_dir_name,
+        )
     raw_paths = [record[0] for record in raw_records]
     raw_metadata = [record[1] for record in raw_records]
 
@@ -817,6 +1043,9 @@ def create_spad_dataloaders(
         total_pages=total_pages,
         time_threshold=time_threshold,
         return_label=return_label,
+        use_precomputed_labels=use_precomputed_labels,
+        require_precomputed_labels=require_precomputed_labels,
+        precomputed_labels_per_class=precomputed_labels_per_class,
         normalize=normalize,
         shuffle_pages=False,
         active_point=active_point,
@@ -838,12 +1067,16 @@ def create_spad_dataloaders(
             page_dropout=page_dropout,
             page_dropout_prob=page_dropout_prob,
         )
+    train_num_aug = max(0, int(num_aug)) if train_transform is not None else 0
     train_dataset = SpadRawGroupDataset(
         raw_paths=raw_paths,
         pages_per_group=pages_per_group,
         total_pages=total_pages,
         time_threshold=time_threshold,
         return_label=return_label,
+        use_precomputed_labels=use_precomputed_labels,
+        require_precomputed_labels=require_precomputed_labels,
+        precomputed_labels_per_class=precomputed_labels_per_class,
         normalize=normalize,
         shuffle_pages=shuffle_pages,
         active_point=active_point,
@@ -852,6 +1085,8 @@ def create_spad_dataloaders(
         raw_metadata=raw_metadata,
         samples=[dataset.samples[index] for index in train_indices],
         raw_group_transform=train_transform,
+        num_aug=train_num_aug,
+        keep_original_sample=keep_original_sample,
     )
 
     train_loader = make_spad_dataloader(
@@ -903,6 +1138,10 @@ def create_spad_dataloader(
     shuffle: bool = True,
     seed: int = DEFAULT_SEED,
     return_label: bool = True,
+    use_precomputed_labels: bool = True,
+    require_precomputed_labels: bool = False,
+    precomputed_label_dir_name: str | Path = DEFAULT_LABEL_DIR_NAME,
+    precomputed_labels_per_class: int = DEFAULT_LABELS_PER_CLASS,
     normalize: bool = False,
     shuffle_pages: bool = False,
     active_point: int = 1,
@@ -925,6 +1164,13 @@ def create_spad_dataloader(
     )
     if not raw_records:
         raise ValueError(f"no .raw files found in paths: {paths}")
+    if use_precomputed_labels or require_precomputed_labels:
+        raw_records = attach_precomputed_label_metadata(
+            raw_records,
+            pages_per_group=pages_per_group,
+            total_pages=total_pages,
+            label_dir_name=precomputed_label_dir_name,
+        )
     raw_paths = [record[0] for record in raw_records]
     raw_metadata = [record[1] for record in raw_records]
 
@@ -934,6 +1180,9 @@ def create_spad_dataloader(
         total_pages=total_pages,
         time_threshold=time_threshold,
         return_label=return_label,
+        use_precomputed_labels=use_precomputed_labels,
+        require_precomputed_labels=require_precomputed_labels,
+        precomputed_labels_per_class=precomputed_labels_per_class,
         normalize=normalize,
         shuffle_pages=shuffle_pages,
         active_point=active_point,

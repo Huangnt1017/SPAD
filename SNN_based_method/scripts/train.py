@@ -24,7 +24,7 @@ from SNN_based_method.scripts.data import seed_everything
 from SNN_based_method.scripts.runtime import (
     add_config_arguments,
     build_run_name,
-    config_from_args,
+    config_from_checkpoint_and_args,
     load_checkpoint,
     make_checkpoint_run_dir,
     prepare_model_input,
@@ -367,9 +367,57 @@ def build_argparser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(description="训练 SPAD SNN 成像模型")
     add_config_arguments(parser)
+    parser.add_argument(
+        "--resume-run-dir",
+        default=None,
+        help="指定训练 run 的 checkpoint 文件夹, 自动从其中的 last.pth 接续训练",
+    )
     parser.add_argument("--save-every", type=int, default=None, help="每 N 个 epoch 额外保存一次 checkpoint")
     parser.add_argument("--trace-steps", type=int, default=0, help="打印前 N 个训练 batch 的阶段耗时")
     return parser
+
+
+def resolve_resume_run_dir(path: str | Path) -> Path:
+    """解析续训目录; 相对路径按项目根目录解释。"""
+    resume_path = Path(path)
+    if not resume_path.is_absolute():
+        resume_path = resolve_output_root(resume_path)
+    resume_path = resume_path.resolve()
+    if resume_path.is_file() and resume_path.suffix.lower() == ".pth":
+        resume_path = resume_path.parent
+    if not resume_path.is_dir():
+        raise NotADirectoryError(f"resume run directory not found: {resume_path}")
+    return resume_path
+
+
+def prepare_resume_args(args: argparse.Namespace) -> Path | None:
+    """把 ``--resume-run-dir`` 转换为 checkpoint/config/run_name 参数。"""
+    if not args.resume_run_dir:
+        return None
+
+    resume_run_dir = resolve_resume_run_dir(args.resume_run_dir)
+    checkpoint_path = resume_run_dir / "last.pth"
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"last checkpoint not found: {checkpoint_path}")
+
+    if args.checkpoint_path:
+        explicit_checkpoint = Path(args.checkpoint_path)
+        if not explicit_checkpoint.is_absolute():
+            explicit_checkpoint = resolve_output_root(explicit_checkpoint)
+        if explicit_checkpoint.resolve() != checkpoint_path.resolve():
+            raise ValueError(
+                "--resume-run-dir already selects last.pth; do not pass a different --checkpoint"
+            )
+    args.checkpoint_path = str(checkpoint_path)
+
+    config_path = resume_run_dir / "config.json"
+    if args.config is None and config_path.is_file():
+        args.config = str(config_path)
+    if args.run_name is None:
+        args.run_name = resume_run_dir.name
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = str(resume_run_dir.parent)
+    return resume_run_dir
 
 
 def _same_paths(left: list[str] | None, right: list[str]) -> bool:
@@ -395,16 +443,55 @@ def apply_default_train_paths(cfg: SNNConfig) -> SNNConfig:
     return cfg.clone_with(**updates)
 
 
+def ensure_train_precomputed_labels(cfg: SNNConfig):
+    """训练前检查当前 pages_per_group 的 label 池, 缺失时自动生成。"""
+    if not cfg.return_label or not cfg.use_precomputed_labels:
+        return None
+    if not cfg.data_paths or not cfg.csv_paths:
+        return None
+
+    from SNN_based_method.scripts.generate_precomputed_labels import (
+        GenerateLabelConfig,
+        ensure_precomputed_labels,
+    )
+
+    label_config = GenerateLabelConfig(
+        data_paths=[Path(path) for path in cfg.data_paths],
+        csv_paths=[Path(path) for path in cfg.csv_paths],
+        pages_per_group=cfg.pages_per_group,
+        total_pages=cfg.total_pages,
+        time_threshold=cfg.time_threshold,
+        active_point=cfg.active_point,
+        label_dir_name=cfg.precomputed_label_dir_name,
+        labels_per_class=cfg.precomputed_labels_per_class,
+        recursive=cfg.recursive,
+        skip_missing_csv_raw=cfg.skip_missing_csv_raw,
+        overwrite=False,
+        dry_run=False,
+        progress_interval=cfg.progress_interval,
+    )
+    stats = ensure_precomputed_labels(label_config)
+    print(
+        "[precomputed labels] "
+        f"pages_per_group={cfg.pages_per_group} planned={stats.planned} "
+        f"generated={stats.generated} skipped_existing={stats.skipped_existing} "
+        f"roots={sorted(stats.label_roots or set())}"
+    )
+    return stats
+
+
 def main() -> None:
     """执行标准训练流程。"""
     args = build_argparser().parse_args()
-    cfg = config_from_args(args)
+    resume_run_dir = prepare_resume_args(args)
+    cfg = config_from_checkpoint_and_args(args)
     cfg = apply_default_train_paths(cfg)
     if args.save_every is not None:
         cfg = cfg.clone_with(save_every=args.save_every)
     seed_everything(cfg.seed)
     configure_torch_runtime(cfg)
 
+    label_stats = ensure_train_precomputed_labels(cfg)
     train_loader, val_loader, test_loader, dataset = cfg.build_dataloaders()
     device = cfg.resolved_device()
     model = cfg.build_model().to(device)
@@ -423,15 +510,22 @@ def main() -> None:
 
     start_epoch = 1
     best_val_loss = float("inf")
+    scheduler_loaded = False
     if cfg.checkpoint_path:
         checkpoint = load_checkpoint(
             cfg.checkpoint_path,
             model,
             optimizer=optimizer,
+            scheduler=scheduler,
             map_location=device,
         )
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_val_loss = float(checkpoint.get("metrics", {}).get("best_val_loss", best_val_loss))
+        scheduler_loaded = bool(checkpoint.get("_scheduler_loaded", False))
+        if hasattr(scheduler, "T_max"):
+            scheduler.T_max = max(cfg.epochs, 1)
+        if not scheduler_loaded:
+            scheduler.last_epoch = start_epoch - 1
 
     run_name = build_run_name(cfg, "train")
     cfg = cfg.clone_with(run_name=run_name)
@@ -443,8 +537,20 @@ def main() -> None:
     logger.info("run_name=%s", run_name)
     logger.info("log_file=%s", log_file)
     logger.info("checkpoint_run_dir=%s", checkpoint_run_dir)
+    if resume_run_dir is not None:
+        logger.info("resume_run_dir=%s", resume_run_dir)
     logger.info("data_paths=%s", cfg.data_paths)
     logger.info("csv_paths=%s", cfg.csv_paths)
+    if label_stats is not None:
+        logger.info(
+            "precomputed_labels pages_per_group=%d planned=%d generated=%d "
+            "skipped_existing=%d roots=%s",
+            cfg.pages_per_group,
+            label_stats.planned,
+            label_stats.generated,
+            label_stats.skipped_existing,
+            sorted(label_stats.label_roots or set()),
+        )
     logger.info(
         "split train/val/test=%d/%d/%d dataset_size=%d",
         len(train_loader.dataset),
@@ -456,7 +562,19 @@ def main() -> None:
         logger.info(line)
     logger.info("config_json=%s", json.dumps(cfg.to_dict(), ensure_ascii=False))
     if cfg.checkpoint_path:
-        logger.info("resumed_from=%s start_epoch=%d", cfg.checkpoint_path, start_epoch)
+        logger.info(
+            "resumed_from=%s start_epoch=%d scheduler_loaded=%s",
+            cfg.checkpoint_path,
+            start_epoch,
+            scheduler_loaded,
+        )
+    if start_epoch > cfg.epochs:
+        logger.warning(
+            "start_epoch=%d is greater than target epochs=%d; "
+            "--epochs 表示总目标 epoch, 需要调大才会继续训练",
+            start_epoch,
+            cfg.epochs,
+        )
 
     for epoch in range(start_epoch, cfg.epochs + 1):
         train_loss, train_items = train_one_epoch(
@@ -513,6 +631,7 @@ def main() -> None:
             checkpoint_run_dir / "last.pth",
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             epoch=epoch,
             cfg=cfg,
             metrics=epoch_record,
@@ -522,6 +641,7 @@ def main() -> None:
                 checkpoint_run_dir / "best.pth",
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 cfg=cfg,
                 metrics=epoch_record,
@@ -536,6 +656,7 @@ def main() -> None:
                 checkpoint_run_dir / f"epoch_{epoch:03d}.pth",
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 cfg=cfg,
                 metrics=epoch_record,

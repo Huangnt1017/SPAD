@@ -102,7 +102,157 @@ ch1 = intensity, 范围 [0, 1]
 
 `time_threshold` 默认是 `128`。输入中小于 `1` 或大于 `time_threshold` 的 ToF 会置 `0`，`0` 表示无效 photon。
 
-## 5. 推荐训练命令
+## 5. 模型结构与设计理论
+
+当前模型是 `SPADSpikeNet`，目标是在浓雾 SPAD ToF 数据中选择更可能属于目标回波的 photon，再由选中的 photon 估计深度和强度。
+
+整体结构：
+
+```text
+[B, 4096, P] raw ToF
+  -> reshape 为 [P, B, 64, 64]
+  -> valid mask: 1 <= tof <= time_threshold
+  -> ToF 编码: sinusoidal [P, B, 17, 64, 64] 或 LUT [P, B, D, 64, 64]
+  -> Stem: Conv1x1 + BN + PLIF + Conv3x3 + BN
+  -> SpikeBlock x num_blocks
+       PLIF -> 多尺度深度可分离卷积 -> PLIF -> Conv1x1 + BN -> residual
+  -> GateHead
+       PLIF -> Conv1x1 + BN -> PLIF -> Conv1x1 -> sigmoid
+  -> gate [P, B, 1, 64, 64]
+  -> Gated Moment
+       depth_coarse     = sum(gate * tof * valid) / sum(gate * valid)
+       intensity_coarse = sum(gate * valid) / P
+       confidence       = weight_sum / (weight_sum + 1)
+  -> 双头 SpatialRefineHead
+       depth_net      精修 depth
+       intensity_net  精修 intensity
+  -> output [B, 2, 64, 64]
+```
+
+核心设计思路：
+
+```text
+1. 不直接把所有 photon 做直方图峰值，而是学习一个逐 photon 的 gate。
+2. gate 表示当前 ToF 是否更像目标回波，而不是雾后向散射或无效噪声。
+3. depth 由原始 ToF 的加权矩计算，避免编码特征本身改变物理量纲。
+4. intensity 由被 gate 选中的有效 photon 比例得到，反映目标回波强度。
+5. SNN 的膜电位沿 P 维累计证据，适合处理稀疏事件和多次采样 photon。
+6. 最后的 CNN refine 只做空间局部残差修正，不替代 Gated Moment 的物理估计。
+```
+
+这里的 `P` 是同一个 raw group 内的 page 数。它不是图像高度或宽度，而是每个像素被重复采样的次数。训练时可以通过 `pages_per_group` 改变 `P`，模型 forward 会按实际 `P` 分 chunk 处理。
+
+## 6. 关键模块分析
+
+### 6.1 ToF 编码
+
+默认使用正弦编码：
+
+```text
+valid 通道:       1 个
+sin/cos 通道:     n_freq * 2 个
+默认 n_freq=8:    C_enc = 17
+```
+
+设计原因：不能直接把 `tof / time_threshold` 当成单通道强度输入。标量 ToF 会让网络把更大的时间 bin 误解为更强的刺激，而实际任务需要区分“时间位置”。正弦编码把 ToF 变成多频位置特征，使卷积可以组合出不同的时间窗口选择器。
+
+可选 `encoding_mode=lut`。LUT 使用 `nn.Embedding` 学习每个 ToF bin 的特征，表达能力更强，但需要 `w_lut_smooth` 和 `w_lut_norm` 约束相邻 bin 平滑和范数一致，避免小数据下过拟合或相邻 bin 表示剧烈跳变。
+
+### 6.2 Stem
+
+Stem 把编码通道映射到主干通道 `C`：
+
+```text
+[T, B, C_enc, H, W]
+  -> Conv1x1 + BN
+  -> PLIF/LIF/IF
+  -> Conv3x3 + BN
+  -> [T, B, C, H, W]
+```
+
+`Conv1x1` 用于融合 ToF 编码通道，`Conv3x3` 引入局部空间上下文。脉冲神经元位于两层卷积之间，用膜电位对 page 维上的稀疏事件进行累积。
+
+### 6.3 SpikeBlock
+
+每个 `SpikeBlock` 是等宽残差块：
+
+```text
+x
+  -> spike_in
+  -> MultiScaleDSConv(dilation=1/2/4)
+  -> spike_mid
+  -> Conv1x1 + BN
+  -> + residual
+```
+
+`MultiScaleDSConv` 使用三路 3x3 depthwise convolution：
+
+```text
+dilation=1: 3x3 局部细节
+dilation=2: 5x5 等效感受野
+dilation=4: 9x9 等效感受野
+```
+
+这些 dilation 只作用在空间维，不会跳过 page，也不会改变 P 维顺序。当前实现避免显式拼接 `[B, 3C, H, W]`，用分块 pointwise 权重累加三路结果，降低训练峰值显存。
+
+### 6.4 GateHead 和 Gated Moment
+
+`GateHead` 输出逐 photon 的 soft gate：
+
+```text
+gate = sigmoid(logits), shape=[P, B, 1, H, W]
+```
+
+gate 不直接输出深度，而是参与加权矩估计：
+
+```text
+weight_sum = sum(gate * valid)
+depth      = sum(gate * tof * valid) / (weight_sum + 1e-6)
+intensity  = weight_sum / P
+confidence = weight_sum / (weight_sum + 1)
+```
+
+这样保留了 ToF 的物理含义：depth 仍然由原始 ToF bin 计算，gate 只负责选择哪些 photon 更可信。`confidence` 用于表示该像素被选中的 photon 数是否足够，低置信区域不允许 refine 产生过大的残差。
+
+### 6.5 双头精修
+
+当前 refine 已拆成两个分支：
+
+```text
+输入: [depth_coarse / depth_range, intensity_coarse, confidence]
+
+depth_net:
+  输出 depth 残差, 只修正深度
+
+intensity_net:
+  输出 intensity 残差, 只修正强度
+```
+
+拆成两个头的原因是 depth 和 intensity 的物理含义不同：depth 是 ToF 位置，intensity 是选中 photon 占比。共享一个输出头容易让两个目标互相牵制；分离后每个分支可以学习自己的局部修正规律。两个分支的残差都会乘以 `confidence`，避免在 photon 很少的位置凭空补结构。
+
+### 6.6 Chunk 状态
+
+大 `P` 会显著增加显存，所以模型按 `chunk_size` 分块：
+
+```text
+P=128, chunk_size=32 -> 4 个 chunk
+```
+
+chunk 内保留完整脉冲状态和梯度；chunk 间执行：
+
+```text
+functional.detach_net(self)
+```
+
+这会保留膜电位前向状态，但截断跨 chunk 的反向传播图，降低显存和长序列 BPTT 风险。单次 forward 结束后执行：
+
+```text
+functional.reset_net(self)
+```
+
+它用于清空脉冲神经元状态，避免不同 batch 之间膜电位串扰。
+
+## 7. 推荐训练命令
 
 直接使用默认 0825/0826 训练：
 
@@ -147,7 +297,7 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py --trace-steps 5
 ```
 
-## 6. 测试命令
+## 8. 测试命令
 
 批量测试默认使用 0917：
 
@@ -174,7 +324,7 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
   --save-prediction
 ```
 
-## 7. 关键配置
+## 9. 关键配置
 
 常用数据参数：
 
@@ -213,23 +363,27 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 | `refine_mid` | `8` | 深度/强度精修头中间通道 |
 | `return_sequence` | `True` | 训练 var/sparse loss 时需要 |
 
-## 8. 数据增强
+## 10. 数据增强
 
 训练增强只作用于训练集。
 
 ToF shift：
 
 ```powershell
---augment-train --tof-shift-max 15 --tof-shift-prob 1.0
+--augment-train --num-aug 3 --keep-original-sample --tof-shift-max 15 --tof-shift-prob 1.0
 ```
 
 逻辑：
 
 ```text
-1. 在原始 raw group 上操作, 先于 time_threshold 裁剪
-2. 对所有非零 ToF 加同一个随机整数 delta, delta 属于 [-15, 15]
-3. 增强后小于 1 或大于 time_threshold 的值置 0
-4. 输入 group 和 label group 同步 shift
+1. 默认每个训练样本保留原始 1 份, 额外生成 num_aug 份增强样本
+2. 使用 --no-keep-original-sample 可只保留增强样本, 不保留 aug_index=0 的原始样本
+3. 若 num_aug=3 且保留原始样本, 训练集样本数变为原始训练集的 4 倍
+4. 若 num_aug=3 且不保留原始样本, 训练集样本数变为原始训练集的 3 倍
+5. 增强发生在原始 raw group 上, 先于 time_threshold 裁剪
+6. 对所有非零 ToF 加同一个随机整数 delta, delta 属于 [-15, 15]
+7. 增强后小于 1 或大于 time_threshold 的值置 0
+8. 输入 group 和 label group 同步 shift
 ```
 
 PageDropout：
@@ -250,7 +404,7 @@ Page shuffle：
 
 逻辑：随机打乱单个样本内部的 `P` 维 page 顺序。标签由未打乱的 group 统计生成，不受 page 顺序影响。
 
-## 9. Loss 和指标
+## 11. Loss 和指标
 
 训练 loss：
 
@@ -279,7 +433,7 @@ w_lut_norm=0.005
 
 日志中 `train_items` 和 `val_items` 会记录各个 loss 分项，`val_metrics` 会记录 depth/intensity 的 MAE、RMSE、SSIM、PSNR。
 
-## 10. 模型状态
+## 12. 模型状态
 
 `SPADSpikeNet.forward()` 内部保留两类状态操作：
 
@@ -299,7 +453,7 @@ intensity_net  精修 intensity
 
 两个分支都使用 coarse depth、coarse intensity 和 confidence 作为输入，并由 confidence 控制残差幅度。
 
-## 11. 显存和速度建议
+## 13. 显存和速度建议
 
 优先调这些参数：
 
