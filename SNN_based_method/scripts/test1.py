@@ -21,7 +21,6 @@ except ImportError:
 ensure_project_root_on_path()
 
 from SNN_based_method.SNN_config import SNNConfig
-from SNN_based_method.visualize_encoding import build_max_count_label_from_group
 from SNN_based_method.scripts.data import (
     RawGroupSample,
     SpadRawGroupDataset,
@@ -62,6 +61,65 @@ def _valid_percentile_range(image: np.ndarray, fallback_max: float) -> tuple[flo
     return vmin, vmax
 
 
+def _positive_percentile_max(image: np.ndarray, fallback_max: float) -> float:
+    """为强度图计算稳定上限, 只统计正值区域。"""
+    positive = image > 0
+    if not np.any(positive):
+        return float(fallback_max)
+    vmax = float(np.percentile(image[positive], 98))
+    return max(vmax, float(fallback_max))
+
+
+def build_histogram_max_label_from_group(
+    data: np.ndarray,
+    time_threshold: int,
+    *,
+    active_point: int = 1,
+    normalize_intensity: bool = False,
+) -> torch.Tensor:
+    """基于逐像素 ToF 直方图的最大值法生成 ``[2, 64, 64]`` 图像。
+
+    通道 0 为最大计数对应的 ToF bin，通道 1 为该 bin 的最大计数。
+    当 ``normalize_intensity=True`` 时，强度会额外除以 ``pages_per_group``，
+    仅用于和模型输出的 ``[0, 1]`` 强度做量纲一致的误差统计。
+    """
+    if data.ndim != 2 or data.shape[0] != 64 * 64:
+        raise ValueError(f"data must have shape [4096, P], got {data.shape}")
+    if time_threshold <= 0:
+        raise ValueError("time_threshold must be a positive integer")
+    if active_point <= 0:
+        raise ValueError("active_point must be a positive integer")
+
+    pages_per_group = int(data.shape[1])
+    label = np.zeros((2, 64, 64), dtype=np.float32)
+    if pages_per_group <= 0:
+        return torch.from_numpy(label)
+
+    group = data.astype(np.int32, copy=False)
+    max_bin = int(time_threshold)
+    intensity_scale = float(pages_per_group) if normalize_intensity else 1.0
+
+    for pixel_index in range(group.shape[0]):
+        values = group[pixel_index]
+        valid_values = values[(values >= 1) & (values <= max_bin)]
+        if valid_values.size == 0:
+            continue
+
+        counts = np.bincount(valid_values, minlength=max_bin + 1)
+        counts[0] = 0
+        best_count = int(counts.max())
+        if best_count < int(active_point):
+            continue
+
+        best_tof = int(counts.argmax())
+        y_idx = pixel_index // 64
+        x_idx = pixel_index % 64
+        label[0, y_idx, x_idx] = float(best_tof)
+        label[1, y_idx, x_idx] = float(best_count) / intensity_scale
+
+    return torch.from_numpy(label)
+
+
 def _save_single_image(
     image: np.ndarray,
     path: Path,
@@ -86,7 +144,8 @@ def _save_single_image(
 
 def save_prediction_images(
     output: torch.Tensor,
-    max_label: torch.Tensor,
+    max_label_count: torch.Tensor,
+    max_label_normalized: torch.Tensor,
     run_dir: Path,
     *,
     time_threshold: int,
@@ -94,21 +153,19 @@ def save_prediction_images(
     """保存模型输出与最大值法 baseline 的深度/强度对比图。"""
     model_depth = _to_image_2d(output[0, 0])
     model_intensity = _to_image_2d(output[0, 1])
-    max_depth = _to_image_2d(max_label[0])
-    max_intensity = _to_image_2d(max_label[1])
+    max_depth = _to_image_2d(max_label_count[0])
+    max_intensity_count = _to_image_2d(max_label_count[1])
+    max_intensity_normalized = _to_image_2d(max_label_normalized[1])
 
     depth_vmin, depth_vmax = _valid_percentile_range(
         np.concatenate([model_depth, max_depth], axis=0),
         fallback_max=float(time_threshold),
     )
-    intensity_vmax = max(
-        float(np.percentile(model_intensity[model_intensity > 0], 98))
-        if np.any(model_intensity > 0)
-        else 0.0,
-        float(np.percentile(max_intensity[max_intensity > 0], 98))
-        if np.any(max_intensity > 0)
-        else 0.0,
-        0.01,
+    model_intensity_vmax = _positive_percentile_max(model_intensity, 0.01)
+    max_intensity_count_vmax = _positive_percentile_max(max_intensity_count, 1.0)
+    comparison_intensity_vmax = max(
+        _positive_percentile_max(model_intensity, 0.01),
+        _positive_percentile_max(max_intensity_normalized, 0.01),
     )
 
     image_dir = run_dir / "images"
@@ -134,7 +191,7 @@ def save_prediction_images(
         title="Model Intensity",
         cmap="inferno",
         vmin=0.0,
-        vmax=intensity_vmax,
+        vmax=model_intensity_vmax,
     )
     _save_single_image(
         max_depth,
@@ -145,23 +202,29 @@ def save_prediction_images(
         vmax=depth_vmax,
     )
     _save_single_image(
-        max_intensity,
+        max_intensity_count,
         Path(saved_paths["max_intensity_png"]),
-        title="Max-count Intensity",
+        title="Max-count Intensity (Counts)",
         cmap="inferno",
         vmin=0.0,
-        vmax=intensity_vmax,
+        vmax=max_intensity_count_vmax,
     )
 
     depth_diff = np.abs(model_depth - max_depth)
-    intensity_diff = np.abs(model_intensity - max_intensity)
+    intensity_diff = np.abs(model_intensity - max_intensity_normalized)
     fig, axes = plt.subplots(2, 3, figsize=(12, 7))
     panels = [
         (model_depth, "Model Depth", "turbo", depth_vmin, depth_vmax),
         (max_depth, "Max-count Depth", "turbo", depth_vmin, depth_vmax),
         (depth_diff, "Abs Depth Diff", "magma", 0.0, max(float(np.percentile(depth_diff, 98)), 1.0)),
-        (model_intensity, "Model Intensity", "inferno", 0.0, intensity_vmax),
-        (max_intensity, "Max-count Intensity", "inferno", 0.0, intensity_vmax),
+        (model_intensity, "Model Intensity", "inferno", 0.0, comparison_intensity_vmax),
+        (
+            max_intensity_normalized,
+            "Max-count Intensity (/P)",
+            "inferno",
+            0.0,
+            comparison_intensity_vmax,
+        ),
         (
             intensity_diff,
             "Abs Intensity Diff",
@@ -277,13 +340,19 @@ def run_single_test(
         pages_per_group=resolved_pages_per_group,
         total_pages=sample.total_pages,
     )
-    max_label = build_max_count_label_from_group(
+    max_label_count = build_histogram_max_label_from_group(
         raw_group,
         cfg.time_threshold,
         active_point=cfg.active_point,
     )
-    depth_diff = torch.abs(output[:, 0:1] - max_label[0:1].unsqueeze(0))
-    intensity_diff = torch.abs(output[:, 1:2] - max_label[1:2].unsqueeze(0))
+    max_label_normalized = build_histogram_max_label_from_group(
+        raw_group,
+        cfg.time_threshold,
+        active_point=cfg.active_point,
+        normalize_intensity=True,
+    )
+    depth_diff = torch.abs(output[:, 0:1] - max_label_count[0:1].unsqueeze(0))
+    intensity_diff = torch.abs(output[:, 1:2] - max_label_normalized[1:2].unsqueeze(0))
     info: dict[str, object] = {
         "raw_path": str(Path(raw_path).resolve()),
         "pages_per_group": int(resolved_pages_per_group),
@@ -295,8 +364,9 @@ def run_single_test(
         "depth_max": float(output[:, 0:1].max().item()),
         "intensity_min": float(output[:, 1:2].min().item()),
         "intensity_max": float(output[:, 1:2].max().item()),
-        "max_method_depth_max": float(max_label[0:1].max().item()),
-        "max_method_intensity_max": float(max_label[1:2].max().item()),
+        "max_method_depth_max": float(max_label_count[0:1].max().item()),
+        "max_method_intensity_max": float(max_label_count[1:2].max().item()),
+        "max_method_intensity_normalized_max": float(max_label_normalized[1:2].max().item()),
         "depth_abs_diff_mean": float(depth_diff.mean().item()),
         "depth_abs_diff_max": float(depth_diff.max().item()),
         "intensity_abs_diff_mean": float(intensity_diff.mean().item()),
@@ -315,7 +385,8 @@ def run_single_test(
         cfg.save(run_dir / "config.json")
         saved_images = save_prediction_images(
             output,
-            max_label,
+            max_label_count,
+            max_label_normalized,
             run_dir,
             time_threshold=cfg.time_threshold,
         )
@@ -359,9 +430,9 @@ def main_without_cli() -> None:
     """无 CLI 直接运行入口; 在这里显式修改单样本测试参数。"""
     # ===== Editable parameters =====
     checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260604_113734\\last.pth"
-    raw_path = r"D:\\PYproject\\SPADdata\\0917\\2025-09-17_17-15-02_Delay-0_Width-2000.raw"  # V，2
-    pages_per_group = 1280
-    group_index = 25
+    raw_path = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-37_Delay-0_Width-2000.raw"  # 
+    pages_per_group = 2400
+    group_index = 15
     save_prediction = True
 
     # 测试输入参数显式在这里指定, 不从 checkpoint/config 继承。

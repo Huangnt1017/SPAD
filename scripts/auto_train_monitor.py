@@ -208,17 +208,17 @@ def run_auto_train(config: AutoTrainConfig) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数。"""
-    parser = argparse.ArgumentParser(description="Run SPAD training jobs sequentially.")
-    parser.add_argument("--models", nargs="+", default=AUTO_TRAIN_MODELS, help="Model queue to train in order.")
-    parser.add_argument("--epochs", type=int, default=100, help="Epochs for each model.")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for each model.")
-    parser.add_argument("--poll-seconds", type=int, default=30, help="Seconds between process checks.")
-    parser.add_argument("--python-exe", type=Path, default=Path(sys.executable), help="Python executable for training.")
-    parser.add_argument("--data-root", type=Path, default=None, help="Optional data root override.")
-    parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "logs" / "CLS", help="Training log directory.")
-    parser.add_argument("--save-dir", type=Path, default=PROJECT_ROOT / "checkpoints" / "CLS", help="Checkpoint directory.")
-    parser.add_argument("--state-file", type=Path, default=STATE_FILE, help="Monitor state JSON path.")
-    parser.add_argument("--dry-run", action="store_true", help="Print the queue without launching training.")
+    parser = argparse.ArgumentParser(description="按队列顺序执行 SPAD 训练任务")
+    parser.add_argument("--models", nargs="+", default=AUTO_TRAIN_MODELS, help="按顺序训练的模型队列")
+    parser.add_argument("--epochs", type=int, default=100, help="每个模型的训练轮数")
+    parser.add_argument("--batch-size", type=int, default=32, help="每个模型的批大小")
+    parser.add_argument("--poll-seconds", type=int, default=30, help="进程检查间隔秒数")
+    parser.add_argument("--python-exe", type=Path, default=Path(sys.executable), help="训练使用的 Python 可执行文件路径")
+    parser.add_argument("--data-root", type=Path, default=None, help="可选的数据根目录覆盖")
+    parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "logs" / "CLS", help="训练日志目录")
+    parser.add_argument("--save-dir", type=Path, default=PROJECT_ROOT / "checkpoints" / "CLS", help="Checkpoint 保存目录")
+    parser.add_argument("--state-file", type=Path, default=STATE_FILE, help="监控状态 JSON 文件路径")
+    parser.add_argument("--dry-run", action="store_true", help="仅打印训练队列, 不启动训练")
     return parser
 
 

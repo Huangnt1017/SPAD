@@ -101,9 +101,25 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint", dest="checkpoint_path", default=None, help="checkpoint 路径")
     parser.add_argument(
         "--model-backend",
-        choices=["new", "activation", "activation_based", "legacy", "clock", "clock_driven"],
+        choices=[
+            "new",
+            "activation",
+            "activation_based",
+            "legacy",
+            "clock",
+            "clock_driven",
+            "rnn",
+            "recurrent",
+            "srnn",
+            "lstm",
+            "clstm",
+            "convlstm",
+            "gru",
+            "cgru",
+            "convgru",
+        ],
         default=None,
-        help="模型后端; legacy/clock_driven 仅作旧配置兼容, 实际使用官方 activation_based",
+        help="模型后端; new 为官方 activation_based SNN, rnn/lstm/gru 为显式时序递推版本",
     )
     parser.add_argument("--encoding-mode", choices=["sinusoidal", "lut"], default=None, help="ToF 编码方式")
     parser.add_argument("--embed-dim", type=int, default=None, help="LUT 编码维度")
@@ -134,6 +150,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
         help="只返回最终图像输出; 推理时可降低显存和日志负担",
     )
     parser.add_argument("--w-gt", type=float, default=None, help="GT L1 loss 权重")
+    parser.add_argument("--w-depth-reg", type=float, default=None, help="有效 depth 区域回归 loss 权重")
     parser.add_argument("--w-ssim", type=float, default=None, help="SSIM loss 权重")
     parser.add_argument("--w-var", type=float, default=None, help="gate 方差 loss 权重")
     parser.add_argument("--w-sparse", type=float, default=None, help="gate 稀疏 loss 权重")
@@ -142,6 +159,14 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--w-lut-norm", type=float, default=None, help="LUT 范数一致性正则权重")
     parser.add_argument("--sigma-target", type=float, default=None, help="gate 方差 loss 的目标 sigma, 单位为 bin")
     parser.add_argument("--rho-target", type=float, default=None, help="gate 稀疏 loss 的目标平均激活率")
+    parser.add_argument(
+        "--sparse-mode",
+        choices=["upper", "target", "band"],
+        default=None,
+        help="gate 稀疏正则模式: upper=旧单边阈值, target=贴近目标率, band=保持在区间内",
+    )
+    parser.add_argument("--rho-min", type=float, default=None, help="sparse_mode=band 时的平均 gate 激活率下限")
+    parser.add_argument("--rho-max", type=float, default=None, help="sparse_mode=band 时的平均 gate 激活率上限")
     parser.add_argument("--beta-smooth", type=float, default=None, help="强度引导平滑 loss 的边缘衰减系数")
     parser.add_argument("--ssim-kernel-size", type=int, default=None, help="SSIM 高斯窗口大小")
     parser.add_argument(
@@ -149,6 +174,32 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="SSIM 前均值滤波窗口; 1 表示关闭, 必须为奇数",
+    )
+    parser.add_argument(
+        "--depth-reg-mode",
+        choices=["mse", "charbonnier", "l1"],
+        default=None,
+        help="depth 回归项类型: mse 对齐 PSNR, charbonnier 抗噪, l1 更稳健",
+    )
+    depth_reg_mask_group = parser.add_mutually_exclusive_group()
+    depth_reg_mask_group.add_argument(
+        "--depth-reg-use-mask",
+        dest="depth_reg_use_mask",
+        action="store_true",
+        default=None,
+        help="depth 回归项仅在 depth_gt > 0 区域计算",
+    )
+    depth_reg_mask_group.add_argument(
+        "--no-depth-reg-mask",
+        dest="depth_reg_use_mask",
+        action="store_false",
+        help="depth 回归项在全图计算",
+    )
+    parser.add_argument(
+        "--depth-reg-charbonnier-eps",
+        type=float,
+        default=None,
+        help="depth_reg_mode=charbonnier 时的平滑常数",
     )
     gt_mask_group = parser.add_mutually_exclusive_group()
     gt_mask_group.add_argument(
@@ -355,6 +406,7 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "refine_mid",
         "return_sequence",
         "w_gt",
+        "w_depth_reg",
         "w_ssim",
         "w_var",
         "w_sparse",
@@ -363,9 +415,15 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "w_lut_norm",
         "sigma_target",
         "rho_target",
+        "sparse_mode",
+        "rho_min",
+        "rho_max",
         "beta_smooth",
         "ssim_kernel_size",
         "ssim_smooth_kernel_size",
+        "depth_reg_mode",
+        "depth_reg_use_mask",
+        "depth_reg_charbonnier_eps",
         "gt_use_mask",
         "ssim_use_mask",
         "use_precomputed_labels",
@@ -479,6 +537,7 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "refine_mid",
         "return_sequence",
         "w_gt",
+        "w_depth_reg",
         "w_ssim",
         "w_var",
         "w_sparse",
@@ -487,9 +546,15 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "w_lut_norm",
         "sigma_target",
         "rho_target",
+        "sparse_mode",
+        "rho_min",
+        "rho_max",
         "beta_smooth",
         "ssim_kernel_size",
         "ssim_smooth_kernel_size",
+        "depth_reg_mode",
+        "depth_reg_use_mask",
+        "depth_reg_charbonnier_eps",
         "gt_use_mask",
         "ssim_use_mask",
         "use_precomputed_labels",

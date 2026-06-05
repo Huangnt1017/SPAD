@@ -663,7 +663,7 @@ def main() -> None:
             )
             logger.info("Saved epoch checkpoint to %s", checkpoint_run_dir / f"epoch_{epoch:03d}.pth")
 
-        logger.info("Saved last checkpoint to %s", checkpoint_run_dir / "last.pth")
+        logger.info("Updated last checkpoint to %s", checkpoint_run_dir / "last.pth")
 
     logger.info("Training finished. Best val loss=%.6f", best_val_loss)
     logger.info("log_file=%s", log_file)

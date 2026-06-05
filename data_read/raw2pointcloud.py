@@ -11,11 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 data_size = 2  # 每个uint16数据占据2个字节
 # 设置时间截取阈值
-timeThreshold = 190
+timeThreshold = 128
 
 # 选择帧数进行统计拟合
 startFrame = 1
-endFrame = 480 * 10
+endFrame = 480 * 100
 # 重塑数据为64*64的数组
 numPixels = 64 * 64
 
@@ -430,9 +430,9 @@ def augment_region_shift_rotate(points: np.ndarray,
 np.set_printoptions(threshold=np.inf)
 if __name__ == '__main__':
     # # 可视化txt文件
-    # rawfile = r'E:/essay/硕士/研一/SPAD数据/20260320/2026-03-20_16-39-17_Delay-0_Width-200.raw'
-    # position,_ = raw2n3(rawfile)
-    # pc = n3_filter(position)
+    rawfile = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-37_Delay-0_Width-2000.raw"
+    position,_ = raw2n3(rawfile)
+    pc = n3_filter(position)
     # # pc[:, 3] = np.where(pc[:, 3] >= 550, 550, pc[:, 3])
     # mask1 = pc[:, 3] >= 30
     # pc1 = pc[mask1]
@@ -444,12 +444,12 @@ if __name__ == '__main__':
     # indices = np.random.choice(pc.shape[0], 4096*20, p=weights1, replace=False)
     # pc_rd = pc[indices, :]
     # plot_pc(pc_rd,'all')
-    pc = read_pc(r"D:\PYproject\SPADdata\2025-04-30-dpc\G\2025-04-30_18-53-59_Delay-0_Width-200-5-7.txt")
+    # pc = read_pc(r"D:\PYproject\SPADdata\2025-04-30-dpc\G\2025-04-30_18-53-59_Delay-0_Width-200-5-7.txt")
     # pc_d = pc_down_sample_intensity_topk(pc,1024)
     # plot_pc2d(pc)
-    mask1 = pc[:, 3] >= 50
+    mask1 = pc[:, 3] >= 150
     pc1 = pc[mask1]
-    mask2 = (pc1[:, 2] >= 55) & (pc1[:, 2] <= 65)
+    mask2 = (pc1[:, 2] >= 60) & (pc1[:, 2] <= 70)
     pc2 = pc1[mask2]
     # dx,dy,dz = np.random.randint(-20,20),np.random.randint(-5,30),np.random.randint(-20,15)
     # print(dx,dy,dz)
@@ -461,8 +461,8 @@ if __name__ == '__main__':
     # pc2 = pc1[mask2]
     # mask3 = (pc2[:, 0] >= 20) & (pc2[:, 0] <= 35)
     # pc3 = pc2[mask3]
-    print('pc shape:', pc.shape)
-    plot_pc(pc, 'ds')
+    print('pc shape:', pc2.shape)
+    plot_pc(pc2, 'ds')
     # plot_pc2d(pc)
     # 可视化raw文件，保存
     # start = time.time()

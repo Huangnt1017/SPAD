@@ -474,7 +474,7 @@ def run_with_config(config: GenerateLabelConfig) -> GenerateLabelStats:
 
             if processed % progress_interval == 0:
                 print(
-                    f"processed={processed} generated={stats.generated} "
+                    f"label_pages={config.pages_per_group} processed={processed} generated={stats.generated} "
                     f"skipped_existing={stats.skipped_existing}"
                 )
 

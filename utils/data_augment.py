@@ -7,6 +7,9 @@ from typing import Tuple, List, Dict, Optional
 AUGMENT_SEED_STRIDE = 1_000_003
 """不同增强副本之间的随机种子步长，选用大素数降低重复采样概率。"""
 
+TARGET_ROTATION_DEGREE_RANGE = (-180.0, 180.0)
+"""target 绕 z 轴旋转的角度范围，单位为 degree。"""
+
 def load_xyzi(file_path: str) -> np.ndarray:
     """Read xyzi txt as numpy array (Utility)"""
     try:
@@ -28,6 +31,28 @@ def _randint_inclusive(low: int, high: int, generator: Optional[torch.Generator]
     if low > high:
         raise ValueError(f"Invalid randint range: [{low}, {high}]")
     return int(torch.randint(low, high + 1, (1,), generator=generator).item())
+
+
+def _uniform_float(low: float, high: float, generator: Optional[torch.Generator] = None) -> float:
+    """从闭区间近似采样浮点数，可传入确定性随机生成器。"""
+    if low > high:
+        raise ValueError(f"Invalid uniform range: [{low}, {high}]")
+    if low == high:
+        return float(low)
+    value = torch.rand(1, generator=generator).item()
+    return float(low + value * (high - low))
+
+
+def _rotate_xy_about_center(xy: torch.Tensor, center_xy: torch.Tensor, angle_degrees: float) -> torch.Tensor:
+    """在 xy 平面绕 center_xy 旋转，等价于绕 z 轴旋转。"""
+    angle_radians = float(np.deg2rad(angle_degrees))
+    cos_theta = torch.as_tensor(np.cos(angle_radians), dtype=xy.dtype, device=xy.device)
+    sin_theta = torch.as_tensor(np.sin(angle_radians), dtype=xy.dtype, device=xy.device)
+
+    relative = xy - center_xy
+    rotated_x = relative[:, 0] * cos_theta - relative[:, 1] * sin_theta
+    rotated_y = relative[:, 0] * sin_theta + relative[:, 1] * cos_theta
+    return torch.stack((rotated_x, rotated_y), dim=1) + center_xy
 
 
 def resolve_num_aug(num_aug: int, apply_augment: bool = True) -> int:
@@ -67,8 +92,8 @@ def augment_pytorch_batch(
 
     Features:
     - Input: (B, N, 4) FloatTensor.
-    - Target layer (fixed source region): x[20,35), y[5,25), z[80,85).
-      Random translation in x/y/z (no rotation).
+    - Target layer (fixed source region): x[20,35), y[5,20), z[80,85).
+      Random z-axis rotation around the target center, then translation in x/y/z.
     - Fog layer (fixed source region): x[1,65), y[1,65), z[35,65).
       Random translation only in z.
     - Constraints:
@@ -124,9 +149,22 @@ def augment_pytorch_batch(
     fog_z_limit = (1, 105)
     min_gap_bins = 5
 
-    # Shift ranges for target translation
-    dx_range = (xy_limit[0] - tgt_x[0], xy_limit[1] - (tgt_x[1] - 1))
-    dy_range = (xy_limit[0] - tgt_y[0], xy_limit[1] - (tgt_y[1] - 1))
+    # target 的训练标签沿用固定连续框，旋转时绕该框中心点旋转。
+    target_rotation_center = (
+        (tgt_x[0] + tgt_x[1]) * 0.5,
+        (tgt_y[0] + tgt_y[1]) * 0.5,
+    )
+    target_source_corners_xy = torch.tensor(
+        [
+            [tgt_x[0], tgt_y[0]],
+            [tgt_x[1] - 1, tgt_y[0]],
+            [tgt_x[1] - 1, tgt_y[1] - 1],
+            [tgt_x[0], tgt_y[1] - 1],
+        ],
+        dtype=torch.float32,
+    )
+
+    # Shift range for target z translation
     dz_target_range = (target_z_limit[0] - tgt_z[0], target_z_limit[1] - (tgt_z[1] - 1))
 
     # Base shift range for fog z translation
@@ -153,6 +191,30 @@ def augment_pytorch_batch(
             sample_generator = torch.Generator(device="cpu")
             sample_generator.manual_seed(int(seed) + i)
 
+        target_rotation_degrees = _uniform_float(
+            TARGET_ROTATION_DEGREE_RANGE[0],
+            TARGET_ROTATION_DEGREE_RANGE[1],
+            sample_generator,
+        )
+
+        # 先计算旋转后 target 的实际 xy 外接范围，再采样平移量，避免边界处被 clamp 截断。
+        center_xy_cpu = torch.tensor(target_rotation_center, dtype=torch.float32)
+        rotated_corners_xy = _rotate_xy_about_center(
+            target_source_corners_xy,
+            center_xy_cpu,
+            target_rotation_degrees,
+        )
+        rotated_xy_min = rotated_corners_xy.min(dim=0).values
+        rotated_xy_max = rotated_corners_xy.max(dim=0).values
+        dx_range = (
+            int(np.ceil(xy_limit[0] - float(rotated_xy_min[0]))),
+            int(np.floor(xy_limit[1] - float(rotated_xy_max[0]))),
+        )
+        dy_range = (
+            int(np.ceil(xy_limit[0] - float(rotated_xy_min[1]))),
+            int(np.floor(xy_limit[1] - float(rotated_xy_max[1]))),
+        )
+
         dx = _randint_inclusive(dx_range[0], dx_range[1], sample_generator)
         dy = _randint_inclusive(dy_range[0], dy_range[1], sample_generator)
 
@@ -175,11 +237,18 @@ def augment_pytorch_batch(
         if not sampled:
             raise RuntimeError("Unable to sample valid target/fog shifts under current constraints.")
 
-        # Move target: random x/y/z translation, no rotation
+        # Move target: z 轴旋转与 x/y/z 平移在同一次增强中完成。
         if target_mask.any():
-            aug_points[i, target_mask, 0] += dx
-            aug_points[i, target_mask, 1] += dy
-            aug_points[i, target_mask, 2] += dz_target
+            center_xy = torch.as_tensor(target_rotation_center, dtype=pc.dtype, device=device)
+            shift_xy = torch.as_tensor([dx, dy], dtype=pc.dtype, device=device)
+            rotated_xy = _rotate_xy_about_center(
+                pc[target_mask, :2],
+                center_xy,
+                target_rotation_degrees,
+            )
+
+            aug_points[i, target_mask, 0:2] = rotated_xy + shift_xy
+            aug_points[i, target_mask, 2] = pc[target_mask, 2] + dz_target
 
             aug_points[i, target_mask, 0] = torch.clamp(aug_points[i, target_mask, 0], xy_limit[0], xy_limit[1])
             aug_points[i, target_mask, 1] = torch.clamp(aug_points[i, target_mask, 1], xy_limit[0], xy_limit[1])
@@ -194,10 +263,25 @@ def augment_pytorch_batch(
         target_y_new = (tgt_y[0] + dy, tgt_y[1] + dy)
         target_z_new_inclusive = (tgt_z[0] + dz_target, (tgt_z[1] - 1) + dz_target)
         fog_z_new_inclusive = (fog_z[0] + dz_fog, (fog_z[1] - 1) + dz_fog)
+        target_rotated_x_range = (
+            float(rotated_xy_min[0]) + dx,
+            float(rotated_xy_max[0]) + dx,
+        )
+        target_rotated_y_range = (
+            float(rotated_xy_min[1]) + dy,
+            float(rotated_xy_max[1]) + dy,
+        )
 
         meta_list.append({
             "label": label_class,
             "target_shift": [int(dx), int(dy), int(dz_target)],
+            "target_rotation_degrees": float(target_rotation_degrees),
+            "target_rotation_center": [
+                float(target_rotation_center[0] + dx),
+                float(target_rotation_center[1] + dy),
+            ],
+            "target_rotated_x_range": [float(target_rotated_x_range[0]), float(target_rotated_x_range[1])],
+            "target_rotated_y_range": [float(target_rotated_y_range[0]), float(target_rotated_y_range[1])],
             "fog_shift_z": int(dz_fog),
             "target_x_range": [int(target_x_new[0]), int(target_x_new[1])],
             "target_y_range": [int(target_y_new[0]), int(target_y_new[1])],
@@ -232,6 +316,57 @@ def _draw_3d_box_wireframe(ax, x_range, y_range, z_range, color='r', linewidth=1
                   color=color, linewidth=linewidth, alpha=alpha)
 
 
+def _draw_rotated_box_wireframe(
+    ax,
+    x_range,
+    y_range,
+    z_range,
+    center_xy,
+    angle_degrees,
+    color='r',
+    linewidth=1.5,
+    alpha=0.8,
+):
+    """绘制绕 z 轴旋转后的 3D 线框 box。"""
+    base_xy = torch.tensor(
+        [
+            [x_range[0], y_range[0]],
+            [x_range[1], y_range[0]],
+            [x_range[1], y_range[1]],
+            [x_range[0], y_range[1]],
+        ],
+        dtype=torch.float32,
+    )
+    center_xy_tensor = torch.tensor(center_xy, dtype=torch.float32)
+    rotated_xy = _rotate_xy_about_center(base_xy, center_xy_tensor, angle_degrees).cpu().numpy()
+
+    z0, z1 = z_range
+    verts = [
+        [rotated_xy[0, 0], rotated_xy[0, 1], z0],
+        [rotated_xy[1, 0], rotated_xy[1, 1], z0],
+        [rotated_xy[2, 0], rotated_xy[2, 1], z0],
+        [rotated_xy[3, 0], rotated_xy[3, 1], z0],
+        [rotated_xy[0, 0], rotated_xy[0, 1], z1],
+        [rotated_xy[1, 0], rotated_xy[1, 1], z1],
+        [rotated_xy[2, 0], rotated_xy[2, 1], z1],
+        [rotated_xy[3, 0], rotated_xy[3, 1], z1],
+    ]
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    for i, j in edges:
+        ax.plot3D(
+            [verts[i][0], verts[j][0]],
+            [verts[i][1], verts[j][1]],
+            [verts[i][2], verts[j][2]],
+            color=color,
+            linewidth=linewidth,
+            alpha=alpha,
+        )
+
+
 if __name__ == "__main__":
     import os
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # 解决 OpenMP 多副本冲突
@@ -259,7 +394,7 @@ if __name__ == "__main__":
 
     # ── 3. 执行增强 ─────────────────────────────────────────────
     label_class = "A"
-    aug_points, meta = augment_pytorch_batch(points, label_class=label_class, seed=42)
+    aug_points, meta = augment_pytorch_batch(points, label_class=label_class, seed=41)
 
     # ── 4. 输出增强后的 label：3D box 位置及类别 ──────────────────
     print("\n" + "=" * 62)
@@ -268,6 +403,7 @@ if __name__ == "__main__":
     m = meta[0]
     print(f"  类别 (label)        : {m['label']}")
     print(f"  目标位移 dx/dy/dz   : {m['target_shift']}")
+    print(f"  目标绕 z 轴旋转角度 : {m['target_rotation_degrees']:.2f}°")
     print(f"  目标 3D Box X 范围  : [{m['target_x_range'][0]}, {m['target_x_range'][1]})")
     print(f"  目标 3D Box Y 范围  : [{m['target_y_range'][0]}, {m['target_y_range'][1]})")
     print(f"  目标 3D Box Z 范围  : [{m['target_z_range'][0]}, {m['target_z_range'][1]}] (含)")
@@ -287,6 +423,8 @@ if __name__ == "__main__":
     aug_tgt_x = (m['target_x_range'][0], m['target_x_range'][1])
     aug_tgt_y = (m['target_y_range'][0], m['target_y_range'][1])
     aug_tgt_z = (m['target_z_range'][0], m['target_z_range'][1] + 1)   # metadata 上界含
+    aug_tgt_center_xy = (m['target_rotation_center'][0], m['target_rotation_center'][1])
+    aug_tgt_angle = m['target_rotation_degrees']
     aug_fog_x = src_fog_x       # 烟雾 x/y 不变
     aug_fog_y = src_fog_y
     aug_fog_z = (m['fog_z_range'][0], m['fog_z_range'][1] + 1)         # metadata 上界含
@@ -328,8 +466,17 @@ if __name__ == "__main__":
     ax2.scatter(aug[:, 0], aug[:, 1], aug[:, 2],
                 c=int_aug, s=2, cmap=cmap_custom, alpha=0.5)
 
-    # 叠加增强后 3D Box 线框
-    _draw_3d_box_wireframe(ax2, aug_tgt_x, aug_tgt_y, aug_tgt_z, color='red', linewidth=1.5)
+    # 叠加增强后 3D Box 线框：target 使用真实旋转后的线框，fog 仍为轴对齐框。
+    _draw_rotated_box_wireframe(
+        ax2,
+        aug_tgt_x,
+        aug_tgt_y,
+        aug_tgt_z,
+        center_xy=aug_tgt_center_xy,
+        angle_degrees=aug_tgt_angle,
+        color='red',
+        linewidth=1.5,
+    )
     _draw_3d_box_wireframe(ax2, aug_fog_x, aug_fog_y, aug_fog_z, color='cyan', linewidth=1.0)
 
     ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')

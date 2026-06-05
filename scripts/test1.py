@@ -571,7 +571,7 @@ def run_single_test(args: argparse.Namespace) -> Dict[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
 	"""单 txt 文件推理 + 可视化 CLI。"""
-	parser = argparse.ArgumentParser(description="SPAD single-TXT-file inference + visualization")
+	parser = argparse.ArgumentParser(description="SPAD 单 txt 文件推理 + 可视化")
 	parser.add_argument(  # 数据路径 
 		"--input", type=str, 
 		default=r"D:\\PYproject\\SPADdata\\2025-04-30-dpc\\W\\2025-04-30_19-07-46_Delay-0_Width-200-7-9.txt",
@@ -591,17 +591,19 @@ def build_parser() -> argparse.ArgumentParser:
 			"spt", "upp",
 			"graph_residual", "graph_residual_gcn",   # 自研模型
 		],
+		help="Backbone 模型名称",
 	)
 	parser.add_argument("--output-dir", type=str, default=r"D:\PYproject\SPAD\logs\CLS\test1",
 	                    help="输出图像保存目录, 文件名=<pred_class>_<ckpt_stem>_<YYYYMMDD_HHMM>.png")
-	parser.add_argument("--log-dir", type=str, default="logs/CLS")
+	parser.add_argument("--log-dir", type=str, default="logs/CLS", help="日志输出目录")
 	parser.add_argument(
 		"--seed", type=int, default=None,
 		help="可选随机 seed; 默认 None = 每次都不同 (适合反复 click Run 看不同增强样本); "
 		     "传整数则固定 RNG 用于复现",
 	)
 	parser.add_argument("--device", type=str, default="auto",
-	                    choices=["auto", "cpu", "cuda"])
+	                    choices=["auto", "cpu", "cuda"],
+	                    help="计算设备: auto/cpu/cuda")
 	# 数据增强开关 (默认开启, 与训练管线一致); 用 --no-augment 关掉做纯前向调试
 	parser.add_argument("--augment", dest="augment", action="store_true",
 	                    help="启用 target+fog 增强 (默认)")

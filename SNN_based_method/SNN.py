@@ -2,8 +2,8 @@
 
 本项目现在只使用环境中安装的官方 ``spikingjelly`` 包，并统一走
 ``spikingjelly.activation_based`` API。保留本文件是为了兼容旧代码中的
-``from SNN_based_method.SNN import SPADSpikeNet`` 导入路径；实际实现位于
-``SNN_based_method.SNN_new``。
+``from SNN_based_method.SNN import ...`` 导入路径，并统一导出默认 SNN
+后端以及显式 RNN / ConvLSTM / ConvGRU 版本。
 """
 
 from __future__ import annotations
@@ -25,6 +25,24 @@ from SNN_based_method.SNN_new import (  # noqa: E402
     encode_tof,
     run_5d_memory_benchmark,
 )
+from SNN_based_method.SNN_c_RNN import (  # noqa: E402
+    SNN_c_RNN,
+    SPADSpikeRNN,
+    SpikeBlockRNN,
+    SpikingRecurrentCell,
+)
+from SNN_based_method.SNN_c_LSTM import (  # noqa: E402
+    ConvLSTMCell,
+    LSTMBlock,
+    SNN_c_LSTM,
+    SPADSpikeLSTM,
+)
+from SNN_based_method.SNN_c_GRU import (  # noqa: E402
+    ConvGRUCell,
+    GRUBlock,
+    SNN_c_GRU,
+    SPADSpikeGRU,
+)
 
 __all__ = [
     "SPADSpikeNet",
@@ -35,4 +53,16 @@ __all__ = [
     "SpikeBlock",
     "SpatialRefineHead",
     "run_5d_memory_benchmark",
+    "SNN_c_RNN",
+    "SPADSpikeRNN",
+    "SpikingRecurrentCell",
+    "SpikeBlockRNN",
+    "SNN_c_LSTM",
+    "SPADSpikeLSTM",
+    "ConvLSTMCell",
+    "LSTMBlock",
+    "SNN_c_GRU",
+    "SPADSpikeGRU",
+    "ConvGRUCell",
+    "GRUBlock",
 ]

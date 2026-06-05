@@ -13,6 +13,8 @@ __pycache__/
 # 训练/测试产物
 logs/
 checkpoints/
+checkpoints/CLS
+checkpoints/SNN
 *.log
 *.pth
 *.pt

@@ -717,9 +717,9 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 def build_parser() -> argparse.ArgumentParser:
 	"""构建测试命令行参数解析器。"""
 	# 测试参数主要控制 checkpoint、数据源、batch 大小以及是否对 eval 集做增强。
-	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification evaluation")
-	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
-	parser.add_argument("--checkpoint", type=str, default=r"D:\PYproject\SPAD\checkpoints\CLS\dgcnn_20260426_183404_669391_best.pth", help="Path to trained checkpoint")
+	parser = argparse.ArgumentParser(description="SPAD 3D 点云分类评估")
+	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD 数据根目录")
+	parser.add_argument("--checkpoint", type=str, default=r"D:\PYproject\SPAD\checkpoints\CLS\dgcnn_20260426_183404_669391_best.pth", help="训练 checkpoint 路径")
 	parser.add_argument(
 		"--model",
 		type=str,
@@ -729,26 +729,26 @@ def build_parser() -> argparse.ArgumentParser:
 			"pointtransformer", "pointtransv2", "pointtransv3",
 			"pointmlp", "pointmlpelite", "pointbert", "pointmae", "pointrwkv", "spt", "upp",
 		],
-		help="Backbone model",
+		help="Backbone 模型名称",
 	)
-	parser.add_argument("--batch-size", type=int, default=16)
-	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
-	parser.add_argument("--train-ratio", type=float, default=0.6)
-	parser.add_argument("--val-ratio", type=float, default=0.2)
-	parser.add_argument("--test-ratio", type=float, default=0.2)
-	parser.add_argument("--num-workers", type=int, default=0)
-	parser.add_argument("--seed", type=int, default=42)
-	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="Label source mode")
-	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in eval dataset")
-	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable eval dataset augmentation")
-	parser.add_argument("--device", type=str, default="cuda", help="auto/cpu/cuda")
-	parser.add_argument("--log-dir", type=str, default="logs/CLS")
-	parser.add_argument("--output-dir", type=str, default="logs/CLS")
-	parser.add_argument("--box-space", type=str, default="absolute", choices=["absolute", "normalized"], help="How to interpret box head outputs")
+	parser.add_argument("--batch-size", type=int, default=16, help="批大小")
+	parser.add_argument("--num-points", type=int, default=1024, help="每个样本的固定点数 (确定性采样/填充)")
+	parser.add_argument("--train-ratio", type=float, default=0.6, help="训练集占比")
+	parser.add_argument("--val-ratio", type=float, default=0.2, help="验证集占比")
+	parser.add_argument("--test-ratio", type=float, default=0.2, help="测试集占比")
+	parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker 进程数")
+	parser.add_argument("--seed", type=int, default=42, help="随机种子")
+	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="标签来源模式")
+	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="对验证/测试集应用数据增强")
+	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="禁用验证/测试集数据增强")
+	parser.add_argument("--device", type=str, default="cuda", help="计算设备: auto/cpu/cuda")
+	parser.add_argument("--log-dir", type=str, default="logs/CLS", help="日志输出目录")
+	parser.add_argument("--output-dir", type=str, default="logs/CLS", help="结果输出目录")
+	parser.add_argument("--box-space", type=str, default="absolute", choices=["absolute", "normalized"], help="box head 输出的解释方式")
 	# 混淆矩阵默认归一化输出 (每行求和=1, 颜色直接反映 recall 强弱); 用 --no-normalize-cm 关闭。
 	# 与 --augment-eval / --no-augment-eval 同款双 dest 模式, 与 train.py 风格保持一致。
-	parser.add_argument("--normalize-cm", dest="normalize_cm", action="store_true", help="Use normalized confusion matrix (default)")
-	parser.add_argument("--no-normalize-cm", dest="normalize_cm", action="store_false", help="Disable normalized confusion matrix (use raw counts)")
+	parser.add_argument("--normalize-cm", dest="normalize_cm", action="store_true", help="使用归一化混淆矩阵 (默认)")
+	parser.add_argument("--no-normalize-cm", dest="normalize_cm", action="store_false", help="关闭归一化混淆矩阵 (使用原始计数)")
 	parser.set_defaults(normalize_cm=True)
 	parser.set_defaults(augment_eval=True)
 	return parser

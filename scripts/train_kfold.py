@@ -592,11 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
     """构建 K 折训练命令行参数。"""
     parser = train_module.build_parser()
     parser.description = "SPAD 3D point cloud K-fold cross-validation training"
-    parser.add_argument("--folds", type=int, default=5, help="Number of cross-validation folds")
-    parser.add_argument("--folds-to-run", type=str, default="all", help="Fold ids to run: all, 3, or 1,3-5")
-    parser.add_argument("--stratified", dest="stratified", action="store_true", help="Use approximate label-stratified folds")
-    parser.add_argument("--no-stratified", dest="stratified", action="store_false", help="Use plain shuffled K-fold split")
-    parser.add_argument("--dry-run", action="store_true", help="Print fold plan and exit without training")
+    parser.add_argument("--folds", type=int, default=5, help="K 折交叉验证的折数")
+    parser.add_argument("--folds-to-run", type=str, default="all", help="要运行的折: all / 3 / 1,3-5")
+    parser.add_argument("--stratified", dest="stratified", action="store_true", help="使用近似标签分层折")
+    parser.add_argument("--no-stratified", dest="stratified", action="store_false", help="使用普通随机打乱 K 折划分")
+    parser.add_argument("--dry-run", action="store_true", help="打印折划分计划后直接退出, 不开始训练")
     parser.set_defaults(stratified=True)
     return parser
 

@@ -722,15 +722,15 @@ def plot_fog_vs_target_encoding(
 # ─── 主程序 ──────────────────────────────────────────────────
 def demo_without_cli() -> None:
     """Run a no-CLI demo with explicit parameters and keep plots open."""
-    raw_path = r"E:\essay\硕士\研一\SPAD数据\0825\2025-08-25_16-50-11_Delay-0_Width-200.raw"
-    pages_per_group = 2000
+    raw_path = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-37_Delay-0_Width-2000.raw"
+    pages_per_group = 2400
     time_threshold = 128
-    plot_group_num = 20
+    plot_group_num = 15
     total_pages = 48000
 
     freqs = FREQ_PRESETS["C"]
     t_max = 128
-    target_bin = 60
+    target_bin = 67
     frame_idx = 0
     save_dir = None
 

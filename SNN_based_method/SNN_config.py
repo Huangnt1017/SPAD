@@ -46,7 +46,7 @@ class SNNConfig:
     """CSV 中 raw 文件缺失时是否跳过; 默认严格报错, 避免静默丢样本。"""
 
     pages_per_group: int = 32 * 4
-    """单个训练样本包含的 raw page 数, 即 ``P``。"""
+    """单个训练样本包含的 raw page 数, 即 ``P``。最好整除48000"""
 
     total_pages: Optional[int] = None
     """每个 raw 文件使用的 page 数; ``None`` 表示使用全部完整分组。"""
@@ -81,7 +81,7 @@ class SNNConfig:
     augment_train: bool = True
     """是否在训练集启用 raw group 级数据增强。"""
 
-    num_aug: int = 2
+    num_aug: int = 1
     """每个训练样本额外生成的增强样本份数，仅训练集。"""
 
     keep_original_sample: bool = False
@@ -138,31 +138,41 @@ class SNNConfig:
 
     # ---- 网络 ----
     model_backend: str = "new"
-    """模型后端; 本项目统一使用官方 ``spikingjelly.activation_based``。"""
+    """模型后端: ``new`` 为 SNN, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
 
-    C: int = 16
+    C: int = 16  # 隐含层通道数
     chunk_size: int = 32
-    spike_mode: str = "plif"
-    spike_backend: str = "auto"
+    spike_mode: str = "lif"
+    spike_backend: str = "cupy"
     """spikingjelly 神经元后端: ``auto`` 优先 cupy, 也可显式 ``cupy``/``torch``。"""
 
-    num_blocks: int = 2
+    num_blocks: int = 1
     refine_mid: int = 8
     return_sequence: bool = True
     """是否返回完整 gate/tof/valid 时间序列; 训练 var/sparse loss 时需要开启。"""
 
     # ---- 损失权重 ----
-    w_gt: float = 0.3
-    w_ssim: float = 0.5
-    w_var: float = 0.15
-    w_sparse: float = 0.02
-    w_smooth: float = 0.03
+    w_gt: float = 0.6
+    w_depth_reg: float = 0.5
+    """有效 depth 区域回归项权重, 直接压低 RMSE/提升 PSNR。"""
+
+    w_ssim: float = 0.25
+    w_var: float = 0.2
+    w_sparse: float = 0.01
+    w_smooth: float = 0.02
     w_lut_smooth: float = 0.01
     w_lut_norm: float = 0.005
 
     # ---- 损失超参数 ----
     sigma_target: float = 4.0
-    rho_target: float = 0.15
+    rho_target: float = 0.08
+    sparse_mode: str = "band"
+    """gate 稀疏正则模式: upper=旧单边阈值, target=贴近目标率, band=保持在区间内。"""
+
+    rho_min: Optional[float] = 0.03
+    rho_max: Optional[float] = 0.12
+    """sparse_mode=band 时的平均 gate 激活率允许范围。"""
+
     beta_smooth: float = 5.0
     ssim_kernel_size: int = 7
     ssim_smooth_kernel_size: int = 3
@@ -173,6 +183,15 @@ class SNNConfig:
 
     ssim_use_mask: bool = False
     """SSIM 是否仅在 depth_gt > 0 区域计算; 干净 GT 默认全图计算。"""
+
+    depth_reg_mode: str = "mse"
+    """depth 回归项类型: mse 直接对齐 PSNR, charbonnier 更抗噪, l1 更稳健。"""
+
+    depth_reg_use_mask: bool = True
+    """depth 回归项是否仅在 depth_gt > 0 的有效区域计算。"""
+
+    depth_reg_charbonnier_eps: float = 1.0e-3
+    """depth_reg_mode=charbonnier 时的平滑常数。"""
 
     depth_range: float = 128.0
     intensity_range: float = 1.0
@@ -220,6 +239,12 @@ class SNNConfig:
             self.model_backend = "new"
         elif backend in {"activation", "activation_based"}:
             self.model_backend = "new"
+        elif backend in {"recurrent", "srnn"}:
+            self.model_backend = "rnn"
+        elif backend in {"clstm", "convlstm"}:
+            self.model_backend = "lstm"
+        elif backend in {"cgru", "convgru"}:
+            self.model_backend = "gru"
 
         self.raw_load_mode = str(self.raw_load_mode).lower()
         if self.raw_load_mode not in {"group", "file_cache"}:
@@ -238,6 +263,18 @@ class SNNConfig:
         self.spike_backend = str(self.spike_backend).lower()
         if self.spike_backend not in {"auto", "cupy", "torch"}:
             raise ValueError("spike_backend must be 'auto', 'cupy' or 'torch'")
+
+        self.sparse_mode = str(self.sparse_mode).lower()
+        if self.sparse_mode not in {"upper", "target", "band"}:
+            raise ValueError("sparse_mode must be 'upper', 'target' or 'band'")
+        if self.rho_min is not None and self.rho_max is not None and self.rho_min > self.rho_max:
+            raise ValueError("rho_min must be <= rho_max")
+
+        self.depth_reg_mode = str(self.depth_reg_mode).lower()
+        if self.depth_reg_mode not in {"mse", "charbonnier", "l1"}:
+            raise ValueError("depth_reg_mode must be 'mse', 'charbonnier' or 'l1'")
+        if self.depth_reg_charbonnier_eps <= 0:
+            raise ValueError("depth_reg_charbonnier_eps must be positive")
 
     @property
     def t_max(self) -> int:
@@ -260,7 +297,7 @@ class SNNConfig:
         return torch.device(self.device)
 
     def build_model(self) -> torch.nn.Module:
-        """根据当前配置构建 ``SPADSpikeNet`` 模型。"""
+        """根据当前配置构建 SNN 或其显式时序递推等价模型。"""
         backend = self.model_backend.lower()
         if backend in {"new", "activation", "activation_based"}:
             from SNN_based_method.SNN_new import SPADSpikeNet
@@ -268,8 +305,14 @@ class SNNConfig:
             # 旧配置文件可能还保存为 legacy/clock_driven。这里仅做兼容映射,
             # 实际仍使用官方 spikingjelly.activation_based 实现。
             from SNN_based_method.SNN_new import SPADSpikeNet
+        elif backend in {"rnn", "recurrent", "srnn"}:
+            from SNN_based_method.SNN_c_RNN import SNN_c_RNN as SPADSpikeNet
+        elif backend in {"lstm", "clstm", "convlstm"}:
+            from SNN_based_method.SNN_c_LSTM import SNN_c_LSTM as SPADSpikeNet
+        elif backend in {"gru", "cgru", "convgru"}:
+            from SNN_based_method.SNN_c_GRU import SNN_c_GRU as SPADSpikeNet
         else:
-            raise ValueError("model_backend must be 'new'/'activation_based'")
+            raise ValueError("model_backend must be 'new'/'activation_based'/'rnn'/'lstm'/'gru'")
 
         return SPADSpikeNet(
             C=self.C,
@@ -292,6 +335,7 @@ class SNNConfig:
 
         return SPADImagingLoss(
             w_gt=self.w_gt,
+            w_depth_reg=self.w_depth_reg,
             w_ssim=self.w_ssim,
             w_var=self.w_var,
             w_sparse=self.w_sparse,
@@ -300,11 +344,17 @@ class SNNConfig:
             w_lut_norm=self.w_lut_norm,
             sigma_target=self.sigma_target,
             rho_target=self.rho_target,
+            sparse_mode=self.sparse_mode,
+            rho_min=self.rho_min,
+            rho_max=self.rho_max,
             beta_smooth=self.beta_smooth,
             ssim_kernel_size=self.ssim_kernel_size,
             ssim_smooth_kernel_size=self.ssim_smooth_kernel_size,
             gt_use_mask=self.gt_use_mask,
             ssim_use_mask=self.ssim_use_mask,
+            depth_reg_mode=self.depth_reg_mode,
+            depth_reg_use_mask=self.depth_reg_use_mask,
+            depth_reg_charbonnier_eps=self.depth_reg_charbonnier_eps,
             depth_range=self.depth_range,
             intensity_range=self.intensity_range,
         )
@@ -465,8 +515,13 @@ class SNNConfig:
             f"return_sequence={self.return_sequence}"
         )
         lines.append(
-            f"  loss_weights: gt={self.w_gt}, ssim={self.w_ssim}, "
+            f"  loss_weights: gt={self.w_gt}, depth_reg={self.w_depth_reg}, ssim={self.w_ssim}, "
             f"var={self.w_var}, sparse={self.w_sparse}, smooth={self.w_smooth}"
+        )
+        lines.append(
+            f"  loss_params: depth_reg_mode={self.depth_reg_mode}, "
+            f"depth_reg_use_mask={self.depth_reg_use_mask}, sparse_mode={self.sparse_mode}, "
+            f"rho_target={self.rho_target}, rho_min={self.rho_min}, rho_max={self.rho_max}"
         )
         lines.append(
             f"  epochs={self.epochs}, lr={self.lr}, weight_decay={self.weight_decay}, "

@@ -895,12 +895,12 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 def build_parser() -> argparse.ArgumentParser:
 	"""构建训练命令行参数解析器。"""
 	# 命令行参数覆盖数据路径、训练超参、损失权重和增强开关，便于不同实验复用同一脚本。
-	parser = argparse.ArgumentParser(description="SPAD 3D point cloud classification training")
-	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD data root directory")
+	parser = argparse.ArgumentParser(description="SPAD 3D 点云分类训练")
+	parser.add_argument("--data-root", type=str, default=r"D:\PYproject\SPADdata\2025-04-30-dpc", help="SPAD 数据根目录")
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="upp",
+		default="dgcnn",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -912,7 +912,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"pointtransformer",
 			"pointtransv2",
 			"pointtransv3",
-			"pointmlp", 
+			"pointmlp",
 			"pointmlpelite",
 			"spt",
 			"upp",
@@ -920,52 +920,52 @@ def build_parser() -> argparse.ArgumentParser:
 			"graph_residual_gcn",
 			"3detr",
 		],
-		help="Backbone model",
+		help="Backbone 模型名称",
 	)
-	parser.add_argument("--epochs", type=int, default=100)
-	parser.add_argument("--batch-size", type=int, default=32)
-	parser.add_argument("--num-aug", type=int, default=5, help="Number of augmented copies generated per original train sample when augmentation is enabled")
-	parser.add_argument("--num-points", type=int, default=1024, help="Fixed number of points per sample (deterministic sample/pad)")
-	parser.add_argument("--lr", type=float, default=1e-3)
-	parser.add_argument("--min-lr", type=float, default=1e-5)
-	parser.add_argument("--weight-decay", type=float, default=1e-4)
-	parser.add_argument("--train-ratio", type=float, default=0.6)
-	parser.add_argument("--val-ratio", type=float, default=0.2)
-	parser.add_argument("--test-ratio", type=float, default=0.2)
-	parser.add_argument("--num-workers", type=int, default=0)
-	parser.add_argument("--seed", type=int, default=42)
-	parser.add_argument("--device", type=str, default="cuda", help="auto/cpu/cuda")
-	parser.add_argument("--log-dir", type=str, default="logs/CLS")
-	parser.add_argument("--save-dir", type=str, default="checkpoints/CLS")
-	parser.add_argument("--resume", type=str, default="", help="checkpoint path to resume")
-	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="Label source mode")
-	parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="Classification loss weight when auto-balance is disabled")
-	parser.add_argument("--box-loss-weight", type=float, default=10.0, help="Box Soft-histogram depth loss weight when auto-balance is disabled")
-	parser.add_argument("--auto-balance", dest="auto_balance", action="store_true", help="Use Kendall log-variance task balancing")
-	parser.add_argument("--no-auto-balance", dest="auto_balance", action="store_false", help="Use fixed cls/box loss weights")
-	parser.add_argument("--label-smoothing", type=float, default=0.1, help="Label smoothing for classification loss")
-	parser.add_argument("--best-score-cls-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation Top-1")
-	parser.add_argument("--best-score-z-mae-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation box z-MAE (depth error)")
-	parser.add_argument("--best-score-depth-weight", type=float, default=1.0, help="Composite best-checkpoint weight for validation depth score")
-	parser.add_argument("--best-score-depth-scale", type=float, default=0.01, help="Depth loss scale used by depth_score = 1 / (1 + depth_loss / scale)")
-	parser.add_argument("--spt-timestep", type=int, default=2, help="SPT temporal steps T; default follows Hengshuang.yaml")
-	parser.add_argument("--spt-nneighbor", type=int, default=16, help="SPT kNN neighborhood size")
-	parser.add_argument("--spt-transformer-dim", type=int, default=512, help="SPT internal transformer channel width; default follows Hengshuang.yaml")
-	parser.add_argument("--spt-nblocks", type=int, default=4, help="SPT transition-down stages; default follows Hengshuang.yaml")
-	parser.add_argument("--spt-num-samples", type=int, default=512, help="SPT Q-SDE samples per timestep when encoder mode is enabled")
-	parser.add_argument("--spt-spike-mode", type=str, default="lif", choices=["lif", "elif", "plif", "if", "none", "ann"], help="SPT neuron type; none/ann runs the ANN path")
-	parser.add_argument("--spt-use-encoder", dest="spt_use_encoder", action="store_true", help="Enable SPT Q-SDE encoder path")
-	parser.add_argument("--spt-no-encoder", dest="spt_use_encoder", action="store_false", help="Disable SPT Q-SDE encoder path")
-	parser.add_argument("--spt-use-moe-lif", dest="spt_use_moe_lif", action="store_true", help="Use original SPT MoE-LIF input neuron in each transformer block")
-	parser.add_argument("--spt-no-moe-lif", dest="spt_use_moe_lif", action="store_false", help="Use a single spike node instead of MoE-LIF for faster/lower-memory training")
-	parser.add_argument("--amp", dest="amp", action="store_true", help="Enable CUDA automatic mixed precision")
-	parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA automatic mixed precision")
-	parser.add_argument("--tf32", dest="tf32", action="store_true", help="Allow TF32 matmul/cuDNN on Ampere/Ada GPUs")
-	parser.add_argument("--no-tf32", dest="tf32", action="store_false", help="Disable TF32 matmul/cuDNN")
-	parser.add_argument("--augment-train", dest="augment_train", action="store_true", help="Apply augmentation in train dataset")
-	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="Disable train dataset augmentation")
-	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="Apply augmentation in val/test dataset")
-	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="Disable val/test dataset augmentation")
+	parser.add_argument("--epochs", type=int, default=100, help="训练总轮数")
+	parser.add_argument("--batch-size", type=int, default=32, help="批大小")
+	parser.add_argument("--num-aug", type=int, default=5, help="启用增强时, 每个原始训练样本生成的增强副本数")
+	parser.add_argument("--num-points", type=int, default=1024, help="每个样本的固定点数 (确定性采样/填充)")
+	parser.add_argument("--lr", type=float, default=1e-3, help="初始学习率")
+	parser.add_argument("--min-lr", type=float, default=1e-5, help="余弦退火最小学习率")
+	parser.add_argument("--weight-decay", type=float, default=1e-4, help="权重衰减 (L2 正则化)")
+	parser.add_argument("--train-ratio", type=float, default=0.6, help="训练集占比")
+	parser.add_argument("--val-ratio", type=float, default=0.2, help="验证集占比")
+	parser.add_argument("--test-ratio", type=float, default=0.2, help="测试集占比")
+	parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker 进程数")
+	parser.add_argument("--seed", type=int, default=42, help="随机种子")
+	parser.add_argument("--device", type=str, default="cuda", help="计算设备: auto/cpu/cuda")
+	parser.add_argument("--log-dir", type=str, default="logs/CLS", help="训练日志输出目录")
+	parser.add_argument("--save-dir", type=str, default="checkpoints/CLS", help="Checkpoint 保存目录")
+	parser.add_argument("--resume", type=str, default="", help="恢复训练的 checkpoint 路径")
+	parser.add_argument("--label-mode", type=str, default="raw", choices=["generated", "raw"], help="标签来源模式")
+	parser.add_argument("--cls-loss-weight", type=float, default=1.0, help="关闭自适应平衡时的分类 loss 权重")
+	parser.add_argument("--box-loss-weight", type=float, default=10.0, help="关闭自适应平衡时的 Box Soft-histogram depth loss 权重")
+	parser.add_argument("--auto-balance", dest="auto_balance", action="store_true", help="启用 Kendall log-variance 自适应任务平衡")
+	parser.add_argument("--no-auto-balance", dest="auto_balance", action="store_false", help="使用固定 cls/box loss 权重")
+	parser.add_argument("--label-smoothing", type=float, default=0.1, help="分类 loss 的标签平滑系数")
+	parser.add_argument("--best-score-cls-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 Top-1 的权重")
+	parser.add_argument("--best-score-z-mae-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 box z-MAE (深度误差) 的权重")
+	parser.add_argument("--best-score-depth-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 depth score 的权重")
+	parser.add_argument("--best-score-depth-scale", type=float, default=0.01, help="depth_score = 1 / (1 + depth_loss / scale) 中的深度 loss 缩放系数")
+	parser.add_argument("--spt-timestep", type=int, default=2, help="SPT 时间步 T; 默认遵循 Hengshuang.yaml")
+	parser.add_argument("--spt-nneighbor", type=int, default=16, help="SPT kNN 邻域大小")
+	parser.add_argument("--spt-transformer-dim", type=int, default=512, help="SPT 内部 transformer 通道宽度; 默认遵循 Hengshuang.yaml")
+	parser.add_argument("--spt-nblocks", type=int, default=4, help="SPT transition-down 阶段数; 默认遵循 Hengshuang.yaml")
+	parser.add_argument("--spt-num-samples", type=int, default=512, help="启用 encoder 模式时, SPT 每个时间步的 Q-SDE 采样数")
+	parser.add_argument("--spt-spike-mode", type=str, default="lif", choices=["lif", "elif", "plif", "if", "none", "ann"], help="SPT 神经元类型; none/ann 走 ANN 路径")
+	parser.add_argument("--spt-use-encoder", dest="spt_use_encoder", action="store_true", help="启用 SPT Q-SDE encoder 路径")
+	parser.add_argument("--spt-no-encoder", dest="spt_use_encoder", action="store_false", help="禁用 SPT Q-SDE encoder 路径")
+	parser.add_argument("--spt-use-moe-lif", dest="spt_use_moe_lif", action="store_true", help="每个 transformer block 使用原始 SPT MoE-LIF 输入神经元")
+	parser.add_argument("--spt-no-moe-lif", dest="spt_use_moe_lif", action="store_false", help="用单一 spike node 替代 MoE-LIF, 训练更快/显存更低")
+	parser.add_argument("--amp", dest="amp", action="store_true", help="启用 CUDA 自动混合精度")
+	parser.add_argument("--no-amp", dest="amp", action="store_false", help="禁用 CUDA 自动混合精度")
+	parser.add_argument("--tf32", dest="tf32", action="store_true", help="允许 Ampere/Ada GPU 使用 TF32 matmul/cuDNN")
+	parser.add_argument("--no-tf32", dest="tf32", action="store_false", help="禁用 TF32 matmul/cuDNN")
+	parser.add_argument("--augment-train", dest="augment_train", action="store_true", help="对训练集应用数据增强")
+	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="禁用训练集数据增强")
+	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="对验证/测试集应用数据增强")
+	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="禁用验证/测试集数据增强")
 	parser.set_defaults(augment_train=True, augment_eval=True, amp=False, tf32=False, spt_use_encoder=True, spt_use_moe_lif=True, auto_balance=False)
 	return parser
 #CUDA AMP 会在部分算子里使用半精度，通常是 FP16，比如：Conv / Linear / MatMul / 部分归一化相关算子，同时用 GradScaler 避免 FP16 梯度下溢。它的目标是加速和省显存，不保证和纯 FP32 完全一致。

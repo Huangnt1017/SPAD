@@ -7,8 +7,11 @@
 ```text
 SNN_based_method/
   SNN_config.py         配置入口
-  SNN.py                兼容旧导入, 转发到 SNN_new.py
-  SNN_new.py            当前模型, 使用官方 spikingjelly.activation_based
+  SNN.py                兼容旧导入, 统一导出所有模型后端
+  SNN_new.py            默认 SNN 后端, 使用官方 spikingjelly.activation_based
+  SNN_c_RNN.py          显式 RNN 等价版
+  SNN_c_LSTM.py         显式 ConvLSTM 版
+  SNN_c_GRU.py          显式 ConvGRU 版
   loss.py               成像 loss 和指标
   scripts/
     train.py            训练入口
@@ -22,6 +25,15 @@ SNN_based_method/
 ```
 
 本项目使用环境中安装的官方 `spikingjelly.activation_based`，不使用本地 `spikingjelly1`。
+
+当前可通过 `SNNConfig.model_backend` 或命令行 `--model-backend` 选择 4 个后端：
+
+```text
+new   : 默认后端, 官方 activation_based SNN
+rnn   : 显式神经元递推等价版
+lstm  : 显式 ConvLSTM 版
+gru   : 显式 ConvGRU 版
+```
 
 ## 2. 数据路径
 
@@ -124,7 +136,10 @@ ch1 = intensity, 范围 [0, 1]
 
 ## 5. 模型结构与设计理论
 
-当前模型是 `SPADSpikeNet`，目标是在浓雾 SPAD ToF 数据中选择更可能属于目标回波的 photon，再由选中的 photon 估计深度和强度。
+当前默认模型是 `SPADSpikeNet`（`model_backend=new`）。此外，同一套输入输出协议还提供
+`SNN_c_RNN`、`SNN_c_LSTM` 和 `SNN_c_GRU` 三个显式时序递推版本，用于和默认
+SNN 后端做可控对比。四个后端共享同一套 ToF 编码、空间卷积主干、gate 聚合和精修头，
+差异只在时间递推核心。
 
 整体结构：
 
@@ -133,11 +148,21 @@ ch1 = intensity, 范围 [0, 1]
   -> reshape 为 [P, B, 64, 64]
   -> valid mask: 1 <= tof <= time_threshold
   -> ToF 编码: sinusoidal [P, B, 17, 64, 64] 或 LUT [P, B, D, 64, 64]
-  -> Stem: Conv1x1 + BN + PLIF + Conv3x3 + BN
-  -> SpikeBlock x num_blocks
-       PLIF -> 多尺度深度可分离卷积 -> PLIF -> Conv1x1 + BN -> residual
-  -> GateHead
-       PLIF -> Conv1x1 + BN -> PLIF -> Conv1x1 -> sigmoid
+  -> 时序 Stem
+       new : Conv1x1 + BN + PLIF/LIF/IF + Conv3x3 + BN
+       rnn : Conv1x1 + BN + 显式神经元递推 + Conv3x3 + BN
+       lstm: Conv1x1 + BN + ConvLSTM + Conv3x3 + BN
+       gru : Conv1x1 + BN + ConvGRU + Conv3x3 + BN
+  -> 时序主干块 x num_blocks
+       new : SpikeBlock
+       rnn : SpikeBlockRNN
+       lstm: LSTMBlock
+       gru : GRUBlock
+  -> 时序 GateHead
+       new : PLIF -> Conv1x1 + BN -> PLIF -> Conv1x1 -> sigmoid
+       rnn : 显式神经元递推 -> Conv1x1 + BN -> 显式神经元递推 -> Conv1x1 -> sigmoid
+       lstm: ConvLSTM -> Conv1x1 + BN -> ConvLSTM -> Conv1x1 -> sigmoid
+       gru : ConvGRU -> Conv1x1 + BN -> ConvGRU -> Conv1x1 -> sigmoid
   -> gate [P, B, 1, 64, 64]
   -> Gated Moment
        depth_coarse     = sum(gate * tof * valid) / sum(gate * valid)
@@ -160,6 +185,15 @@ ch1 = intensity, 范围 [0, 1]
 6. 最后的 CNN refine 只做空间局部残差修正，不替代 Gated Moment 的物理估计。
 ```
 
+不同后端的时间建模差异：
+
+```text
+new  : 通过脉冲神经元膜电位和 reset 隐式保存时序状态
+rnn  : 把 IF/LIF/PLIF 的膜电位更新显式展开成 RNN hidden state
+lstm : 用显式 ConvLSTM 的 (h_t, c_t) 状态建模时间依赖
+gru  : 用显式 ConvGRU 的 h_t 状态建模时间依赖
+```
+
 这里的 `P` 是同一个 raw group 内的 page 数。它不是图像高度或宽度，而是每个像素被重复采样的次数。训练时可以通过 `pages_per_group` 改变 `P`，模型 forward 会按实际 `P` 分 chunk 处理。
 
 ## 6. 关键模块分析
@@ -180,7 +214,7 @@ sin/cos 通道:     n_freq * 2 个
 
 ### 6.2 Stem
 
-Stem 把编码通道映射到主干通道 `C`：
+以下先以默认 `new` 后端为例说明。Stem 把编码通道映射到主干通道 `C`：
 
 ```text
 [T, B, C_enc, H, W]
@@ -190,11 +224,13 @@ Stem 把编码通道映射到主干通道 `C`：
   -> [T, B, C, H, W]
 ```
 
-`Conv1x1` 用于融合 ToF 编码通道，`Conv3x3` 引入局部空间上下文。脉冲神经元位于两层卷积之间，用膜电位对 page 维上的稀疏事件进行累积。
+`Conv1x1` 用于融合 ToF 编码通道，`Conv3x3` 引入局部空间上下文。默认 SNN 后端把
+脉冲神经元放在两层卷积之间，用膜电位对 page 维上的稀疏事件进行累积。`rnn`、`lstm`
+和 `gru` 后端则在同一位置分别使用显式 RNN / ConvLSTM / ConvGRU 单元。
 
 ### 6.3 SpikeBlock
 
-每个 `SpikeBlock` 是等宽残差块：
+默认后端的每个 `SpikeBlock` 是等宽残差块：
 
 ```text
 x
@@ -214,6 +250,9 @@ dilation=4: 9x9 等效感受野
 ```
 
 这些 dilation 只作用在空间维，不会跳过 page，也不会改变 P 维顺序。当前实现避免显式拼接 `[B, 3C, H, W]`，用分块 pointwise 权重累加三路结果，降低训练峰值显存。
+
+显式递推后端保持同样的多尺度卷积与残差结构，只把块内两处脉冲节点替换为对应的
+RNN / ConvLSTM / ConvGRU 单元，因此不同后端之间的大部分差异都集中在时间状态更新。
 
 ### 6.4 GateHead 和 Gated Moment
 
@@ -258,7 +297,7 @@ intensity_net:
 P=128, chunk_size=32 -> 4 个 chunk
 ```
 
-chunk 内保留完整脉冲状态和梯度；chunk 间执行：
+`new` 后端在 chunk 内保留完整脉冲状态和梯度；chunk 间执行：
 
 ```text
 functional.detach_net(self)
@@ -271,6 +310,10 @@ functional.reset_net(self)
 ```
 
 它用于清空脉冲神经元状态，避免不同 batch 之间膜电位串扰。
+
+`rnn`、`lstm`、`gru` 后端不依赖 `spikingjelly.functional.reset_net`。它们把时序状态显式保存在
+本次 forward 的局部 `state` 变量中，chunk 间通过递归 `detach` 截断 BPTT，forward 结束后
+自然释放，不会跨 batch 残留。
 
 ## 7. 推荐训练命令
 
@@ -297,6 +340,19 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
   --tf32 `
   --cudnn-benchmark `
   --spike-backend auto
+```
+
+切换显式时序后端：
+
+```powershell
+# 显式 RNN 等价版
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py --model-backend rnn
+
+# 显式 ConvLSTM 版
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py --model-backend lstm
+
+# 显式 ConvGRU 版
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py --model-backend gru
 ```
 
 显式指定训练路径和 CSV：
@@ -441,6 +497,7 @@ D:\PYproject\SPAD\logs\SNN\test1_YYYYMMDD_HHMMSS\
 | `use_precomputed_labels` | `True` | 优先读取预生成 label 池 |
 | `precomputed_label_dir_name` | `label` | label 池父目录名 |
 | `precomputed_labels_per_class` | `5` | 每个类别随机抽取的 label 数量 |
+| `num_aug` | `1` | 每个训练样本额外生成的增强份数 |
 
 常用加速参数：
 
@@ -459,12 +516,12 @@ D:\PYproject\SPAD\logs\SNN\test1_YYYYMMDD_HHMMSS\
 
 | 参数 | 默认 | 说明 |
 |---|---:|---|
-| `model_backend` | `new` | 官方 `activation_based` 实现 |
-| `spike_backend` | `auto` | CUDA 可用时优先 cupy, 否则 torch |
+| `model_backend` | `new` | 可选 `new` / `rnn` / `lstm` / `gru` |
+| `spike_backend` | `auto` | 仅 `new` 后端使用, CUDA 可用时优先 cupy |
 | `encoding_mode` | `sinusoidal` | ToF 编码, 可选 `lut` |
-| `C` | `16` | 主干通道数 |
+| `C` | `32` | 主干通道数 |
 | `chunk_size` | `32` | 时间维分块大小, 影响显存 |
-| `num_blocks` | `2` | SpikeBlock 数量 |
+| `num_blocks` | `1` | 时序主干块数量 |
 | `refine_mid` | `8` | 深度/强度精修头中间通道 |
 | `return_sequence` | `True` | 训练 var/sparse loss 时需要 |
 
@@ -481,11 +538,11 @@ ToF shift：
 逻辑：
 
 ```text
-1. 当前默认 augment_train=True, num_aug=2, keep_original_sample=False
-2. 默认每个训练样本只保留 2 份增强样本, 不保留 aug_index=0 原始样本
+1. 当前默认 augment_train=True, num_aug=1, keep_original_sample=False
+2. 默认每个训练样本只保留 1 份增强样本, 不保留 aug_index=0 原始样本
 3. 使用 --keep-original-sample 可额外保留原始样本
-4. 若 num_aug=2 且保留原始样本, 训练集样本数变为原始训练集的 3 倍
-5. 若 num_aug=2 且不保留原始样本, 训练集样本数变为原始训练集的 2 倍
+4. 若 num_aug=1 且保留原始样本, 训练集样本数变为原始训练集的 2 倍
+5. 若 num_aug=1 且不保留原始样本, 训练集样本数变为原始训练集的 1 倍增强样本
 6. 增强发生在原始 raw group 上, 先于 time_threshold 裁剪
 7. 对所有非零 ToF 加同一个随机整数 delta, delta 属于 [-20, 20]
 8. 增强后小于 1 或大于 time_threshold 的值置 0
@@ -516,6 +573,7 @@ Page shuffle：
 
 ```text
 L = w_gt * L_GT
+  + w_depth_reg * L_depth_reg
   + w_ssim * L_SSIM
   + w_var * L_var
   + w_sparse * L_sparse
@@ -526,11 +584,12 @@ L = w_gt * L_GT
 当前默认权重：
 
 ```text
-w_gt=0.3
-w_ssim=0.5
-w_var=0.15
-w_sparse=0.02
-w_smooth=0.03
+w_gt=0.6
+w_depth_reg=0.5
+w_ssim=0.25
+w_var=0.2
+w_sparse=0.01
+w_smooth=0.02
 w_lut_smooth=0.01
 w_lut_norm=0.005
 ```
@@ -541,14 +600,20 @@ w_lut_norm=0.005
 
 ## 13. 模型状态
 
-`SPADSpikeNet.forward()` 内部保留两类状态操作：
+不同后端的状态管理方式：
 
 ```text
-functional.detach_net(self)  chunk 之间截断梯度, 保留状态前向延续
-functional.reset_net(self)   单次 forward 结束后重置脉冲神经元状态
+new:
+  functional.detach_net(self)  chunk 之间截断梯度, 保留状态前向延续
+  functional.reset_net(self)   单次 forward 结束后重置脉冲神经元状态
+
+rnn / lstm / gru:
+  显式 state 变量在 chunk 间递推
+  通过递归 detach 截断跨 chunk BPTT
+  forward 结束后状态自然释放, 不跨 batch 持久化
 ```
 
-不要删除 `reset_net`。它用于避免不同 batch 之间脉冲神经元膜电位串扰。
+对 `new` 后端，不要删除 `reset_net`。它用于避免不同 batch 之间脉冲神经元膜电位串扰。
 
 当前精修头已经拆成两个分支：
 

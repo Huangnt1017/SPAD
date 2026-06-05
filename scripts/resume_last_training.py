@@ -317,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器，供命令行入口和测试复用。"""
     model_choices = supported_model_choices()
     parser = argparse.ArgumentParser(
-        description="Resume the latest resumable SPAD training run.",
+        description="恢复最近一次可继续的 SPAD 训练任务",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -335,41 +335,41 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="spt",
         choices=model_choices or None,
-        help="Only resume this model. Default: spt.",
+        help="仅恢复此模型; 默认 spt",
     )
     parser.add_argument(
         "--log-dir",
         type=Path,
         default=Path("logs/CLS"),
-        help="Training log directory, absolute or relative to the project root. Default: logs/CLS.",
+        help="训练日志目录, 绝对路径或相对于项目根目录; 默认 logs/CLS",
     )
     parser.add_argument(
         "--save-dir",
         type=Path,
         default=Path("checkpoints/CLS"),
-        help="Checkpoint directory, absolute or relative to the project root. Default: checkpoints/CLS.",
+        help="Checkpoint 目录, 绝对路径或相对于项目根目录; 默认 checkpoints/CLS",
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=None,
-        help="Override target total epochs. Must exceed checkpoint epoch when training starts.",
+        help="覆盖目标总轮数; 开始训练时必须大于 checkpoint 已训练的轮数",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=None,
-        help="Override batch size. Omit to reuse the checkpoint's saved value.",
+        help="覆盖批大小; 不传则复用 checkpoint 中保存的值",
     )
     parser.add_argument(
         "--include-finished",
         action="store_true",
-        help="Allow selecting a run whose log already reached its target epoch.",
+        help="允许选择已完成目标轮数的 run",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the selected checkpoint and resolved arguments without starting training.",
+        help="仅打印选中的 checkpoint 和解析后的参数, 不启动训练",
     )
     return parser
 

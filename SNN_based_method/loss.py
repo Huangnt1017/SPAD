@@ -5,6 +5,7 @@ histogram peak 或重复点计数生成的噪声 GT。
 
 包含:
 - ``WeakGTLoss``: 对弱 GT 的 L1/MAE 约束。
+- ``DepthRegressionLoss``: 有效深度区域的 MSE/Charbonnier 约束, 直接对齐 RMSE/PSNR。
 - ``SSIMLoss``: 结构相似性损失 ``1 - SSIM``。
 - ``GatedMomentVarianceLoss``: 约束 gate 选中光子的 ToF 方差。
 - ``SpikeSparsityLoss``: gate 稀疏性正则。
@@ -138,6 +139,50 @@ class WeakGTLoss(nn.Module):
         return self.w_depth * loss_d + self.w_intensity * loss_i
 
 
+class DepthRegressionLoss(nn.Module):
+    """有效深度区域的归一化 depth 回归项, 用于直接压低 RMSE/提升 PSNR。"""
+
+    def __init__(
+        self,
+        depth_range=128.0,
+        mode: str = "mse",
+        use_mask: bool = True,
+        charbonnier_eps: float = 1.0e-3,
+    ):
+        super().__init__()
+        self.depth_range = float(depth_range)
+        self.mode = str(mode).lower()
+        if self.mode not in {"mse", "charbonnier", "l1"}:
+            raise ValueError("depth_reg_mode must be 'mse', 'charbonnier' or 'l1'")
+        self.use_mask = bool(use_mask)
+        self.charbonnier_eps = float(charbonnier_eps)
+        if self.charbonnier_eps <= 0:
+            raise ValueError("depth_reg_charbonnier_eps must be positive")
+
+    def forward(self, result, gt):
+        """计算 depth 通道的归一化回归损失。"""
+        d_pred = (result["output"][:, 0:1] / self.depth_range).clamp(0.0, 1.0)
+        d_gt_raw = gt[:, 0:1]
+        d_gt = (d_gt_raw / self.depth_range).clamp(0.0, 1.0)
+
+        if self.use_mask:
+            mask = (d_gt_raw > 0).float()
+        else:
+            mask = torch.ones_like(d_gt)
+        normalizer = mask.sum().clamp(min=1.0)
+
+        error = d_pred - d_gt
+        if self.mode == "mse":
+            penalty = error ** 2
+        elif self.mode == "charbonnier":
+            eps = self.charbonnier_eps
+            penalty = torch.sqrt(error ** 2 + eps ** 2) - eps
+        else:
+            penalty = error.abs()
+
+        return (penalty * mask).sum() / normalizer
+
+
 class GatedMomentVarianceLoss(nn.Module):
     """Penalize if gate-selected photons scatter too far from predicted depth.
 
@@ -170,20 +215,76 @@ class GatedMomentVarianceLoss(nn.Module):
 
 
 class SpikeSparsityLoss(nn.Module):
-    """Encourage gate sparsity: target photons are rare in dense fog."""
+    """约束 gate 平均激活率, 避免单边阈值项过早失去梯度。"""
 
-    def __init__(self, rho_target=0.15):
+    def __init__(
+        self,
+        rho_target=0.15,
+        mode: str = "band",
+        rho_min: float | None = 0.03,
+        rho_max: float | None = 0.15,
+    ):
         super().__init__()
-        self.rho_target = rho_target
+        self.rho_target = float(rho_target)
+        self.mode = str(mode).lower()
+        if self.mode not in {"upper", "target", "band"}:
+            raise ValueError("sparse_mode must be 'upper', 'target' or 'band'")
+        self.rho_min = None if rho_min is None else float(rho_min)
+        self.rho_max = None if rho_max is None else float(rho_max)
+        if self.rho_target < 0:
+            raise ValueError("rho_target must be non-negative")
+        if self.rho_min is not None and self.rho_min < 0:
+            raise ValueError("rho_min must be non-negative")
+        if self.rho_max is not None and self.rho_max < 0:
+            raise ValueError("rho_max must be non-negative")
+        if (
+            self.rho_min is not None
+            and self.rho_max is not None
+            and self.rho_min > self.rho_max
+        ):
+            raise ValueError("rho_min must be <= rho_max")
 
-    def forward(self, result):
+    def mean_rate(self, result):
+        """返回有效 ToF 位置上的平均 gate 激活率。"""
         gate = result["gate"]       # [T, B, 1, H, W]
         valid = result["valid"]     # [T, B, H, W]
 
         gate_sq = gate.squeeze(2)   # [T, B, H, W]
-        mean_rate = (gate_sq * valid).sum() / (valid.sum() + 1e-6)
+        return (gate_sq * valid).sum() / (valid.sum() + 1e-6)
 
-        return F.relu(mean_rate - self.rho_target)
+    def penalty_from_mean(self, mean_rate):
+        """根据平均激活率计算 sparse 正则值。"""
+        if self.mode == "upper":
+            return F.relu(mean_rate - self.rho_target)
+        if self.mode == "target":
+            return torch.abs(mean_rate - self.rho_target)
+
+        rho_min = self.rho_min if self.rho_min is not None else self.rho_target
+        rho_max = self.rho_max if self.rho_max is not None else self.rho_target
+        lower = torch.as_tensor(rho_min, dtype=mean_rate.dtype, device=mean_rate.device)
+        upper = torch.as_tensor(rho_max, dtype=mean_rate.dtype, device=mean_rate.device)
+        return F.relu(lower - mean_rate) + F.relu(mean_rate - upper)
+
+    def band_components_from_mean(self, mean_rate):
+        """返回下限/上限惩罚分量, 仅用于日志诊断。"""
+        if self.mode != "band":
+            zero = torch.zeros_like(mean_rate)
+            if self.mode == "upper":
+                return zero, F.relu(mean_rate - self.rho_target)
+            target_gap = torch.abs(mean_rate - self.rho_target)
+            return target_gap, target_gap
+
+        rho_min = self.rho_min if self.rho_min is not None else self.rho_target
+        rho_max = self.rho_max if self.rho_max is not None else self.rho_target
+        lower = torch.as_tensor(rho_min, dtype=mean_rate.dtype, device=mean_rate.device)
+        upper = torch.as_tensor(rho_max, dtype=mean_rate.dtype, device=mean_rate.device)
+        return F.relu(lower - mean_rate), F.relu(mean_rate - upper)
+
+    def forward(self, result):
+        mean_rate = self.mean_rate(result)
+        return self.penalty_from_mean(mean_rate)
+
+
 
 
 class SSIMLoss(nn.Module):
@@ -288,11 +389,13 @@ class IntensityAwareSmoothnessLoss(nn.Module):
 class SPADImagingLoss(nn.Module):
     """组合训练损失函数.
 
-    L = w_gt * L_GT + w_ssim * L_SSIM + w_var * L_var + w_sparse * L_sparse + w_smooth * L_smooth
+    L = w_gt * L_GT + w_depth_reg * L_depth_reg + w_ssim * L_SSIM
+        + w_var * L_var + w_sparse * L_sparse + w_smooth * L_smooth
         [+ w_lut_smooth * L_lut_smooth + w_lut_norm * L_lut_norm]   (仅 LUT 编码模式)
 
     Args:
         w_gt: L1 (MAE) loss 权重
+        w_depth_reg: 有效 depth 区域 MSE/Charbonnier 回归项权重
         w_ssim: SSIM loss 权重 (结构相似性)
         w_var: gate 方差 loss 权重
         w_sparse: gate 稀疏性 loss 权重
@@ -309,25 +412,33 @@ class SPADImagingLoss(nn.Module):
 
     def __init__(
         self,
-        w_gt=0.3,
-        w_ssim=0.5,
-        w_var=0.15,
-        w_sparse=0.02,
-        w_smooth=0.03,
+        w_gt=0.6,
+        w_depth_reg=0.5,
+        w_ssim=0.25,
+        w_var=0.2,
+        w_sparse=0.01,
+        w_smooth=0.02,
         w_lut_smooth=0.01,
         w_lut_norm=0.005,
         sigma_target=4.0,
-        rho_target=0.15,
+        rho_target=0.08,
+        sparse_mode="band",
+        rho_min=0.03,
+        rho_max=0.12,
         beta_smooth=5.0,
         ssim_kernel_size=7,
         ssim_smooth_kernel_size=3,
         gt_use_mask=False,
         ssim_use_mask=False,
+        depth_reg_mode="mse",
+        depth_reg_use_mask=True,
+        depth_reg_charbonnier_eps=1.0e-3,
         depth_range=128.0,
         intensity_range=1.0,
     ):
         super().__init__()
         self.w_gt = w_gt
+        self.w_depth_reg = w_depth_reg
         self.w_ssim = w_ssim
         self.w_var = w_var
         self.w_sparse = w_sparse
@@ -340,6 +451,12 @@ class SPADImagingLoss(nn.Module):
             intensity_range=intensity_range,
             use_mask=gt_use_mask,
         )
+        self.depth_reg_loss = DepthRegressionLoss(
+            depth_range=depth_range,
+            mode=depth_reg_mode,
+            use_mask=depth_reg_use_mask,
+            charbonnier_eps=depth_reg_charbonnier_eps,
+        )
         self.ssim_loss = SSIMLoss(
             kernel_size=ssim_kernel_size,
             depth_range=depth_range,
@@ -351,7 +468,12 @@ class SPADImagingLoss(nn.Module):
             sigma_target=sigma_target,
             depth_range=depth_range,
         )
-        self.sparse_loss = SpikeSparsityLoss(rho_target=rho_target)
+        self.sparse_loss = SpikeSparsityLoss(
+            rho_target=rho_target,
+            mode=sparse_mode,
+            rho_min=rho_min,
+            rho_max=rho_max,
+        )
         self.smooth_loss = IntensityAwareSmoothnessLoss(
             beta=beta_smooth,
             depth_range=depth_range,
@@ -377,6 +499,12 @@ class SPADImagingLoss(nn.Module):
             losses["weighted_gt"] = (self.w_gt * l_gt).detach()
             total = total + self.w_gt * l_gt
 
+        if gt is not None and self.w_depth_reg > 0:
+            l_depth_reg = self.depth_reg_loss(result, gt)
+            losses["depth_reg"] = l_depth_reg.detach()
+            losses["weighted_depth_reg"] = (self.w_depth_reg * l_depth_reg).detach()
+            total = total + self.w_depth_reg * l_depth_reg
+
         if gt is not None and self.w_ssim > 0:
             l_ssim = self.ssim_loss(result, gt)
             losses["ssim"] = l_ssim.detach()
@@ -393,7 +521,12 @@ class SPADImagingLoss(nn.Module):
             losses["var_skipped"] = 1.0
 
         if self.w_sparse > 0 and has_sequence:
-            l_sparse = self.sparse_loss(result)
+            sparse_rate = self.sparse_loss.mean_rate(result)
+            sparse_lower, sparse_upper = self.sparse_loss.band_components_from_mean(sparse_rate)
+            l_sparse = self.sparse_loss.penalty_from_mean(sparse_rate)
+            losses["sparse_rate"] = sparse_rate.detach()
+            losses["sparse_lower"] = sparse_lower.detach()
+            losses["sparse_upper"] = sparse_upper.detach()
             losses["sparse"] = l_sparse.detach()
             losses["weighted_sparse"] = (self.w_sparse * l_sparse).detach()
             total = total + self.w_sparse * l_sparse
