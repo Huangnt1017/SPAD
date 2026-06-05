@@ -20,15 +20,15 @@ except ImportError:
 
 ensure_project_root_on_path()
 
-from SNN_based_method.SNN_config import SNNConfig
-from SNN_based_method.scripts.data import (
+from SNN_based_method.config.SNN_config import SNNConfig
+from SNN_based_method.utils.data import (
     RawGroupSample,
     SpadRawGroupDataset,
     read_raw_group,
     seed_everything,
     spad_time_first_collate,
 )
-from SNN_based_method.scripts.runtime import (
+from SNN_based_method.utils.runtime import (
     add_config_arguments,
     config_from_checkpoint_and_args,
     load_checkpoint,

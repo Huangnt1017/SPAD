@@ -15,7 +15,7 @@ from typing import Any, Optional, Sequence
 
 import torch
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -143,6 +143,15 @@ class SNNConfig:
     C: int = 16  # 隐含层通道数
     chunk_size: int = 32
     spike_mode: str = "lif"
+    spike_tau: float = 2.0
+    """LIF/PLIF 膜时间常数; IF 模式下忽略。"""
+
+    spike_v_threshold: float = 0.5
+    """脉冲发放阈值。"""
+
+    spike_v_reset: float | None = 0.0
+    """脉冲重置电位; ``None`` 表示 soft reset。"""
+
     spike_backend: str = "cupy"
     """spikingjelly 神经元后端: ``auto`` 优先 cupy, 也可显式 ``cupy``/``torch``。"""
 
@@ -217,6 +226,9 @@ class SNNConfig:
     progress_interval: int = 20
     """训练/验证进度条每 N 个 batch 同步一次 loss, 降低 CPU-GPU 同步频率。"""
 
+    log_spike_stats: bool = True
+    """是否统计并输出脉冲神经元放电率。"""
+
     # ---- 运行时 / 实验产物 ----
     device: str = "auto"
     log_dir: str = "logs/SNN"
@@ -263,6 +275,18 @@ class SNNConfig:
         self.spike_backend = str(self.spike_backend).lower()
         if self.spike_backend not in {"auto", "cupy", "torch"}:
             raise ValueError("spike_backend must be 'auto', 'cupy' or 'torch'")
+        self.spike_mode = str(self.spike_mode).lower()
+        if self.spike_mode not in {"plif", "lif", "if"}:
+            raise ValueError("spike_mode must be 'plif', 'lif' or 'if'")
+        if self.spike_tau <= 0:
+            raise ValueError("spike_tau must be positive")
+        if self.spike_mode == "plif" and self.spike_tau <= 1.0:
+            raise ValueError("PLIF 要求 spike_tau > 1.0")
+        self.spike_v_threshold = float(self.spike_v_threshold)
+        if self.spike_v_threshold <= 0:
+            raise ValueError("spike_v_threshold must be positive")
+        if self.spike_v_reset is not None:
+            self.spike_v_reset = float(self.spike_v_reset)
 
         self.sparse_mode = str(self.sparse_mode).lower()
         if self.sparse_mode not in {"upper", "target", "band"}:
@@ -300,17 +324,17 @@ class SNNConfig:
         """根据当前配置构建 SNN 或其显式时序递推等价模型。"""
         backend = self.model_backend.lower()
         if backend in {"new", "activation", "activation_based"}:
-            from SNN_based_method.SNN_new import SPADSpikeNet
+            from SNN_based_method.model.SNN_new import SPADSpikeNet
         elif backend in {"legacy", "clock", "clock_driven"}:
             # 旧配置文件可能还保存为 legacy/clock_driven。这里仅做兼容映射,
             # 实际仍使用官方 spikingjelly.activation_based 实现。
-            from SNN_based_method.SNN_new import SPADSpikeNet
+            from SNN_based_method.model.SNN_new import SPADSpikeNet
         elif backend in {"rnn", "recurrent", "srnn"}:
-            from SNN_based_method.SNN_c_RNN import SNN_c_RNN as SPADSpikeNet
+            from SNN_based_method.model.SNN_c_RNN import SNN_c_RNN as SPADSpikeNet
         elif backend in {"lstm", "clstm", "convlstm"}:
-            from SNN_based_method.SNN_c_LSTM import SNN_c_LSTM as SPADSpikeNet
+            from SNN_based_method.model.SNN_c_LSTM import SNN_c_LSTM as SPADSpikeNet
         elif backend in {"gru", "cgru", "convgru"}:
-            from SNN_based_method.SNN_c_GRU import SNN_c_GRU as SPADSpikeNet
+            from SNN_based_method.model.SNN_c_GRU import SNN_c_GRU as SPADSpikeNet
         else:
             raise ValueError("model_backend must be 'new'/'activation_based'/'rnn'/'lstm'/'gru'")
 
@@ -318,6 +342,9 @@ class SNNConfig:
             C=self.C,
             chunk_size=self.chunk_size,
             spike_mode=self.spike_mode,
+            spike_tau=self.spike_tau,
+            spike_v_threshold=self.spike_v_threshold,
+            spike_v_reset=self.spike_v_reset,
             spike_backend=self.spike_backend,
             t_max=self.time_threshold,
             n_freq=self.n_freq,
@@ -331,7 +358,7 @@ class SNNConfig:
 
     def build_loss(self) -> torch.nn.Module:
         """构建标准 SNN 成像损失。"""
-        from SNN_based_method.loss import SPADImagingLoss
+        from SNN_based_method.utils.loss import SPADImagingLoss
 
         return SPADImagingLoss(
             w_gt=self.w_gt,
@@ -361,7 +388,7 @@ class SNNConfig:
 
     def build_metrics(self):
         """构建验证和测试使用的图像指标。"""
-        from SNN_based_method.loss import ImageMetrics
+        from SNN_based_method.utils.loss import ImageMetrics
 
         return ImageMetrics(
             depth_range=self.depth_range,
@@ -374,7 +401,7 @@ class SNNConfig:
         if not self.data_paths:
             raise ValueError("data_paths is empty; pass --data-paths or use a config JSON")
 
-        from SNN_based_method.scripts.data import create_spad_dataloaders
+        from SNN_based_method.utils.data import create_spad_dataloaders
 
         return create_spad_dataloaders(
             self.data_paths,
@@ -417,7 +444,7 @@ class SNNConfig:
         if not self.data_paths:
             raise ValueError("data_paths is empty; pass --data-paths or use a config JSON")
 
-        from SNN_based_method.scripts.data import create_spad_dataloader
+        from SNN_based_method.utils.data import create_spad_dataloader
 
         return create_spad_dataloader(
             self.data_paths,
@@ -511,6 +538,8 @@ class SNNConfig:
         lines.append(
             f"  model_backend={self.model_backend}, encoding={self.encoding_mode}, "
             f"C_enc={self.C_enc}, C={self.C}, chunk_size={self.chunk_size}, "
+            f"spike_mode={self.spike_mode}, spike_tau={self.spike_tau}, "
+            f"spike_v_threshold={self.spike_v_threshold}, spike_v_reset={self.spike_v_reset}, "
             f"spike_backend={self.spike_backend}, refine_mid={self.refine_mid}, "
             f"return_sequence={self.return_sequence}"
         )
@@ -529,7 +558,8 @@ class SNNConfig:
         )
         lines.append(
             f"  runtime: amp={self.amp}, tf32={self.tf32}, cuda_prefetch={self.cuda_prefetch}, "
-            f"cudnn_benchmark={self.cudnn_benchmark}, progress_interval={self.progress_interval}"
+            f"cudnn_benchmark={self.cudnn_benchmark}, progress_interval={self.progress_interval}, "
+            f"log_spike_stats={self.log_spike_stats}"
         )
         lines.append(f"  log_dir={self.log_dir}, checkpoint_dir={self.checkpoint_dir}")
         return "\n".join(lines)

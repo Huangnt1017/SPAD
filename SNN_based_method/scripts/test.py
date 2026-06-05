@@ -17,9 +17,9 @@ except ImportError:
 
 ensure_project_root_on_path()
 
-from SNN_based_method.SNN_config import SNNConfig
-from SNN_based_method.scripts.data import seed_everything
-from SNN_based_method.scripts.runtime import (
+from SNN_based_method.config.SNN_config import SNNConfig
+from SNN_based_method.utils.data import seed_everything
+from SNN_based_method.utils.runtime import (
     add_config_arguments,
     config_from_checkpoint_and_args,
     divide_average,

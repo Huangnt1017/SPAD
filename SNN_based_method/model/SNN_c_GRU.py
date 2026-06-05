@@ -22,8 +22,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from SNN_based_method.SNN_c_RNN import _detach_state_tree, _seq_to_ann_forward
-from SNN_based_method.SNN_new import (
+from SNN_based_method.model.SNN_c_RNN import _detach_state_tree, _seq_to_ann_forward
+from SNN_based_method.model.SNN_new import (
     LearnableTofEmbedding,
     MultiScaleDSConv,
     SpatialRefineHead,
@@ -194,6 +194,9 @@ class SNN_c_GRU(nn.Module):
         C: int = 32,
         chunk_size: int = 128,
         spike_mode: str = "plif",
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
         t_max: int = 128,
         n_freq: int = 8,
         num_blocks: int = 3,
@@ -212,6 +215,9 @@ class SNN_c_GRU(nn.Module):
         self.encoding_mode = str(encoding_mode).lower()
         self.return_sequence = bool(return_sequence)
         self.spike_mode = str(spike_mode).lower()
+        self.spike_tau = float(spike_tau)
+        self.spike_v_threshold = float(spike_v_threshold)
+        self.spike_v_reset = None if spike_v_reset is None else float(spike_v_reset)
         self.spike_backend = str(spike_backend).lower()
 
         if self.encoding_mode == "lut":

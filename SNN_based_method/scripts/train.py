@@ -19,9 +19,9 @@ except ImportError:
 
 ensure_project_root_on_path()
 
-from SNN_based_method.SNN_config import SNNConfig
-from SNN_based_method.scripts.data import seed_everything
-from SNN_based_method.scripts.runtime import (
+from SNN_based_method.config.SNN_config import SNNConfig
+from SNN_based_method.utils.data import seed_everything
+from SNN_based_method.utils.runtime import (
     add_config_arguments,
     build_run_name,
     config_from_checkpoint_and_args,
@@ -101,6 +101,82 @@ def _tensor_average_to_float(total: dict[str, torch.Tensor], count: int) -> dict
     stacked = torch.stack([total[key] / divisor for key in keys])
     values = stacked.detach().cpu().tolist()
     return {key: float(value) for key, value in zip(keys, values)}
+
+
+def _update_spike_stats_sums(
+    total_sum: dict[str, torch.Tensor],
+    total_count: dict[str, torch.Tensor],
+    spike_stats: dict[str, object] | None,
+    device: torch.device,
+) -> None:
+    """累加每个 batch 返回的脉冲放电统计。"""
+    if not spike_stats:
+        return
+    stat_sum = spike_stats.get("sum")
+    stat_count = spike_stats.get("count")
+    if not isinstance(stat_sum, dict) or not isinstance(stat_count, dict):
+        return
+
+    for key, value in stat_sum.items():
+        if isinstance(value, torch.Tensor):
+            scalar = value.detach()
+            if scalar.device != device:
+                scalar = scalar.to(device=device, non_blocking=True)
+        else:
+            scalar = torch.tensor(float(value), device=device)
+        total_sum[key] = total_sum.get(key, torch.zeros((), device=device)) + scalar
+
+    for key, value in stat_count.items():
+        if isinstance(value, torch.Tensor):
+            scalar = value.detach()
+            if scalar.device != device:
+                scalar = scalar.to(device=device, non_blocking=True)
+        else:
+            scalar = torch.tensor(float(value), device=device)
+        total_count[key] = total_count.get(key, torch.zeros((), device=device)) + scalar
+
+
+def _spike_rates_to_float(
+    total_sum: dict[str, torch.Tensor],
+    total_count: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """把累计的脉冲统计转成 epoch 级平均放电率。"""
+    if not total_sum or not total_count:
+        return {}
+    keys = sorted(set(total_sum) & set(total_count))
+    if not keys:
+        return {}
+    rates = []
+    for key in keys:
+        rates.append((total_sum[key] / total_count[key].clamp_min(1.0)).detach())
+    values = torch.stack(rates).cpu().tolist()
+    return {key: float(value) for key, value in zip(keys, values)}
+
+
+def _format_spike_rates(spike_rates: dict[str, float]) -> str:
+    """把放电率字典格式化为稳定的一行日志。"""
+    if not spike_rates:
+        return "none"
+    return " ".join(f"{key}={value:.6f}" for key, value in sorted(spike_rates.items()))
+
+
+def _build_progress_postfix(
+    loss_value: float,
+    spike_stats: dict[str, object] | None,
+) -> dict[str, str]:
+    """构造 tqdm 进度条右侧展示内容。"""
+    postfix = {"loss": f"{loss_value:.4f}"}
+    if not spike_stats:
+        return postfix
+    stat_rate = spike_stats.get("rate")
+    if not isinstance(stat_rate, dict):
+        return postfix
+
+    for key in ("all", "stem", "blocks", "gate"):
+        value = stat_rate.get(key)
+        if isinstance(value, torch.Tensor):
+            postfix[f"spk_{key}"] = f"{float(value.detach().cpu().item()):.4f}"
+    return postfix
 
 
 def configure_torch_runtime(cfg: SNNConfig) -> None:
@@ -227,6 +303,8 @@ def train_one_epoch(
     model.train()
     total_loss = torch.zeros((), device=device)
     loss_sums: dict[str, torch.Tensor] = {}
+    spike_sum_sums: dict[str, torch.Tensor] = {}
+    spike_count_sums: dict[str, torch.Tensor] = {}
     num_steps = 0
     use_amp = cfg.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -293,12 +371,24 @@ def train_one_epoch(
             _stamp(stage_times, "batch_done", device)
         total_loss = total_loss + detached_loss
         _update_tensor_sums(loss_sums, loss_items, device)
+        if cfg.log_spike_stats:
+            _update_spike_stats_sums(
+                spike_sum_sums,
+                spike_count_sums,
+                result.get("spike_stats") if isinstance(result, dict) else None,
+                device,
+            )
         num_steps += 1
 
         is_last = batch_index + 1 == len(data_loader)
         if batch_index % progress_interval == 0 or is_last:
             loss_value = float(detached_loss.cpu().item())
-            progress.set_postfix(loss=f"{loss_value:.4f}")
+            progress.set_postfix(
+                _build_progress_postfix(
+                    loss_value,
+                    result.get("spike_stats") if cfg.log_spike_stats and isinstance(result, dict) else None,
+                )
+            )
 
         if stage_times is not None:
             names = list(stage_times)
@@ -312,7 +402,11 @@ def train_one_epoch(
             )
 
     avg_loss = float((total_loss / max(num_steps, 1)).detach().cpu().item())
-    return avg_loss, _tensor_average_to_float(loss_sums, num_steps)
+    train_items = _tensor_average_to_float(loss_sums, num_steps)
+    if cfg.log_spike_stats:
+        for key, value in _spike_rates_to_float(spike_sum_sums, spike_count_sums).items():
+            train_items[f"spike_rate_{key}"] = value
+    return avg_loss, train_items
 
 
 @torch.no_grad()
@@ -330,6 +424,8 @@ def validate_one_epoch(
     total_loss = torch.zeros((), device=device)
     loss_sums: dict[str, torch.Tensor] = {}
     metric_sums: dict[str, torch.Tensor] = {}
+    spike_sum_sums: dict[str, torch.Tensor] = {}
+    spike_count_sums: dict[str, torch.Tensor] = {}
     num_steps = 0
     progress_interval = max(1, int(cfg.progress_interval))
 
@@ -350,15 +446,31 @@ def validate_one_epoch(
         detached_loss = loss.detach()
         total_loss = total_loss + detached_loss
         _update_tensor_sums(loss_sums, loss_items, device)
+        if cfg.log_spike_stats:
+            _update_spike_stats_sums(
+                spike_sum_sums,
+                spike_count_sums,
+                result.get("spike_stats") if isinstance(result, dict) else None,
+                device,
+            )
         num_steps += 1
         is_last = batch_index + 1 == len(data_loader)
         if batch_index % progress_interval == 0 or is_last:
             loss_value = float(detached_loss.cpu().item())
-            progress.set_postfix(loss=f"{loss_value:.4f}")
+            progress.set_postfix(
+                _build_progress_postfix(
+                    loss_value,
+                    result.get("spike_stats") if cfg.log_spike_stats and isinstance(result, dict) else None,
+                )
+            )
 
+    val_items = _tensor_average_to_float(loss_sums, num_steps)
+    if cfg.log_spike_stats:
+        for key, value in _spike_rates_to_float(spike_sum_sums, spike_count_sums).items():
+            val_items[f"spike_rate_{key}"] = value
     return (
         float((total_loss / max(num_steps, 1)).detach().cpu().item()),
-        _tensor_average_to_float(loss_sums, num_steps),
+        val_items,
         _tensor_average_to_float(metric_sums, num_steps),
     )
 
@@ -450,7 +562,7 @@ def ensure_train_precomputed_labels(cfg: SNNConfig):
     if not cfg.data_paths or not cfg.csv_paths:
         return None
 
-    from SNN_based_method.scripts.generate_precomputed_labels import (
+    from SNN_based_method.utils.generate_precomputed_labels import (
         GenerateLabelConfig,
         ensure_precomputed_labels,
     )

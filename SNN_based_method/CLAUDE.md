@@ -8,8 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Conda 环境：`torchnew`（Python 路径 `D:\Anaconda3\envs\torchnew\python.exe`）
 - SpikingJelly：使用环境中安装的官方 `spikingjelly.activation_based`，**不要**使用本地的 `spikingjelly1`
-- `SNN.py` 只是兼容入口，实际转发到 `SNN_new.py`。任何模型改动都请编辑 `SNN_new.py`
-- 所有可调参数的唯一真源：`SNN_config.SNNConfig`（dataclass）。不要在其他地方硬编码常量
+- 任何模型改动都请编辑 `model/SNN_new.py` 或对应的 `model/SNN_c_*.py`
+- 所有可调参数的唯一真源：`config/SNN_config.py` 中的 `SNNConfig`（dataclass）。不要在其他地方硬编码常量
 
 ## 常用命令
 
@@ -41,7 +41,7 @@ $python = "D:\Anaconda3\envs\torchnew\python.exe"
 & $python SNN_based_method/scripts/generate_precomputed_labels.py --data-paths <...> --csv-paths <...> --pages-per-group 128 --dry-run
 
 # 编码可视化（频率响应 / 多帧聚合 / 雾 vs 目标区分度）
-& $python SNN_based_method/visualize_encoding.py --t-max 128
+& $python SNN_based_method/scripts/visualize_encoding.py --t-max 128
 ```
 
 易踩的几点：

@@ -7,8 +7,8 @@
 4. 对比不同 ToF bin 经过编码后的频率响应和区分度。
 
 用法示例:
-    python SNN_based_method/visualize_encoding.py --data_path <txt文件路径> --n_freq 8 --t_max 128
-    python SNN_based_method/visualize_encoding.py --raw_path <raw文件路径> --pages_per_group 512 --time_threshold 128 --plot_group_num 1
+    python SNN_based_method/scripts/visualize_encoding.py --data_path <txt文件路径> --n_freq 8 --t_max 128
+    python SNN_based_method/scripts/visualize_encoding.py --raw_path <raw文件路径> --pages_per_group 512 --time_threshold 128 --plot_group_num 1
 """
 
 import argparse

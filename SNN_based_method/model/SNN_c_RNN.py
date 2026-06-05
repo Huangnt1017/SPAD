@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from spikingjelly.activation_based import surrogate
 
-from SNN_based_method.SNN_new import (
+from SNN_based_method.model.SNN_new import (
     LearnableTofEmbedding,
     MultiScaleDSConv,
     SpatialRefineHead,
@@ -170,13 +170,21 @@ class _StemRNN(nn.Module):
         c_enc: int,
         c_hidden: int,
         spike_mode: str,
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
         spike_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.spike_backend = str(spike_backend).lower()
         self.conv1 = nn.Conv2d(c_enc, c_hidden, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(c_hidden)
-        self.spike = SpikingRecurrentCell(spike_mode=spike_mode)
+        self.spike = SpikingRecurrentCell(
+            spike_mode=spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+        )
         self.conv2 = nn.Conv2d(c_hidden, c_hidden, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(c_hidden)
 
@@ -194,12 +202,30 @@ class _StemRNN(nn.Module):
 class SpikeBlockRNN(nn.Module):
     """SpikeBlock 的显式 RNN 版本，保持模块命名与原模型一致。"""
 
-    def __init__(self, c_hidden: int, spike_mode: str, spike_backend: str = "auto") -> None:
+    def __init__(
+        self,
+        c_hidden: int,
+        spike_mode: str,
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
+        spike_backend: str = "auto",
+    ) -> None:
         super().__init__()
         self.spike_backend = str(spike_backend).lower()
-        self.spike_in = SpikingRecurrentCell(spike_mode=spike_mode)
+        self.spike_in = SpikingRecurrentCell(
+            spike_mode=spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+        )
         self.ms_dsconv = MultiScaleDSConv(c_hidden)
-        self.spike_mid = SpikingRecurrentCell(spike_mode=spike_mode)
+        self.spike_mid = SpikingRecurrentCell(
+            spike_mode=spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+        )
         self.pw = nn.Conv2d(c_hidden, c_hidden, 1, bias=False)
         self.bn = nn.BatchNorm2d(c_hidden)
 
@@ -221,13 +247,31 @@ class SpikeBlockRNN(nn.Module):
 class _GateHeadRNN(nn.Module):
     """GateHead 的显式 RNN 版本。"""
 
-    def __init__(self, c_hidden: int, spike_mode: str, spike_backend: str = "auto") -> None:
+    def __init__(
+        self,
+        c_hidden: int,
+        spike_mode: str,
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
+        spike_backend: str = "auto",
+    ) -> None:
         super().__init__()
         self.spike_backend = str(spike_backend).lower()
-        self.spike1 = SpikingRecurrentCell(spike_mode=spike_mode)
+        self.spike1 = SpikingRecurrentCell(
+            spike_mode=spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+        )
         self.conv1 = nn.Conv2d(c_hidden, c_hidden // 2, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(c_hidden // 2)
-        self.spike2 = SpikingRecurrentCell(spike_mode=spike_mode)
+        self.spike2 = SpikingRecurrentCell(
+            spike_mode=spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+        )
         self.conv2 = nn.Conv2d(c_hidden // 2, 1, 1, bias=True)
 
     def forward(
@@ -252,6 +296,9 @@ class SNN_c_RNN(nn.Module):
         C: int = 32,
         chunk_size: int = 128,
         spike_mode: str = "plif",
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
         t_max: int = 128,
         n_freq: int = 8,
         num_blocks: int = 3,
@@ -269,7 +316,11 @@ class SNN_c_RNN(nn.Module):
         self.n_freq = int(n_freq)
         self.encoding_mode = str(encoding_mode).lower()
         self.return_sequence = bool(return_sequence)
+        self.spike_mode = str(spike_mode).lower()
         self.spike_backend = str(spike_backend).lower()
+        self.spike_tau = float(spike_tau)
+        self.spike_v_threshold = float(spike_v_threshold)
+        self.spike_v_reset = None if spike_v_reset is None else float(spike_v_reset)
 
         if self.encoding_mode == "lut":
             self.tof_embedding = LearnableTofEmbedding(
@@ -285,14 +336,36 @@ class SNN_c_RNN(nn.Module):
         else:
             raise ValueError("encoding_mode must be 'sinusoidal' or 'lut'")
 
-        self.stem = _StemRNN(c_enc, self.C, spike_mode, spike_backend=self.spike_backend)
+        self.stem = _StemRNN(
+            c_enc,
+            self.C,
+            self.spike_mode,
+            spike_tau=self.spike_tau,
+            spike_v_threshold=self.spike_v_threshold,
+            spike_v_reset=self.spike_v_reset,
+            spike_backend=self.spike_backend,
+        )
         self.blocks = nn.ModuleList(
             [
-                SpikeBlockRNN(self.C, spike_mode, spike_backend=self.spike_backend)
+                SpikeBlockRNN(
+                    self.C,
+                    self.spike_mode,
+                    spike_tau=self.spike_tau,
+                    spike_v_threshold=self.spike_v_threshold,
+                    spike_v_reset=self.spike_v_reset,
+                    spike_backend=self.spike_backend,
+                )
                 for _ in range(num_blocks)
             ]
         )
-        self.gate_head = _GateHeadRNN(self.C, spike_mode, spike_backend=self.spike_backend)
+        self.gate_head = _GateHeadRNN(
+            self.C,
+            self.spike_mode,
+            spike_tau=self.spike_tau,
+            spike_v_threshold=self.spike_v_threshold,
+            spike_v_reset=self.spike_v_reset,
+            spike_backend=self.spike_backend,
+        )
         self.refine = SpatialRefineHead(mid=refine_mid, depth_range=self.t_max)
 
     def _encode_chunk(

@@ -6,22 +6,26 @@
 
 ```text
 SNN_based_method/
-  SNN_config.py         配置入口
-  SNN.py                兼容旧导入, 统一导出所有模型后端
-  SNN_new.py            默认 SNN 后端, 使用官方 spikingjelly.activation_based
-  SNN_c_RNN.py          显式 RNN 等价版
-  SNN_c_LSTM.py         显式 ConvLSTM 版
-  SNN_c_GRU.py          显式 ConvGRU 版
-  loss.py               成像 loss 和指标
+  config/
+    SNN_config.py       配置入口
+  model/
+    SNN_new.py          默认 SNN 后端, 使用官方 spikingjelly.activation_based
+    SNN_c_RNN.py        显式 RNN 等价版
+    SNN_c_LSTM.py       显式 ConvLSTM 版
+    SNN_c_GRU.py        显式 ConvGRU 版
+  utils/
+    loss.py             成像 loss 和指标
+    data.py             raw/csv 数据集与 DataLoader
+    augment.py          raw group 级数据增强
+    runtime.py          CLI、日志、checkpoint、公用运行时工具
   scripts/
     train.py            训练入口
     test.py             批量测试入口
     test1.py            单 raw group 推理入口
+    visualize_encoding.py
+                        ToF 编码可视化入口
     generate_precomputed_labels.py
                         预生成类别级 label 池
-    data.py             raw/csv 数据集与 DataLoader
-    augment.py          raw group 级数据增强
-    runtime.py          CLI、日志、checkpoint、公用运行时工具
 ```
 
 本项目使用环境中安装的官方 `spikingjelly.activation_based`，不使用本地 `spikingjelly1`。

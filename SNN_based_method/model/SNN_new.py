@@ -26,6 +26,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from spikingjelly.activation_based import neuron, functional
+from spikingjelly.activation_based.neuron import base_node as sj_base_node
+from spikingjelly.activation_based.neuron import integrate_and_fire as sj_if
+from spikingjelly.activation_based.neuron import lif as sj_lif
 
 
 # ─── cupy backend 探测 ────────────────────────────────────
@@ -63,12 +66,267 @@ def _cupy_backend_available() -> bool:
     return _CUPY_AVAILABLE
 
 
+class _SpikeActivityMixin:
+    """为脉冲节点记录当前 forward 的放电统计。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spike_activity_sum: torch.Tensor | None = None
+        self._spike_activity_count: torch.Tensor | None = None
+
+    def forward(self, *args, **kwargs):
+        out = super().forward(*args, **kwargs)
+        if isinstance(out, torch.Tensor):
+            self._record_spike_activity(out)
+        return out
+
+    def _record_spike_activity(self, spike_seq: torch.Tensor) -> None:
+        with torch.no_grad():
+            spike_sum = spike_seq.detach().sum()
+            spike_count = torch.as_tensor(
+                float(spike_seq.numel()),
+                device=spike_sum.device,
+                dtype=spike_sum.dtype,
+            )
+            if self._spike_activity_sum is None or self._spike_activity_count is None:
+                self._spike_activity_sum = spike_sum
+                self._spike_activity_count = spike_count
+            else:
+                self._spike_activity_sum = self._spike_activity_sum + spike_sum
+                self._spike_activity_count = self._spike_activity_count + spike_count
+
+    def reset_spike_activity(self) -> None:
+        self._spike_activity_sum = None
+        self._spike_activity_count = None
+
+    def export_spike_activity(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self._spike_activity_sum is None or self._spike_activity_count is None:
+            return None
+        return self._spike_activity_sum.detach(), self._spike_activity_count.detach()
+
+
+def _reset_module_spike_stats(root: nn.Module) -> None:
+    """清空模型内所有脉冲节点的累计放电统计。"""
+    for module in root.modules():
+        reset_fn = getattr(module, "reset_spike_activity", None)
+        if callable(reset_fn):
+            reset_fn()
+
+
+def _sanitize_spike_stat_name(name: str) -> str:
+    """把模块路径转换为适合日志展示的稳定键名。"""
+    return name.replace(".", "_")
+
+
+def _spike_group_name(module_name: str) -> str:
+    """按网络结构把脉冲层归入 stem / blocks / gate 三组。"""
+    if module_name.startswith("stem."):
+        return "stem"
+    if module_name.startswith("blocks."):
+        return "blocks"
+    if module_name.startswith("gate_head."):
+        return "gate"
+    return "other"
+
+
+def _collect_module_spike_stats(root: nn.Module) -> dict[str, dict[str, torch.Tensor]]:
+    """汇总模型内各脉冲层的放电统计，并额外生成分组统计。"""
+    spike_sum: dict[str, torch.Tensor] = {}
+    spike_count: dict[str, torch.Tensor] = {}
+    grouped_keys: dict[str, list[str]] = {}
+
+    for module_name, module in root.named_modules():
+        if not module_name:
+            continue
+        export_fn = getattr(module, "export_spike_activity", None)
+        if not callable(export_fn):
+            continue
+        exported = export_fn()
+        if exported is None:
+            continue
+
+        layer_sum, layer_count = exported
+        stat_name = _sanitize_spike_stat_name(module_name)
+        spike_sum[stat_name] = layer_sum
+        spike_count[stat_name] = layer_count
+        grouped_keys.setdefault(_spike_group_name(module_name), []).append(stat_name)
+
+    if not spike_sum:
+        return {}
+
+    spike_rate = {
+        key: spike_sum[key] / spike_count[key].clamp_min(1.0)
+        for key in spike_sum
+    }
+
+    grouped_keys["all"] = list(spike_sum.keys())
+    for group_name, stat_names in grouped_keys.items():
+        if not stat_names:
+            continue
+        group_sum = torch.stack([spike_sum[name] for name in stat_names]).sum()
+        group_count = torch.stack([spike_count[name] for name in stat_names]).sum()
+        spike_sum[group_name] = group_sum
+        spike_count[group_name] = group_count
+        spike_rate[group_name] = group_sum / group_count.clamp_min(1.0)
+
+    return {
+        "sum": spike_sum,
+        "count": spike_count,
+        "rate": spike_rate,
+    }
+
+
+# 这版 spikingjelly 的 IF/LIF 在 CUDA + step_mode='m' + eval() 下会优先尝试 Triton，
+# 即使用户显式指定了 backend='cupy' 或 backend='torch'。Windows 环境通常未安装
+# Triton，于是验证阶段会直接报错。这里用轻量兼容子类强制尊重显式后端选择。
+class _CompatIFNode(_SpikeActivityMixin, neuron.IFNode):
+    """兼容 IFNode 多步前向的隐式 Triton 切换。"""
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if self.backend == "inductor" or self.backend == "triton":
+            return super().multi_step_forward(x_seq)
+
+        if self.backend == "torch":
+            return sj_base_node.BaseNode.multi_step_forward(self, x_seq)
+
+        if self.backend == "cupy":
+            hard_reset = self.v_reset is not None
+            if x_seq.dtype == torch.float:
+                dtype = "float"
+            elif x_seq.dtype == torch.half:
+                dtype = "half2"
+            else:
+                raise NotImplementedError(x_seq.dtype)
+
+            if (
+                self.forward_kernel is None
+                or not self.forward_kernel.check_attributes(
+                    hard_reset=hard_reset, dtype=dtype
+                )
+            ):
+                self.forward_kernel = sj_if.ac_neuron_kernel.IFNodeFPTTKernel(
+                    hard_reset=hard_reset, dtype=dtype
+                )
+            if (
+                self.backward_kernel is None
+                or not self.backward_kernel.check_attributes(
+                    surrogate_function=self.surrogate_function.cuda_codes,
+                    hard_reset=hard_reset,
+                    detach_reset=self.detach_reset,
+                    dtype=dtype,
+                )
+            ):
+                self.backward_kernel = sj_if.ac_neuron_kernel.IFNodeBPTTKernel(
+                    surrogate_function=self.surrogate_function.cuda_codes,
+                    hard_reset=hard_reset,
+                    detach_reset=self.detach_reset,
+                    dtype=dtype,
+                )
+
+            self.v_float_to_tensor(x_seq[0])
+            spike_seq, v_seq = sj_if.ac_neuron_kernel.multistep_if(
+                x_seq=x_seq.flatten(1),
+                v_init=self.v.flatten(0),
+                v_threshold=self.v_threshold,
+                v_reset=self.v_reset,
+                detach_reset=self.detach_reset,
+                surrogate_function=self.surrogate_function,
+                forward_kernel=self.forward_kernel,
+                backward_kernel=self.backward_kernel,
+            )
+            spike_seq = spike_seq.reshape(x_seq.shape)
+            v_seq = v_seq.reshape(x_seq.shape)
+            if self.store_v_seq:
+                self.v_seq = v_seq
+            self.v = v_seq[-1].clone()
+            return spike_seq
+
+        raise ValueError(self.backend)
+
+
+class _CompatLIFNode(_SpikeActivityMixin, neuron.LIFNode):
+    """兼容 LIFNode 多步前向的隐式 Triton 切换。"""
+
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if self.backend == "inductor" or self.backend == "triton":
+            return super().multi_step_forward(x_seq)
+
+        if self.backend == "torch":
+            return sj_base_node.BaseNode.multi_step_forward(self, x_seq)
+
+        if self.backend == "cupy":
+            hard_reset = self.v_reset is not None
+            if x_seq.dtype == torch.float:
+                dtype = "float"
+            elif x_seq.dtype == torch.half:
+                dtype = "half2"
+            else:
+                raise NotImplementedError(x_seq.dtype)
+
+            if (
+                self.forward_kernel is None
+                or not self.forward_kernel.check_attributes(
+                    hard_reset=hard_reset, dtype=dtype, decay_input=self.decay_input
+                )
+            ):
+                self.forward_kernel = sj_lif.ac_neuron_kernel.LIFNodeFPTTKernel(
+                    decay_input=self.decay_input, hard_reset=hard_reset, dtype=dtype
+                )
+
+            if (
+                self.backward_kernel is None
+                or not self.backward_kernel.check_attributes(
+                    surrogate_function=self.surrogate_function.cuda_codes,
+                    hard_reset=hard_reset,
+                    detach_reset=self.detach_reset,
+                    dtype=dtype,
+                    decay_input=self.decay_input,
+                )
+            ):
+                self.backward_kernel = sj_lif.ac_neuron_kernel.LIFNodeBPTTKernel(
+                    decay_input=self.decay_input,
+                    surrogate_function=self.surrogate_function.cuda_codes,
+                    hard_reset=hard_reset,
+                    detach_reset=self.detach_reset,
+                    dtype=dtype,
+                )
+
+            self.v_float_to_tensor(x_seq[0])
+            spike_seq, v_seq = sj_lif.ac_neuron_kernel.multistep_lif(
+                x_seq=x_seq.flatten(1),
+                v_init=self.v.flatten(0),
+                decay_input=self.decay_input,
+                tau=self.tau,
+                v_threshold=self.v_threshold,
+                v_reset=self.v_reset,
+                detach_reset=self.detach_reset,
+                surrogate_function=self.surrogate_function,
+                forward_kernel=self.forward_kernel,
+                backward_kernel=self.backward_kernel,
+            )
+            spike_seq = spike_seq.reshape(x_seq.shape)
+            v_seq = v_seq.reshape(x_seq.shape)
+            if self.store_v_seq:
+                self.v_seq = v_seq
+                self.v = v_seq[-1]
+            else:
+                self.v = v_seq[-1].clone()
+            return spike_seq
+
+        raise ValueError(self.backend)
+
+
+class _CompatPLIFNode(_SpikeActivityMixin, neuron.ParametricLIFNode):
+    """为 PLIF 节点补充统一放电统计接口。"""
+
+
 # ─── 神经元工厂 ───────────────────────────────────────────
 
 def build_node(
     spike_mode: str = "plif",
     tau: float = 2.0,
     v_threshold: float = 0.5,
+    v_reset: float | None = 0.0,
     spike_backend: str = "auto",
 ) -> nn.Module:
     """构造 activation_based 脉冲神经元节点.
@@ -85,6 +343,7 @@ def build_node(
         spike_mode:   神经元类型 ("plif" / "lif" / "if")
         tau:          膜时间常数 (lif/plif 有效)
         v_threshold:  发放阈值
+        v_reset:      重置电位, ``None`` 表示 soft reset
         spike_backend: "auto" / "cupy" / "torch"
 
     Returns:
@@ -104,14 +363,19 @@ def build_node(
         backend = "torch"
     else:
         raise ValueError("spike_backend must be 'auto', 'cupy' or 'torch'")
-    common = dict(v_threshold=v_threshold, detach_reset=True,
-                  step_mode="m", backend=backend)
+    common = dict(
+        v_threshold=v_threshold,
+        v_reset=v_reset,
+        detach_reset=True,
+        step_mode="m",
+        backend=backend,
+    )
     if spike_mode == "plif":
-        return neuron.ParametricLIFNode(init_tau=tau, **common)
+        return _CompatPLIFNode(init_tau=tau, **common)
     elif spike_mode == "lif":
-        return neuron.LIFNode(tau=tau, **common)
+        return _CompatLIFNode(tau=tau, **common)
     elif spike_mode == "if":
-        return neuron.IFNode(**common)
+        return _CompatIFNode(**common)
     else:
         raise ValueError(f"不支持的 spike_mode: {spike_mode}, 可选 plif/lif/if")
 
@@ -335,11 +599,31 @@ class SpikeBlock(nn.Module):
         spike_mode: 神经元类型
     """
 
-    def __init__(self, C: int, spike_mode: str, spike_backend: str = "auto"):
+    def __init__(
+        self,
+        C: int,
+        spike_mode: str,
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
+        spike_backend: str = "auto",
+    ):
         super().__init__()
-        self.spike_in = build_node(spike_mode, spike_backend=spike_backend)
+        self.spike_in = build_node(
+            spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+            spike_backend=spike_backend,
+        )
         self.ms_dsconv = MultiScaleDSConv(C)
-        self.spike_mid = build_node(spike_mode, spike_backend=spike_backend)
+        self.spike_mid = build_node(
+            spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+            spike_backend=spike_backend,
+        )
         self.pw = nn.Conv2d(C, C, 1, bias=False)
         self.bn = nn.BatchNorm2d(C)
 
@@ -439,6 +723,9 @@ class _Stem(nn.Module):
         C_enc: int,
         C: int,
         spike_mode: str,
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
         spike_backend: str = "auto",
     ):
         super().__init__()
@@ -446,6 +733,9 @@ class _Stem(nn.Module):
         self.bn1 = nn.BatchNorm2d(C)
         self.spike = build_node(
             spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
             spike_backend=spike_backend,
         )                                               # step_mode='m', 需要 [T,B,C,H,W]
         self.conv2 = nn.Conv2d(C, C, 3, padding=1, bias=False)
@@ -478,12 +768,32 @@ class _GateHead(nn.Module):
         spike_mode: 神经元类型
     """
 
-    def __init__(self, C: int, spike_mode: str, spike_backend: str = "auto"):
+    def __init__(
+        self,
+        C: int,
+        spike_mode: str,
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
+        spike_backend: str = "auto",
+    ):
         super().__init__()
-        self.spike1 = build_node(spike_mode, spike_backend=spike_backend)
+        self.spike1 = build_node(
+            spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+            spike_backend=spike_backend,
+        )
         self.conv1 = nn.Conv2d(C, C // 2, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(C // 2)
-        self.spike2 = build_node(spike_mode, spike_backend=spike_backend)
+        self.spike2 = build_node(
+            spike_mode,
+            tau=spike_tau,
+            v_threshold=spike_v_threshold,
+            v_reset=spike_v_reset,
+            spike_backend=spike_backend,
+        )
         self.conv2 = nn.Conv2d(C // 2, 1, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -515,6 +825,9 @@ class SPADSpikeNet(nn.Module):
         C:             工作通道数
         chunk_size:    每个 chunk 的帧数 (= 一次 forward 的时间步数 T)
         spike_mode:    神经元类型 ("plif" / "lif" / "if")
+        spike_tau:     LIF/PLIF 的膜时间常数，IF 模式下忽略
+        spike_v_threshold: 脉冲发放阈值
+        spike_v_reset: 重置电位，``None`` 表示 soft reset
         t_max:         最大有效 ToF bin
         n_freq:        正弦编码频率对数量
         num_blocks:    SpikeBlock 数量
@@ -528,6 +841,9 @@ class SPADSpikeNet(nn.Module):
         C: int = 32,
         chunk_size: int = 128,
         spike_mode: str = "plif",
+        spike_tau: float = 2.0,
+        spike_v_threshold: float = 0.5,
+        spike_v_reset: float | None = 0.0,
         t_max: int = 128,
         n_freq: int = 8,
         num_blocks: int = 3,
@@ -545,7 +861,11 @@ class SPADSpikeNet(nn.Module):
         self.n_freq = n_freq
         self.encoding_mode = encoding_mode
         self.return_sequence = bool(return_sequence)
+        self.spike_mode = str(spike_mode).lower()
         self.spike_backend = str(spike_backend).lower()
+        self.spike_tau = float(spike_tau)
+        self.spike_v_threshold = float(spike_v_threshold)
+        self.spike_v_reset = None if spike_v_reset is None else float(spike_v_reset)
 
         if encoding_mode == "lut":
             self.tof_embedding = LearnableTofEmbedding(
@@ -557,14 +877,36 @@ class SPADSpikeNet(nn.Module):
             self.tof_embedding = None
             C_enc = 2 * n_freq + 1                      # 默认 17
 
-        self.stem = _Stem(C_enc, C, spike_mode, spike_backend=self.spike_backend)
+        self.stem = _Stem(
+            C_enc,
+            C,
+            self.spike_mode,
+            spike_tau=self.spike_tau,
+            spike_v_threshold=self.spike_v_threshold,
+            spike_v_reset=self.spike_v_reset,
+            spike_backend=self.spike_backend,
+        )
         self.blocks = nn.ModuleList(
             [
-                SpikeBlock(C, spike_mode, spike_backend=self.spike_backend)
+                SpikeBlock(
+                    C,
+                    self.spike_mode,
+                    spike_tau=self.spike_tau,
+                    spike_v_threshold=self.spike_v_threshold,
+                    spike_v_reset=self.spike_v_reset,
+                    spike_backend=self.spike_backend,
+                )
                 for _ in range(num_blocks)
             ]
         )
-        self.gate_head = _GateHead(C, spike_mode, spike_backend=self.spike_backend)
+        self.gate_head = _GateHead(
+            C,
+            self.spike_mode,
+            spike_tau=self.spike_tau,
+            spike_v_threshold=self.spike_v_threshold,
+            spike_v_reset=self.spike_v_reset,
+            spike_backend=self.spike_backend,
+        )
         self.refine = SpatialRefineHead(mid=refine_mid, depth_range=t_max)
 
     def _encode_chunk(
@@ -634,6 +976,7 @@ class SPADSpikeNet(nn.Module):
         H = W = int(N ** 0.5)
         T_chunk = self.chunk_size
         device = raw_data.device
+        _reset_module_spike_stats(self)
 
         # [B, 4096, P] → [B, H, W, P] → [P, B, H, W]
         data = raw_data.view(B, H, W, P).permute(3, 0, 1, 2).contiguous()
@@ -684,6 +1027,7 @@ class SPADSpikeNet(nn.Module):
         coarse = torch.cat([depth, intensity], dim=1)
         output = self.refine(coarse, confidence)        # [B, 2, H, W]
 
+        spike_stats = _collect_module_spike_stats(self)
         functional.reset_net(self)
 
         out = {
@@ -702,6 +1046,8 @@ class SPADSpikeNet(nn.Module):
         if self.tof_embedding is not None:
             out["lut_smooth"] = self.tof_embedding.smoothness_loss()
             out["lut_norm"] = self.tof_embedding.norm_loss()
+        if spike_stats:
+            out["spike_stats"] = spike_stats
 
         return out
 
