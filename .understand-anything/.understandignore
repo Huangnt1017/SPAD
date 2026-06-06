@@ -8,17 +8,39 @@
 #
 # --- From .gitignore (uncomment to exclude) ---
 
-# *.pyc
-# *.pyo
-# .split_cache.json
-# checkpoints/*.pth
-# logs/*.log
-# logs/*.png
-# logs/*.json
-# logs/test1/
-# *.csv
-# *.tar.gz
-# *.doc
+*.pyc
+*.pyo
+.split_cache.json
+checkpoints/*.pth
+logs/*.log
+logs/*.png
+logs/*.json
+logs/test1/
+*.csv
+*.tar.gz
+*.doc
+
+# --- Additional exclusions ---
+
+# Binary/image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+
+# Log files
+*.log
+
+# Tool internal files
+.codegraph/
+.vscode/
+.idea/
+
+# Cache files
+__pycache__/
+*.cache
 
 # --- Detected directories (uncomment to exclude) ---
 

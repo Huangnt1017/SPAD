@@ -138,15 +138,15 @@ class SNNConfig:
 
     # ---- 网络 ----
     model_backend: str = "new"
-    """模型后端: ``new`` 为 SNN, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
+    """模型后端: ``new`` 为 SNN, ``ann_gate`` 为非脉冲 gate baseline, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
 
     C: int = 16  # 隐含层通道数
-    chunk_size: int = 32
-    spike_mode: str = "lif"
+    chunk_size: int = 64
+    spike_mode: str = "plif"
     spike_tau: float = 2.0
     """LIF/PLIF 膜时间常数; IF 模式下忽略。"""
 
-    spike_v_threshold: float = 0.5
+    spike_v_threshold: float = 0.8
     """脉冲发放阈值。"""
 
     spike_v_reset: float | None = 0.0
@@ -251,6 +251,8 @@ class SNNConfig:
             self.model_backend = "new"
         elif backend in {"activation", "activation_based"}:
             self.model_backend = "new"
+        elif backend in {"ann", "ann_gate", "ann-gate", "gated_ann", "gated-ann"}:
+            self.model_backend = "ann_gate"
         elif backend in {"recurrent", "srnn"}:
             self.model_backend = "rnn"
         elif backend in {"clstm", "convlstm"}:
@@ -335,8 +337,10 @@ class SNNConfig:
             from SNN_based_method.model.SNN_c_LSTM import SNN_c_LSTM as SPADSpikeNet
         elif backend in {"gru", "cgru", "convgru"}:
             from SNN_based_method.model.SNN_c_GRU import SNN_c_GRU as SPADSpikeNet
+        elif backend in {"ann_gate", "ann", "gated_ann"}:
+            from SNN_based_method.model.ANN_gated_moment import ANNGatedMomentNet as SPADSpikeNet
         else:
-            raise ValueError("model_backend must be 'new'/'activation_based'/'rnn'/'lstm'/'gru'")
+            raise ValueError("model_backend must be 'new'/'activation_based'/'ann_gate'/'rnn'/'lstm'/'gru'")
 
         return SPADSpikeNet(
             C=self.C,

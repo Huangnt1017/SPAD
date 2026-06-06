@@ -122,6 +122,11 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
             "legacy",
             "clock",
             "clock_driven",
+            "ann",
+            "ann_gate",
+            "ann-gate",
+            "gated_ann",
+            "gated-ann",
             "rnn",
             "recurrent",
             "srnn",
@@ -133,7 +138,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
             "convgru",
         ],
         default=None,
-        help="模型后端; new 为官方 activation_based SNN, rnn/lstm/gru 为显式时序递推版本",
+        help="模型后端; new 为官方 activation_based SNN, ann_gate 为非脉冲 gate baseline, rnn/lstm/gru 为显式时序递推版本",
     )
     parser.add_argument("--encoding-mode", choices=["sinusoidal", "lut"], default=None, help="ToF 编码方式")
     parser.add_argument("--embed-dim", type=int, default=None, help="LUT 编码维度")

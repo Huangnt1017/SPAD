@@ -10,6 +10,7 @@ SNN_based_method/
     SNN_config.py       配置入口
   model/
     SNN_new.py          默认 SNN 后端, 使用官方 spikingjelly.activation_based
+    ANN_gated_moment.py 非脉冲 ANN gate-moment baseline
     SNN_c_RNN.py        显式 RNN 等价版
     SNN_c_LSTM.py       显式 ConvLSTM 版
     SNN_c_GRU.py        显式 ConvGRU 版
@@ -22,6 +23,12 @@ SNN_based_method/
     train.py            训练入口
     test.py             批量测试入口
     test1.py            单 raw group 推理入口
+    run_experiment_grid.py
+                        对比实验矩阵生成/执行入口
+    collect_experiment_results.py
+                        实验结果 CSV/JSON 汇总入口
+    analyze_spike_and_tau.py
+                        PLIF tau、参数量和 spike 指标分析入口
     visualize_encoding.py
                         ToF 编码可视化入口
     generate_precomputed_labels.py
@@ -30,13 +37,14 @@ SNN_based_method/
 
 本项目使用环境中安装的官方 `spikingjelly.activation_based`，不使用本地 `spikingjelly1`。
 
-当前可通过 `SNNConfig.model_backend` 或命令行 `--model-backend` 选择 4 个后端：
+当前可通过 `SNNConfig.model_backend` 或命令行 `--model-backend` 选择 5 个后端：
 
 ```text
-new   : 默认后端, 官方 activation_based SNN
-rnn   : 显式神经元递推等价版
-lstm  : 显式 ConvLSTM 版
-gru   : 显式 ConvGRU 版
+new      : 默认后端, 官方 activation_based SNN
+ann_gate : 非脉冲 ANN gate-moment baseline
+rnn      : 显式神经元递推等价版
+lstm     : 显式 ConvLSTM 版
+gru      : 显式 ConvGRU 版
 ```
 
 ## 2. 数据路径
@@ -141,9 +149,10 @@ ch1 = intensity, 范围 [0, 1]
 ## 5. 模型结构与设计理论
 
 当前默认模型是 `SPADSpikeNet`（`model_backend=new`）。此外，同一套输入输出协议还提供
-`SNN_c_RNN`、`SNN_c_LSTM` 和 `SNN_c_GRU` 三个显式时序递推版本，用于和默认
-SNN 后端做可控对比。四个后端共享同一套 ToF 编码、空间卷积主干、gate 聚合和精修头，
-差异只在时间递推核心。
+`ANNGatedMomentNet`、`SNN_c_RNN`、`SNN_c_LSTM` 和 `SNN_c_GRU` 四个对比后端。
+`ann_gate` 是非脉冲 ANN gate-moment baseline，用于区分性能收益来自 gate-moment
+结构本身，还是来自 SNN/PLIF 的脉冲时序机制。除 `ann_gate` 外，其余后端共享同一套
+ToF 编码、空间卷积主干、gate 聚合和精修头，差异主要集中在时间递推核心。
 
 整体结构：
 
@@ -154,16 +163,19 @@ SNN 后端做可控对比。四个后端共享同一套 ToF 编码、空间卷�
   -> ToF 编码: sinusoidal [P, B, 17, 64, 64] 或 LUT [P, B, D, 64, 64]
   -> 时序 Stem
        new : Conv1x1 + BN + PLIF/LIF/IF + Conv3x3 + BN
+       ann_gate: Conv1x1 + BN + GELU + Conv3x3 + BN + GELU
        rnn : Conv1x1 + BN + 显式神经元递推 + Conv3x3 + BN
        lstm: Conv1x1 + BN + ConvLSTM + Conv3x3 + BN
        gru : Conv1x1 + BN + ConvGRU + Conv3x3 + BN
   -> 时序主干块 x num_blocks
        new : SpikeBlock
+       ann_gate: ANNGatedBlock
        rnn : SpikeBlockRNN
        lstm: LSTMBlock
        gru : GRUBlock
   -> 时序 GateHead
        new : PLIF -> Conv1x1 + BN -> PLIF -> Conv1x1 -> sigmoid
+       ann_gate: Conv1x1 + BN + GELU -> Conv1x1 -> sigmoid
        rnn : 显式神经元递推 -> Conv1x1 + BN -> 显式神经元递推 -> Conv1x1 -> sigmoid
        lstm: ConvLSTM -> Conv1x1 + BN -> ConvLSTM -> Conv1x1 -> sigmoid
        gru : ConvGRU -> Conv1x1 + BN -> ConvGRU -> Conv1x1 -> sigmoid
@@ -192,10 +204,11 @@ SNN 后端做可控对比。四个后端共享同一套 ToF 编码、空间卷�
 不同后端的时间建模差异：
 
 ```text
-new  : 通过脉冲神经元膜电位和 reset 隐式保存时序状态
-rnn  : 把 IF/LIF/PLIF 的膜电位更新显式展开成 RNN hidden state
-lstm : 用显式 ConvLSTM 的 (h_t, c_t) 状态建模时间依赖
-gru  : 用显式 ConvGRU 的 h_t 状态建模时间依赖
+new      : 通过脉冲神经元膜电位和 reset 隐式保存时序状态
+ann_gate : 不使用脉冲状态, 对每个 page 逐帧提取特征并输出连续 gate
+rnn      : 把 IF/LIF/PLIF 的膜电位更新显式展开成 RNN hidden state
+lstm     : 用显式 ConvLSTM 的 (h_t, c_t) 状态建模时间依赖
+gru      : 用显式 ConvGRU 的 h_t 状态建模时间依赖
 ```
 
 这里的 `P` 是同一个 raw group 内的 page 数。它不是图像高度或宽度，而是每个像素被重复采样的次数。训练时可以通过 `pages_per_group` 改变 `P`，模型 forward 会按实际 `P` 分 chunk 处理。
@@ -349,6 +362,9 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 切换显式时序后端：
 
 ```powershell
+# 非脉冲 ANN gate-moment baseline
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py --model-backend ann_gate
+
 # 显式 RNN 等价版
 D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py --model-backend rnn
 
@@ -520,7 +536,7 @@ D:\PYproject\SPAD\logs\SNN\test1_YYYYMMDD_HHMMSS\
 
 | 参数 | 默认 | 说明 |
 |---|---:|---|
-| `model_backend` | `new` | 可选 `new` / `rnn` / `lstm` / `gru` |
+| `model_backend` | `new` | 可选 `new` / `ann_gate` / `rnn` / `lstm` / `gru` |
 | `spike_backend` | `auto` | 仅 `new` 后端使用, CUDA 可用时优先 cupy |
 | `encoding_mode` | `sinusoidal` | ToF 编码, 可选 `lut` |
 | `C` | `32` | 主干通道数 |
@@ -615,6 +631,10 @@ rnn / lstm / gru:
   显式 state 变量在 chunk 间递推
   通过递归 detach 截断跨 chunk BPTT
   forward 结束后状态自然释放, 不跨 batch 持久化
+
+ann_gate:
+  不保存脉冲膜电位或显式循环状态
+  每个 chunk 内逐 page 共享 ANN 卷积权重, 输出连续 gate
 ```
 
 对 `new` 后端，不要删除 `reset_net`。它用于避免不同 batch 之间脉冲神经元膜电位串扰。
@@ -650,3 +670,168 @@ grad_accum_steps 根据 batch_size 调整等效 batch
 ```
 
 如果 OOM，优先降低 `batch_size` 或 `chunk_size`。如需进一步降低显存，可尝试 `--amp`，但需要观察 loss 和 SSIM 是否稳定。
+
+## 15. 论文章节对比实验与工具
+
+本节用于组织博士论文章节级别的对比实验。建议围绕同一套输入输出协议展开:
+
+```text
+主实验:
+  ann_gate      非脉冲 ANN gate-moment baseline
+  new + IF      无泄漏脉冲基线
+  new + LIF     固定膜时间常数 SNN
+  new + PLIF    可学习膜时间常数 SNN
+  rnn/lstm/gru  显式时序递推基线
+
+训练策略:
+  LIF 直接训练
+  PLIF 直接训练
+  LIF -> PLIF fine-tune
+  LIF -> PLIF fine-tune + freeze_plif_epochs
+
+Loss 消融:
+  Full loss
+  - w_var
+  - w_sparse
+  - w_smooth
+  - w_ssim
+  --no-return-sequence + w_var=0 + w_sparse=0
+
+效率分析:
+  pages_per_group: 64 / 128 / 256
+  chunk_size:      16 / 32 / 64 / 128
+  spike_backend:   cupy / torch
+  amp:             on / off
+```
+
+### 15.1 ANN gate baseline
+
+`ann_gate` 后端位于 `model/ANN_gated_moment.py`。它保留 ToF 编码、连续 gate、Gated Moment 和
+SpatialRefineHead, 但不使用 IF/LIF/PLIF 脉冲神经元。该 baseline 用于回答:
+
+```text
+1. 性能提升是否仅来自 gate-moment 物理聚合结构?
+2. SNN/PLIF 的脉冲时序状态是否带来额外收益?
+3. 非脉冲连续 gate 在相同 loss 下的上限和代价如何?
+```
+
+训练示例:
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train.py `
+  --model-backend ann_gate `
+  --run-name chapter4_ann_gate `
+  --pages-per-group 128 `
+  --chunk-size 64 `
+  --C 16 `
+  --num-blocks 1
+```
+
+### 15.2 LIF -> PLIF fine-tune
+
+`scripts/train_lif_to_plif.py` 用于从 LIF checkpoint 迁移到 PLIF。它只加载同名同形状模型权重,
+PLIF 新增的 `*.w` tau 参数由 `--spike-tau` 初始化, 不恢复 LIF optimizer/scheduler。
+
+先 dry-run 检查迁移:
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train_lif_to_plif.py `
+  --lif-checkpoint D:\PYproject\SPAD\checkpoints\SNN\chapter4_snn_lif\last.pth `
+  --epochs 10 `
+  --lr 2e-4 `
+  --spike-tau 2.0 `
+  --dry-run
+```
+
+正式微调:
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\train_lif_to_plif.py `
+  --lif-checkpoint D:\PYproject\SPAD\checkpoints\SNN\chapter4_snn_lif\last.pth `
+  --epochs 10 `
+  --lr 2e-4 `
+  --spike-tau 2.0 `
+  --freeze-plif-epochs 2 `
+  --spike-backend cupy `
+  --tf32 `
+  --cudnn-benchmark `
+  --cuda-prefetch
+```
+
+### 15.3 实验矩阵工具
+
+`scripts/run_experiment_grid.py` 读取 JSON 实验表, 生成或顺序执行训练命令。示例配置:
+
+```text
+SNN_based_method/experiments/chapter_grid.json
+```
+
+只打印命令:
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\run_experiment_grid.py `
+  --spec D:\PYproject\SPAD\SNN_based_method\experiments\chapter_grid.json `
+  --dry-run
+```
+
+实际顺序执行:
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\run_experiment_grid.py `
+  --spec D:\PYproject\SPAD\SNN_based_method\experiments\chapter_grid.json `
+  --execute
+```
+
+建议先用 `--dry-run` 确认 `run-name`、数据路径、模型后端、loss 消融参数都正确, 再执行完整矩阵。
+
+### 15.4 结果汇总工具
+
+`scripts/collect_experiment_results.py` 扫描 checkpoint run 目录和 test summary, 输出 CSV/JSON:
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\collect_experiment_results.py `
+  --checkpoint-root D:\PYproject\SPAD\checkpoints\SNN `
+  --log-root D:\PYproject\SPAD\logs\SNN `
+  --pattern "chapter4_*" `
+  --output D:\PYproject\SPAD\SNN_based_method\artifacts\chapter4_results.csv
+```
+
+输出字段包含:
+
+```text
+config.*             训练配置
+metrics.train_loss   checkpoint 中记录的训练 loss
+metrics.val_loss     checkpoint 中记录的验证 loss
+metrics.val_metrics.* depth/intensity 的 MAE/RMSE/SSIM/PSNR
+summary.metrics.*    test.py / test1.py 生成的测试指标
+```
+
+### 15.5 可解释性分析工具
+
+`scripts/analyze_spike_and_tau.py` 从 checkpoint 读取 PLIF tau、参数量和已记录 spike rate:
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\analyze_spike_and_tau.py `
+  --checkpoint-root D:\PYproject\SPAD\checkpoints\SNN `
+  --pattern best.pth `
+  --output D:\PYproject\SPAD\SNN_based_method\artifacts\chapter4_tau_spike.csv
+```
+
+PLIF tau 的换算:
+
+```text
+tau = 1 / sigmoid(w)
+```
+
+建议在论文中至少报告:
+
+```text
+1. tau_mean / tau_std / tau_min / tau_max
+2. parameter_count / trainable_parameter_count
+3. spike_rate_all / spike_rate_stem / spike_rate_blocks / spike_rate_gate
+4. depth_rmse / depth_ssim 与 tau、spike_rate 的对应关系
+5. ann_gate、LIF、PLIF、LIF->PLIF 在精度与训练代价上的对比
+```
+
+`ann_gate` 没有 `*.w` 和 spike_rate, 这本身就是对照信息: 它说明非脉冲连续 gate 在相同
+Gated Moment 框架下的表现, 与 SNN/PLIF 的脉冲状态机制分开比较。
