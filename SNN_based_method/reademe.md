@@ -2,6 +2,8 @@
 
 本文档只记录当前 `SNN_based_method` 的实际用法。模型、数据加载、loss、日志和 checkpoint 均由 `SNNConfig` 统一管理。
 
+仓库根目录下的 `baseline/`、`model/`、`scripts/`、`utils/` 是点云分类/3D box 工程；`SNN_based_method/` 是独立的 SPAD ToF 成像子项目。当前 SNN 训练只共享仓库根路径、`logs/SNN`、`checkpoints/SNN` 和外部数据目录 `D:\PYproject\SPADdata`，不调用顶层 `scripts/train.py`，也不使用本地 `spikingjelly1/`。
+
 ## 1. 当前入口
 
 ```text
@@ -21,6 +23,8 @@ SNN_based_method/
     runtime.py          CLI、日志、checkpoint、公用运行时工具
   scripts/
     train.py            训练入口
+    train_lif_to_plif.py
+                        LIF checkpoint 迁移到 PLIF 微调入口
     test.py             批量测试入口
     test1.py            单 raw group 推理入口
     run_experiment_grid.py
@@ -33,6 +37,9 @@ SNN_based_method/
                         ToF 编码可视化入口
     generate_precomputed_labels.py
                         预生成类别级 label 池
+    vis_label.py        预生成 label 池可视化入口
+  experiments/
+    chapter_grid.json   论文章节对比实验矩阵示例
 ```
 
 本项目使用环境中安装的官方 `spikingjelly.activation_based`，不使用本地 `spikingjelly1`。
@@ -106,6 +113,15 @@ D:\PYproject\SPAD\logs\SNN\test_YYYYMMDD_HHMMSS\
   config.json
   summary.json
   predictions\*.npy    # 仅 --save-predictions 时生成
+```
+
+工程工具运行后会生成 `artifacts` 目录，例如：
+
+```text
+D:\PYproject\SPAD\SNN_based_method\artifacts\
+  chapter4_results.csv
+  chapter4_results.json
+  chapter4_tau_spike.csv
 ```
 
 预生成 label 池：
@@ -311,7 +327,7 @@ intensity_net:
 大 `P` 会显著增加显存，所以模型按 `chunk_size` 分块：
 
 ```text
-P=128, chunk_size=32 -> 4 个 chunk
+P=128, chunk_size=64 -> 2 个 chunk
 ```
 
 `new` 后端在 chunk 内保留完整脉冲状态和梯度；chunk 间执行：
@@ -459,6 +475,14 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 
 无参数运行 `generate_precomputed_labels.py` 默认是 dry-run，避免误写数据。实际训练不需要手动先运行这个脚本；`train.py` 会自动检查和生成。
 
+可视化已生成的 label 池：
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe -c "from SNN_based_method.scripts.vis_label import visualize_labels; visualize_labels(r'D:\PYproject\SPADdata\0825\label', '128', 'K')"
+```
+
+`vis_label.py` 会逐个显示 `label[0]` depth 和 `label[1]` intensity，用于检查 clean label 来源、ToF shift 同步平移和不同类别 label 是否异常。
+
 ## 9. 测试命令
 
 批量测试默认使用 0917：
@@ -537,10 +561,14 @@ D:\PYproject\SPAD\logs\SNN\test1_YYYYMMDD_HHMMSS\
 | 参数 | 默认 | 说明 |
 |---|---:|---|
 | `model_backend` | `new` | 可选 `new` / `ann_gate` / `rnn` / `lstm` / `gru` |
-| `spike_backend` | `auto` | 仅 `new` 后端使用, CUDA 可用时优先 cupy |
+| `spike_backend` | `cupy` | 仅 `new` 后端使用, 可选 `auto` / `cupy` / `torch` |
+| `spike_mode` | `plif` | 脉冲神经元类型, 可选 `if` / `lif` / `plif` |
+| `spike_tau` | `2.0` | LIF/PLIF 膜时间常数, PLIF 用它初始化可学习 tau |
+| `spike_v_threshold` | `0.8` | 脉冲发放阈值 |
+| `spike_v_reset` | `0.0` | 脉冲重置电位, `None` 表示 soft reset |
 | `encoding_mode` | `sinusoidal` | ToF 编码, 可选 `lut` |
-| `C` | `32` | 主干通道数 |
-| `chunk_size` | `32` | 时间维分块大小, 影响显存 |
+| `C` | `16` | 主干通道数 |
+| `chunk_size` | `64` | 时间维分块大小, 影响显存和长序列 BPTT |
 | `num_blocks` | `1` | 时序主干块数量 |
 | `refine_mid` | `8` | 深度/强度精修头中间通道 |
 | `return_sequence` | `True` | 训练 var/sparse loss 时需要 |
@@ -654,7 +682,7 @@ intensity_net  精修 intensity
 
 ```text
 pages_per_group: 64 / 128 / 256
-chunk_size:      16 / 32 / 64
+chunk_size:      16 / 32 / 64 / 128
 batch_size:      2 / 4 / 8
 grad_accum_steps 根据 batch_size 调整等效 batch
 ```

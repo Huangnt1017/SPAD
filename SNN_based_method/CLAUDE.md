@@ -26,10 +26,11 @@ $python = "D:\Anaconda3\envs\torchnew\python.exe"
   --pages-per-group 128 --batch-size 8 --grad-accum-steps 8 `
   --num-workers 8 --persistent-workers --prefetch-factor 4 `
   --raw-load-mode group --cuda-prefetch --pin-memory `
-  --progress-interval 50 --tf32 --cudnn-benchmark --spike-backend auto
+  --progress-interval 50 --tf32 --cudnn-benchmark `
+  --model-backend new --spike-mode plif --spike-tau 2.0 --spike-backend cupy
 
 # 从 run 目录续训（自动读取 last.pth + config.json）
-& $python SNN_based_method/scripts/train.py --resume-runDir checkpoints/SNN/train_YYYYMMDD_HHMMSS --epochs 40
+& $python SNN_based_method/scripts/train.py --resume-run-dir checkpoints/SNN/train_YYYYMMDD_HHMMSS --epochs 40
 
 # 批量测试（默认使用 0917 数据）
 & $python SNN_based_method/scripts/test.py --checkpoint checkpoints/SNN/train_YYYYMMDD_HHMMSS/best.pth
@@ -42,12 +43,15 @@ $python = "D:\Anaconda3\envs\torchnew\python.exe"
 
 # 编码可视化（频率响应 / 多帧聚合 / 雾 vs 目标区分度）
 & $python SNN_based_method/scripts/visualize_encoding.py --t-max 128
+
+# 论文章节实验矩阵 dry-run
+& $python SNN_based_method/scripts/run_experiment_grid.py --spec SNN_based_method/experiments/chapter_grid.json --dry-run
 ```
 
 易踩的几点：
 - 续训时的 `--epochs` 是**总目标 epoch 数**，不是"再训练多少轮"。checkpoint 已训到 epoch 20，想再训 20 轮，应传 `--epochs 40`
 - `--trace-steps 5` 会打印训练循环中 DataLoader 与 GPU 各自的等待点，调 worker 数之前先跑这个
-- `--augment-train` 默认开启，当前默认 `num_aug=2` 且 `keep_original_sample=False`，训练集样本数 = 原始的 2 倍
+- `--augment-train` 默认开启，当前默认 `num_aug=1` 且 `keep_original_sample=False`，训练集样本数 = 原始的 1 倍增强样本
 
 ## 架构概览
 
@@ -82,7 +86,7 @@ raw ToF [B, 4096, P]
 ### Loss
 
 ```
-L = 0.3·L_GT + 0.5·L_SSIM + 0.15·L_var + 0.02·L_sparse + 0.03·L_smooth + LUT 正则项
+L = 0.6·L_GT + 0.5·L_depth_reg + 0.25·L_SSIM + 0.2·L_var + 0.01·L_sparse + 0.02·L_smooth + LUT 正则项
 ```
 
 - `SSIMLoss`：7×7 高斯窗口，输入通过 `depth_range=128` 归一化到 `[0,1]`
@@ -107,10 +111,12 @@ L = 0.3·L_GT + 0.5·L_SSIM + 0.15·L_var + 0.02·L_sparse + 0.03·L_smooth + LU
 | `batch_size` | 8 | |
 | `grad_accum_steps` | 8 | 等效 batch = 64 |
 | `C` | 16 | backbone 通道数 |
-| `chunk_size` | 32 | 显存旋钮；P=128 → 4 个 chunk |
-| `num_blocks` | 2 | |
+| `chunk_size` | 64 | 显存旋钮；P=128 → 2 个 chunk |
+| `num_blocks` | 1 | |
 | `encoding_mode` | `sinusoidal` | `n_freq=8` → 17 通道 |
-| `spike_backend` | `auto` | 优先 cupy，回退 torch |
+| `spike_mode` | `plif` | 默认使用可学习膜时间常数 |
+| `spike_tau` | 2.0 | LIF/PLIF 膜时间常数初值 |
+| `spike_backend` | `cupy` | 可显式改为 `auto` 或 `torch` |
 
 ## 数据布局
 
