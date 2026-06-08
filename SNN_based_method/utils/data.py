@@ -43,6 +43,12 @@ RAW_VALUE_BYTES = 2
 DEFAULT_SEED = 42
 DEFAULT_LABEL_DIR_NAME = "label"
 DEFAULT_LABELS_PER_CLASS = 5
+FOG_LEVEL_SPLIT_WINDOWS: dict[int, tuple[float, float]] = {
+    0: (0.0, 0.4),
+    1: (0.0, 1.0),
+    2: (0.0, 1.0),
+    3: (0.6, 1.0),
+}
 
 
 @dataclass(frozen=True)
@@ -979,6 +985,95 @@ def split_indices(
     return train_indices, val_indices, test_indices
 
 
+def _parse_fog_level_for_split(value: object, sample: RawGroupSample) -> int:
+    """解析 split 筛选使用的 CSV fog_level。"""
+    if value is None or str(value).strip() == "":
+        raise ValueError(
+            "filter_split_by_fog_level requires fog_level metadata for raw file: "
+            f"{sample.raw_path}"
+        )
+
+    text = str(value).strip()
+    try:
+        numeric_value = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            "fog_level must be one of 0, 1, 2, 3 when "
+            f"filter_split_by_fog_level=True, got {value!r}: {sample.raw_path}"
+        ) from exc
+
+    if not np.isfinite(numeric_value) or not numeric_value.is_integer():
+        raise ValueError(
+            "fog_level must be an integer in 0, 1, 2, 3 when "
+            f"filter_split_by_fog_level=True, got {value!r}: {sample.raw_path}"
+        )
+
+    fog_level = int(numeric_value)
+    if fog_level not in FOG_LEVEL_SPLIT_WINDOWS:
+        raise ValueError(
+            "fog_level must be one of 0, 1, 2, 3 when "
+            f"filter_split_by_fog_level=True, got {fog_level}: {sample.raw_path}"
+        )
+    return fog_level
+
+
+def _sample_in_fog_level_split_window(
+    sample: RawGroupSample,
+    *,
+    pages_per_group: int,
+    fog_level: int,
+) -> bool:
+    """判断一个 group 是否完整落在该 fog_level 允许的 raw 页段内。"""
+    start_ratio, end_ratio = FOG_LEVEL_SPLIT_WINDOWS[fog_level]
+    start_page = int(sample.group_index) * int(pages_per_group)
+    end_page = start_page + int(pages_per_group)
+    total_pages = int(sample.total_pages)
+    return start_page >= total_pages * start_ratio and end_page <= total_pages * end_ratio
+
+
+def filter_indices_by_fog_level_split(
+    samples: Sequence[RawGroupSample],
+    raw_metadata_by_path: Mapping[str, Mapping[str, Any]],
+    *,
+    pages_per_group: int,
+) -> list[int]:
+    """返回允许进入 train/val/test 划分的 fog_level 筛选后样本索引。
+
+    规则按每个 raw 文件内部的 page 位置判断:
+        fog_level=0: 只保留完整落在前 40% page 内的 group
+        fog_level=1/2: 保留全部 group
+        fog_level=3: 只保留完整落在后 40% page 内的 group
+    """
+    if pages_per_group <= 0:
+        raise ValueError("pages_per_group must be a positive integer")
+
+    selected_indices: list[int] = []
+    for index, sample in enumerate(samples):
+        metadata = raw_metadata_by_path.get(sample.raw_path)
+        if metadata is None:
+            metadata = raw_metadata_by_path.get(str(Path(sample.raw_path).resolve()))
+        if metadata is None:
+            raise ValueError(
+                "filter_split_by_fog_level requires raw metadata for raw file: "
+                f"{sample.raw_path}"
+            )
+
+        fog_level = _parse_fog_level_for_split(metadata.get("fog_level"), sample)
+        if _sample_in_fog_level_split_window(
+            sample,
+            pages_per_group=pages_per_group,
+            fog_level=fog_level,
+        ):
+            selected_indices.append(index)
+
+    if not selected_indices:
+        raise ValueError(
+            "filter_split_by_fog_level removed all samples; check fog_level metadata, "
+            "pages_per_group, and total_pages"
+        )
+    return selected_indices
+
+
 def create_spad_dataloaders(
     paths: str | Path | Sequence[str | Path],
     *,
@@ -989,6 +1084,7 @@ def create_spad_dataloaders(
     time_threshold: int = 150,
     batch_size: int = 4,
     split_ratios: Sequence[float] = (0.7, 0.2, 0.1),
+    filter_split_by_fog_level: bool = False,
     seed: int = DEFAULT_SEED,
     return_label: bool = True,
     use_precomputed_labels: bool = True,
@@ -1018,6 +1114,8 @@ def create_spad_dataloaders(
     """从 raw 文件或目录构建 train/val/test DataLoader。
 
     返回的 loader 都会产出 ``batch["frames"]``，形状为 ``[P, B, 1, 64, 64]``。
+    ``filter_split_by_fog_level=False`` 时保持旧的全样本划分方案; 为 True
+    时先按 fog_level 的 0/1/2/3 分段规则筛选, 再划分 train/val/test。
     """
     raw_records = collect_raw_records(
         paths,
@@ -1053,11 +1151,21 @@ def create_spad_dataloaders(
         raw_load_mode=raw_load_mode,
         raw_metadata=raw_metadata,
     )
-    train_indices, val_indices, test_indices = split_indices(
-        len(dataset),
+    split_candidate_indices = list(range(len(dataset)))
+    if filter_split_by_fog_level:
+        split_candidate_indices = filter_indices_by_fog_level_split(
+            dataset.samples,
+            dataset.raw_metadata_by_path,
+            pages_per_group=pages_per_group,
+        )
+    train_relative_indices, val_relative_indices, test_relative_indices = split_indices(
+        len(split_candidate_indices),
         split_ratios=split_ratios,
         seed=seed,
     )
+    train_indices = [split_candidate_indices[index] for index in train_relative_indices]
+    val_indices = [split_candidate_indices[index] for index in val_relative_indices]
+    test_indices = [split_candidate_indices[index] for index in test_relative_indices]
     train_transform = None
     if augment_train or page_dropout:
         train_transform = SpadRawTrainAugmentation(

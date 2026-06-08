@@ -57,6 +57,20 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
         help="raw 读取模式: group 只读当前分组; file_cache 读取并缓存整文件",
     )
     parser.add_argument("--split-ratios", nargs=3, type=float, default=None, metavar=("TRAIN", "VAL", "TEST"), help="train/val/test 划分比例, 三项之和必须为 1")
+    fog_level_split_group = parser.add_mutually_exclusive_group()
+    fog_level_split_group.add_argument(
+        "--filter-split-by-fog-level",
+        dest="filter_split_by_fog_level",
+        action="store_true",
+        default=None,
+        help="先按 fog_level 分段筛选样本, 再做 train/val/test 划分: 0 前40%, 1/2 全部, 3 后40%",
+    )
+    fog_level_split_group.add_argument(
+        "--no-filter-split-by-fog-level",
+        dest="filter_split_by_fog_level",
+        action="store_false",
+        help="关闭 fog_level 分段筛选, 保持全部样本参与 train/val/test 划分",
+    )
     parser.add_argument("--batch-size", type=int, default=None, help="批大小")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker 数")
     pin_memory_group = parser.add_mutually_exclusive_group()
@@ -418,6 +432,7 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "time_threshold",
         "raw_load_mode",
         "split_ratios",
+        "filter_split_by_fog_level",
         "batch_size",
         "num_workers",
         "pin_memory",
@@ -554,6 +569,7 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "time_threshold",
         "raw_load_mode",
         "split_ratios",
+        "filter_split_by_fog_level",
         "batch_size",
         "num_workers",
         "pin_memory",

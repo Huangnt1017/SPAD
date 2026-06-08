@@ -45,8 +45,8 @@ class SNNConfig:
     skip_missing_csv_raw: bool = False
     """CSV 中 raw 文件缺失时是否跳过; 默认严格报错, 避免静默丢样本。"""
 
-    pages_per_group: int = 32 * 4
-    """单个训练样本包含的 raw page 数, 即 ``P``。最好整除48000"""
+    pages_per_group: int = 960
+    """单个训练样本包含的 raw page 数, 即 ``P``。最好整除48000，例如：128，384，480，640，960，1000，1200，2400等"""
 
     total_pages: Optional[int] = None
     """每个 raw 文件使用的 page 数; ``None`` 表示使用全部完整分组。"""
@@ -87,7 +87,7 @@ class SNNConfig:
     keep_original_sample: bool = False
     """训练增强展开时是否保留 ``aug_index=0`` 的原始样本。"""
 
-    tof_shift_max: int = 20
+    tof_shift_max: int = 30
     """训练增强的最大整数 ToF 偏移; 增强后小于 1 或大于 time_threshold 的值置 0。"""
 
     tof_shift_prob: float = 0.9
@@ -111,14 +111,17 @@ class SNNConfig:
     split_ratios: tuple[float, float, float] = (0.8, 0.2, 0.0)
     """train/val/test 划分比例。"""
 
+    filter_split_by_fog_level: bool = False
+    """是否启用 fog_level 分段筛选后再做 train/val/test 划分。"""
+
     # ---- Dataloader ----
-    batch_size: int = 8
-    num_workers: int = 8
+    batch_size: int = 2
+    num_workers: int = 4
     pin_memory: Optional[bool] = None
     persistent_workers: bool = True
     """num_workers > 0 时保持 DataLoader worker 常驻, 减少 epoch 间空窗。"""
 
-    prefetch_factor: int = 4
+    prefetch_factor: int = 2
     """每个 DataLoader worker 预取的 batch 数; 仅 num_workers > 0 时生效。"""
 
     precompute_model_input: bool = False
@@ -143,7 +146,7 @@ class SNNConfig:
     C: int = 16  # 隐含层通道数
     chunk_size: int = 64
     spike_mode: str = "plif"
-    spike_tau: float = 2.0
+    spike_tau: float = 1.5
     """LIF/PLIF 膜时间常数; IF 模式下忽略。"""
 
     spike_v_threshold: float = 0.8
@@ -178,8 +181,8 @@ class SNNConfig:
     sparse_mode: str = "band"
     """gate 稀疏正则模式: upper=旧单边阈值, target=贴近目标率, band=保持在区间内。"""
 
-    rho_min: Optional[float] = 0.03
-    rho_max: Optional[float] = 0.12
+    rho_min: Optional[float] = 0.05
+    rho_max: Optional[float] = 0.15
     """sparse_mode=band 时的平均 gate 激活率允许范围。"""
 
     beta_smooth: float = 5.0
@@ -416,6 +419,7 @@ class SNNConfig:
             time_threshold=self.time_threshold,
             batch_size=self.batch_size,
             split_ratios=self.split_ratios,
+            filter_split_by_fog_level=self.filter_split_by_fog_level,
             seed=self.seed,
             return_label=self.return_label,
             use_precomputed_labels=self.use_precomputed_labels,
@@ -523,7 +527,8 @@ class SNNConfig:
         lines.append(
             f"  dataloader: num_workers={self.num_workers}, pin_memory={self.pin_memory}, "
             f"persistent_workers={self.persistent_workers}, prefetch_factor={self.prefetch_factor}, "
-            f"precompute_model_input={self.precompute_model_input}, raw_load_mode={self.raw_load_mode}"
+            f"precompute_model_input={self.precompute_model_input}, raw_load_mode={self.raw_load_mode}, "
+            f"filter_split_by_fog_level={self.filter_split_by_fog_level}"
         )
         lines.append(
             f"  labels: return_label={self.return_label}, "

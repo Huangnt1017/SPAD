@@ -49,6 +49,14 @@ def _to_image_2d(array: torch.Tensor | np.ndarray) -> np.ndarray:
     return data.astype(np.float32, copy=False)
 
 
+def _to_prediction_npy(output: torch.Tensor) -> np.ndarray:
+    """把单样本模型输出转成 ``[2, 64, 64]`` 的 float32 数组。"""
+    data = output.detach().cpu().numpy()
+    if data.shape != (1, 2, 64, 64):
+        raise ValueError(f"output must have shape (1, 2, 64, 64), got {data.shape}")
+    return data[0].astype(np.float32, copy=False)
+
+
 def _valid_percentile_range(image: np.ndarray, fallback_max: float) -> tuple[float, float]:
     """为 depth 图计算稳定色阶, 只统计非零有效区域。"""
     valid = image > 0
@@ -150,7 +158,8 @@ def save_prediction_images(
     *,
     time_threshold: int,
 ) -> dict[str, str]:
-    """保存模型输出与最大值法 baseline 的深度/强度对比图。"""
+    """保存模型输出 npy 与最大值法 baseline 的深度/强度对比图。"""
+    model_output_npy = _to_prediction_npy(output)
     model_depth = _to_image_2d(output[0, 0])
     model_intensity = _to_image_2d(output[0, 1])
     max_depth = _to_image_2d(max_label_count[0])
@@ -170,6 +179,7 @@ def save_prediction_images(
 
     image_dir = run_dir / "images"
     saved_paths = {
+        "model_output_npy": str(image_dir / "model_output.npy"),
         "model_depth_png": str(image_dir / "model_depth.png"),
         "model_intensity_png": str(image_dir / "model_intensity.png"),
         "max_depth_png": str(image_dir / "max_method_depth.png"),
@@ -177,6 +187,8 @@ def save_prediction_images(
         "comparison_png": str(image_dir / "model_vs_max_method.png"),
     }
 
+    Path(saved_paths["model_output_npy"]).parent.mkdir(parents=True, exist_ok=True)
+    np.save(saved_paths["model_output_npy"], model_output_npy)
     _save_single_image(
         model_depth,
         Path(saved_paths["model_depth_png"]),
@@ -408,7 +420,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save-prediction",
         action="store_true",
-        help="保存模型输出、最大值法 baseline 及差异对比 PNG 图片和 summary.json",
+        help="保存模型输出 npy、最大值法 baseline、差异对比 PNG 图片和 summary.json",
     )
     return parser
 
@@ -429,10 +441,11 @@ def main() -> None:
 def main_without_cli() -> None:
     """无 CLI 直接运行入口; 在这里显式修改单样本测试参数。"""
     # ===== Editable parameters =====
-    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260604_113734\\last.pth"
-    raw_path = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-37_Delay-0_Width-2000.raw"  # 
+    # checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260604_113734\\last.pth"
+    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\lif_to_plif_20260607_012227\\plif_stage\\last.pth"
+    raw_path = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-40_Delay-0_Width-2000.raw"  # 
     pages_per_group = 2400
-    group_index = 15
+    group_index = 2
     save_prediction = True
 
     # 测试输入参数显式在这里指定, 不从 checkpoint/config 继承。

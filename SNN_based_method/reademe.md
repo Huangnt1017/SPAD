@@ -678,12 +678,98 @@ intensity_net  精修 intensity
 
 ## 14. 显存和速度建议
 
-优先调这些参数：
+当前 `new` 后端仍是非流式训练图：虽然 forward 内按 `chunk_size` 分块，并在 chunk 间
+`detach_net`，但最终 `depth/intensity` loss 仍通过 `weighted_sum/weight_sum` 追溯到每个
+chunk；当 `return_sequence=True` 时还会保留完整 `gate/tof/valid` 用于 `var/sparse` loss。
+因此当前实现的显存主要随 `batch_size * pages_per_group` 增长，`chunk_size` 只带来小幅差异，
+还没有达到“显存主要由 `batch_size * chunk_size * C * 64 * 64` 决定”的流式形态。
+
+下面表格用于 12GB 显卡上的配置选择。测量脚本：
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\profile_snn_memory.py
+```
+
+测量/估算口径：
 
 ```text
-pages_per_group: 64 / 128 / 256
-chunk_size:      16 / 32 / 64 / 128
-batch_size:      2 / 4 / 8
+模型: SPADSpikeNet, C=16, num_blocks=1, spike_mode=plif, spike_backend=cupy, return_sequence=True
+步骤: 随机输入的一次 forward + SPADImagingLoss + backward + AdamW step
+显存: PyTorch max_memory_reserved, 单位 GiB, 更接近训练时 CUDA allocator 占用
+实测: 预测不超过 11.5 GiB 的组合实际运行; 高风险组合不实测
+估算: OOM 括号内为按 P=128 基线线性外推的 reserved 显存
+判定: 为避免 Windows 共享 GPU 内存拖慢, profiling 脚本用 11.5 GiB 作为严格上限;
+      11.0-11.5 GiB 记为“边界”, >11.5 GiB 记为 OOM
+```
+
+### 14.1 当前非流式显存表
+
+`chunk_size=32`：
+
+| pages_per_group P | B=2 | B=4 | B=8 |
+|---:|---:|---:|---:|
+| 128 | 1.52 | 3.03 | 5.96 |
+| 384 | 4.55 | 8.85 | OOM (17.89) |
+| 480 | 5.68 | 11.04 边界 | OOM (22.36) |
+| 640 | 7.56 | OOM (15.15) | OOM (29.81) |
+| 960 | 11.31 边界 | OOM (22.72) | OOM (44.72) |
+| 1000 | OOM (11.84) | OOM (23.67) | OOM (46.59) |
+| 1200 | OOM (14.21) | OOM (28.40) | OOM (55.90) |
+| 2400 | OOM (28.42) | OOM (56.80) | OOM (111.80) |
+
+`chunk_size=64`：
+
+| pages_per_group P | B=2 | B=4 | B=8 |
+|---:|---:|---:|---:|
+| 128 | 1.56 | 3.10 | 6.20 |
+| 384 | 4.51 | 8.98 | OOM (18.60) |
+| 480 | 5.93 | OOM (11.64) | OOM (23.25) |
+| 640 | 7.40 | OOM (15.52) | OOM (31.01) |
+| 960 | OOM (11.67) | OOM (23.28) | OOM (46.51) |
+| 1000 | OOM (12.16) | OOM (24.25) | OOM (48.45) |
+| 1200 | OOM (14.59) | OOM (29.10) | OOM (58.14) |
+| 2400 | OOM (29.19) | OOM (58.19) | OOM (116.27) |
+
+`chunk_size=128`：
+
+| pages_per_group P | B=2 | B=4 | B=8 |
+|---:|---:|---:|---:|
+| 128 | 1.71 | 3.43 | 6.75 |
+| 384 | 4.62 | 9.31 | OOM (20.25) |
+| 480 | 5.96 | OOM (12.86) | OOM (25.31) |
+| 640 | 7.54 | OOM (17.15) | OOM (33.75) |
+| 960 | OOM (12.83) | OOM (25.72) | OOM (50.62) |
+| 1000 | OOM (13.37) | OOM (26.79) | OOM (52.73) |
+| 1200 | OOM (16.04) | OOM (32.15) | OOM (63.28) |
+| 2400 | OOM (32.08) | OOM (64.31) | OOM (126.56) |
+
+### 14.2 当前可用配置建议
+
+12GB 卡上，当前非流式实现建议优先用：
+
+```text
+P=384, chunk_size=32/64, batch_size=4
+P=640, chunk_size=32/64, batch_size=2
+P=960, chunk_size=32, batch_size=2    # 边界配置, 训练前先关其它占显存进程
+```
+
+不建议直接训练：
+
+```text
+P>=1200 的任意 B=2/4/8
+P>=640 且 B>=4
+P>=384 且 B=8
+```
+
+如果需要 `P=1200/2400` 或希望 `P=960` 下使用更大的 batch，必须先把模型改成流式统计
+或两遍式 streaming backward，否则仅调 `chunk_size` 不能根本解决显存随 P 增长的问题。
+
+常规调参优先级：
+
+```text
+pages_per_group: 384 / 640 / 960
+chunk_size:      32 优先, 64 次之, 128 只在吞吐明显更好时使用
+batch_size:      2 / 4
 grad_accum_steps 根据 batch_size 调整等效 batch
 ```
 
@@ -697,7 +783,9 @@ grad_accum_steps 根据 batch_size 调整等效 batch
 5. 是否有其它进程占用显存或 GPU
 ```
 
-如果 OOM，优先降低 `batch_size` 或 `chunk_size`。如需进一步降低显存，可尝试 `--amp`，但需要观察 loss 和 SSIM 是否稳定。
+如果 OOM，优先降低 `batch_size` 或 `pages_per_group`。当前非流式实现里，降低 `chunk_size`
+只能小幅降低峰值，不能把显存复杂度从 O(P) 变成 O(chunk)。如需进一步降低显存，可尝试
+`--amp`，但需要观察 loss 和 SSIM 是否稳定。
 
 ## 15. 论文章节对比实验与工具
 

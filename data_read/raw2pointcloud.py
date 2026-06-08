@@ -14,8 +14,8 @@ data_size = 2  # 每个uint16数据占据2个字节
 timeThreshold = 128
 
 # 选择帧数进行统计拟合
-startFrame = 1
-endFrame = 480 * 100
+startFrame = 2400*2
+endFrame = 2400*3
 # 重塑数据为64*64的数组
 numPixels = 64 * 64
 
@@ -132,7 +132,7 @@ def plot_pc(pc, mode):
         ax.set_xlim(0, 64)
         # ax.set_ylim(40, 70)
         ax.set_zlim(0, 64)
-        ax.view_init(elev=10, azim=-135)
+        ax.view_init(elev=2, azim=-90)
         # ax.view_init(elev=45, azim=-43)
     elif mode == 'n3':
         pc = ax.scatter(xyz[:, 1], xyz[:, 2], np.abs(xyz[:, 0] - 65), color=(72/255,16/255,96/255),
@@ -430,7 +430,7 @@ def augment_region_shift_rotate(points: np.ndarray,
 np.set_printoptions(threshold=np.inf)
 if __name__ == '__main__':
     # # 可视化txt文件
-    rawfile = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-37_Delay-0_Width-2000.raw"
+    rawfile = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-40_Delay-0_Width-2000.raw"
     position,_ = raw2n3(rawfile)
     pc = n3_filter(position)
     # # pc[:, 3] = np.where(pc[:, 3] >= 550, 550, pc[:, 3])
@@ -447,7 +447,7 @@ if __name__ == '__main__':
     # pc = read_pc(r"D:\PYproject\SPADdata\2025-04-30-dpc\G\2025-04-30_18-53-59_Delay-0_Width-200-5-7.txt")
     # pc_d = pc_down_sample_intensity_topk(pc,1024)
     # plot_pc2d(pc)
-    mask1 = pc[:, 3] >= 150
+    mask1 = pc[:, 3] >= 19
     pc1 = pc[mask1]
     mask2 = (pc1[:, 2] >= 60) & (pc1[:, 2] <= 70)
     pc2 = pc1[mask2]
