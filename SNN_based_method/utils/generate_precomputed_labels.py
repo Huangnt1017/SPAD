@@ -506,12 +506,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def main_without_cli() -> None:
     """无 CLI 调试入口; 默认只做 dry-run, 避免误写文件。"""
     # ===== Editable parameters =====
-    # 数据根目录: 通过环境变量 SPAD_DATA_ROOT 覆盖, 默认指向服务器数据集目录。
-    #   本地 Windows: set SPAD_DATA_ROOT=D:\PYproject\SPADdata
-    #   服务器 Linux: 无需设置, 使用下方默认值
+    # 数据根目录: 通过环境变量 SPAD_DATA_ROOT 覆盖, 默认指向本地数据集目录。
+    #   本地 Windows: 无需设置, 使用下方默认值
+    #   服务器 Linux: set SPAD_DATA_ROOT=/public/home/202210183047/datasets
     data_root = os.environ.get(
         "SPAD_DATA_ROOT",
-        "/public/home/202210183047/datasets/0825",
+        "D:/PYproject/SPADdata",
     )
     data_paths = [
         Path(data_root) / "0825",

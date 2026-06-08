@@ -57,7 +57,8 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 
 	Returns:
 		Model name in {dgcnn, pointnet, pointnet2, pointtransformer, pointtransv2, pointtransv3,
-		pointmlp, pointbert, pointmae, pointrwkv, pointnext, spt, tnpc, 3detr, dct, upp}.
+		pointmlp, pointbert, pointmae, pointrwkv, pointnext, spt, tnpc, 3detr, dct, upp,
+		graph_residual, graph_residual_gcn}.
 		注意识别顺序: 更长 / 更具体的关键字必须在更短关键字之前 (例如 pointtransv3 在
 		pointtransformer 之前; pointnet2 / pointbert / pointmae 都在 pointnet 之前),
 		否则会误命中前缀。
@@ -89,6 +90,11 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 	if "pointnext" in name or "pointnxt" in name:
 		return "pointnext"
 	# 其它简单关键字
+	# 自研模型 (graph_residual_gcn 必须在 graph_residual 之前判定, 避免前缀误命中)
+	if "graph_residual_gcn" in name or "graph_res_gcn" in name:
+		return "graph_residual_gcn"
+	if "graph_residual" in name or "graph_res" in name:
+		return "graph_residual"
 	if "spt" in name:
 		return "spt"
 	if "3detr" in name:
@@ -728,6 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"auto", "dgcnn", "pointnet", "pointnet2", "pointnet2msg",
 			"pointtransformer", "pointtransv2", "pointtransv3",
 			"pointmlp", "pointmlpelite", "pointbert", "pointmae", "pointrwkv", "spt", "upp",
+			"3detr", "graph_residual", "graph_residual_gcn",
 		],
 		help="Backbone 模型名称",
 	)

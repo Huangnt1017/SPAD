@@ -184,10 +184,17 @@ class DepthRegressionLoss(nn.Module):
 
 
 class GatedMomentVarianceLoss(nn.Module):
-    """Penalize if gate-selected photons scatter too far from predicted depth.
+    """约束 gate 选中光子的 ToF 围绕"目标深度"的散度, 逼出 gate 选择性.
 
-    Target echo is narrow (~4 bin FWHM). If the variance of selected photon
-    timestamps around predicted depth is large, the gate is selecting wrong photons.
+    目标回波很窄 (~4 bin FWHM)。若 gate 选中光子的时间戳围绕中心散得很开,
+    说明 gate 选错了光子 (混入了雾后向散射)。
+
+    中心的选取是这个 loss 的关键:
+    - 旧实现以 ``depth_coarse`` 自身为中心, 是**自指**的 —— 只鼓励 gate 聚在
+      "当前加权均值"附近, 而那个均值本身已被雾光子拉偏, 无法把 gate 拽向真实峰值。
+    - 现实现在**有 GT 的前景区域用 GT 深度作中心**, gate 必须把光子选在真实回波
+      峰值附近才不被罚, 从而学会"挑信号光子 vs 雾"。
+    - 无 GT 的背景区域回退到 ``depth_coarse`` 自指 (保持原行为, 不向背景乱施压)。
     """
 
     def __init__(self, sigma_target=4.0, depth_range=128.0):
@@ -195,18 +202,26 @@ class GatedMomentVarianceLoss(nn.Module):
         self.sigma2 = (float(sigma_target) / float(depth_range)) ** 2
         self.depth_range = float(depth_range)
 
-    def forward(self, result):
+    def forward(self, result, gt=None):
         gate = result["gate"]             # [P, B, 1, H, W]
         tof = result["tof"]               # [P, B, H, W]
         valid = result["valid"]           # [P, B, H, W]
-        depth = result["depth_coarse"]    # [B, 1, H, W]  use coarse for variance
+        coarse = result["depth_coarse"]   # [B, 1, H, W]
 
-        depth_exp = depth.squeeze(1).unsqueeze(0) / self.depth_range  # [1, B, H, W]
+        # 前景 (d_gt>0) 用 GT 深度作方差中心, 背景回退到 coarse 自指
+        if gt is not None:
+            d_gt = gt[:, 0:1]                                    # [B, 1, H, W]
+            fg_mask = (d_gt > 0).float()
+            center = fg_mask * d_gt + (1.0 - fg_mask) * coarse   # [B, 1, H, W]
+        else:
+            center = coarse
+
+        center_exp = center.squeeze(1).unsqueeze(0) / self.depth_range  # [1, B, H, W]
         tof_norm = tof / self.depth_range
         gate_sq = gate.squeeze(2)                                # [T, B, H, W]
 
         gv = gate_sq * valid                                     # [T, B, H, W]
-        residual2 = (tof_norm - depth_exp) ** 2                  # [T, B, H, W]
+        residual2 = (tof_norm - center_exp) ** 2                 # [T, B, H, W]
 
         weighted_var = (gv * residual2).sum(0) / (gv.sum(0) + 1e-6)  # [B, H, W]
         excess = F.relu(weighted_var - self.sigma2)
@@ -513,7 +528,7 @@ class SPADImagingLoss(nn.Module):
 
         has_sequence = all(key in result for key in ("gate", "tof", "valid"))
         if self.w_var > 0 and has_sequence:
-            l_var = self.var_loss(result)
+            l_var = self.var_loss(result, gt)
             losses["var"] = l_var.detach()
             losses["weighted_var"] = (self.w_var * l_var).detach()
             total = total + self.w_var * l_var

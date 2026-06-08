@@ -52,7 +52,11 @@ import torch
 import torch.nn as nn
 
 from utils.graph_ops import knn_gpu, weighted_downsample
-from utils.heads import build_standard_cls_head, build_standard_box_head
+from utils.heads import (
+    SegmentationCentroidHead,
+    build_standard_box_head,
+    build_standard_cls_head,
+)
 
 try:
     from torch_geometric.nn import SAGEConv
@@ -373,6 +377,9 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         use_checkpoint: 梯度检查点 (默认 True)。
         dropout: 头部 Dropout。
         box_dim: bbox 维度。
+        seg_centroid_box: 是否启用分割引导质心头替代 MLP 回归头 (自研创新点,
+            默认 True)。置 False 时退回与 baseline 一致的统一 MLP 回归头,
+            便于消融对比。
     """
 
     def __init__(
@@ -382,11 +389,13 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         use_checkpoint: bool = True,
         dropout: float = 0.3,
         box_dim: int = 3,
+        seg_centroid_box: bool = True,
     ):
         super().__init__()
         self.k = k
         self.box_dim = box_dim
         self.use_checkpoint = use_checkpoint
+        self.seg_centroid_box = bool(seg_centroid_box)
 
         # Stem: (B, 4, N) → (B, 32, N)
         self.stem = nn.Sequential(
@@ -418,9 +427,14 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
         self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
 
-        # 统一中心点回归头: 3 层 MLP (1024 → 256 → 128 → box_dim)
-        # 直接回归, 与 baseline 一致, 确保 backbone 为唯一变量。
-        self.box_head = build_standard_box_head(pooled_dim, box_dim=box_dim, dropout=dropout)
+        # Box 头二选一:
+        #   seg_centroid_box=True  → 分割引导质心头 (自研创新点, 逐点打分 → 加权质心)
+        #   seg_centroid_box=False → 统一 MLP 回归头 (与 baseline 一致, 消融对照)
+        if self.seg_centroid_box:
+            # 逐点特征通道 = agg_conv 输出 512 (非池化维度)
+            self.box_head = SegmentationCentroidHead(in_channels=512, coord_dim=box_dim)
+        else:
+            self.box_head = build_standard_box_head(pooled_dim, box_dim=box_dim, dropout=dropout)
 
     def forward(self, points: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -467,11 +481,22 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
 
         logits = self.cls_head(f_pooled)
 
-        # Box head: 直接回归 (与 baseline 一致)
-        # backbone 内 Block 的 coord_encoder 已将位置信息注入到每个点特征中,
-        # 全局池化后位置统计量仍被保留, 深度回归不再 "盲猜" 中心点
-        box_preds = self.box_head(f_pooled)                       # (B, 3)
+        if self.seg_centroid_box:
+            # 分割引导质心头 (自研创新点): 逐点目标性打分 → softmax 权重
+            # → 用真实点 xyz 凸组合求质心。SAGEConv 的 mean 聚合 + coord_encoder
+            # 注入使逐点特征对 "目标 vs 雾" 有强判别力, 质心头据此聚焦目标点。
+            # 输入点坐标 xyz: (B, N, 4) → (B, 3, N) channel-first
+            point_xyz = points[..., :3].transpose(1, 2).contiguous()  # (B, 3, N)
+            centroid_out = self.box_head(f, point_xyz)
+            return {
+                "logits": logits,
+                "box_pred": centroid_out["centroid"],             # (B, 3)
+                "seg_logits": centroid_out["seg_logits"],         # (B, N) 可选辅助监督
+                "seg_weights": centroid_out["seg_weights"],       # (B, N) 可视化
+            }
 
+        # 退回统一 MLP 回归头 (消融用, 与 baseline 一致)
+        box_preds = self.box_head(f_pooled)                       # (B, 3)
         return {"logits": logits, "box_pred": box_preds}
 
 

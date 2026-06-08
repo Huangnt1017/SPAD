@@ -311,16 +311,27 @@ def _build_prior_label(
     )
     corrected_target = np.maximum(corrected_target, 0.0)
 
+    def _mode_depth_for_peak(peak_bin: np.ndarray) -> np.ndarray:
+        """以 peak_bin 为中心做局部加权平均, 得到亚 bin 精度的众数深度。"""
+        local_count = np.zeros(NUM_PIXELS, dtype=np.float32)
+        local_weighted_sum = np.zeros(NUM_PIXELS, dtype=np.float32)
+        for offset in range(-int(config.local_half_width), int(config.local_half_width) + 1):
+            bins = np.clip(peak_bin + offset, 1, int(config.time_threshold))
+            counts = hist[bins, pix]
+            local_count += counts
+            local_weighted_sum += counts * bins.astype(np.float32)
+        return local_weighted_sum / np.maximum(local_count, EPS)
+
+    # 目标深度: 在 target_search_window 内取每像素众数 (峰值 bin), 再局部加权细化
     search_hist = hist[search_lo : search_hi + 1]
     peak_bin = search_hist.argmax(axis=0).astype(np.int32) + int(search_lo)
-    local_count = np.zeros(NUM_PIXELS, dtype=np.float32)
-    local_weighted_sum = np.zeros(NUM_PIXELS, dtype=np.float32)
-    for offset in range(-int(config.local_half_width), int(config.local_half_width) + 1):
-        bins = np.clip(peak_bin + offset, 1, int(config.time_threshold))
-        counts = hist[bins, pix]
-        local_count += counts
-        local_weighted_sum += counts * bins.astype(np.float32)
-    depth = local_weighted_sum / np.maximum(local_count, EPS)
+    depth = _mode_depth_for_peak(peak_bin)
+
+    # 背景深度: 在全有效范围 [1, time_threshold] 内取每像素众数, 给非目标区域提供监督
+    # (避免背景 depth=0 导致整片区域无梯度; 雾后向散射众数 ~40 bin)
+    full_hist = hist[1 : int(config.time_threshold) + 1]
+    full_peak_bin = full_hist.argmax(axis=0).astype(np.int32) + 1
+    background_depth = _mode_depth_for_peak(full_peak_bin)
 
     confidence = corrected_target / (
         corrected_target
@@ -339,7 +350,9 @@ def _build_prior_label(
     )
     mask = _remove_small_components(mask, int(config.min_component_area))
 
-    depth = np.where(mask, depth, 0.0)
+    # 目标区用 target-window 众数深度, 背景区用全范围众数深度 (不再置 0)
+    # 这样深度通道逐像素稠密, 训练 mask (d_gt>0) 自动转为全 1, 背景获得监督
+    depth = np.where(mask, depth, background_depth)
     confidence = np.where(mask, confidence, 0.0)
     label = np.stack(
         [depth.reshape(64, 64), confidence.reshape(64, 64)],

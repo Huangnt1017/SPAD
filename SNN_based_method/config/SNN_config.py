@@ -158,18 +158,23 @@ class SNNConfig:
     spike_backend: str = "cupy"
     """spikingjelly 神经元后端: ``auto`` 优先 cupy, 也可显式 ``cupy``/``torch``。"""
 
-    num_blocks: int = 1
+    num_blocks: int = 2
     refine_mid: int = 8
     return_sequence: bool = True
     """是否返回完整 gate/tof/valid 时间序列; 训练 var/sparse loss 时需要开启。"""
 
     # ---- 损失权重 ----
     w_gt: float = 0.55
-    w_depth_reg: float = 0.5
-    """有效 depth 区域回归项权重, 直接压低 RMSE/提升 PSNR。"""
+    w_depth_reg: float = 2.0
+    """有效 depth 区域回归项权重, 直接压低 RMSE/提升 PSNR。
+
+    提高到 2.0 (原 0.5): 旧 run 中 weighted_depth_reg≈0.004, 比 weighted_ssim≈0.12
+    小约一个量级, 绝对深度精度几乎不进梯度预算, 导致深度图整体偏高且发平。"""
 
     w_ssim: float = 0.25
-    w_var: float = 0.2
+    w_var: float = 0.5
+    """提高到 0.5 (原 0.2): 配合 GatedMomentVarianceLoss 改用 GT 深度作中心后,
+    强化 gate 围绕真实回波峰值收窄的压力, 逼出 gate 选择性 (压制雾光子)。"""
     w_sparse: float = 0.03
     w_smooth: float = 0.03
     w_lut_smooth: float = 0.01
@@ -209,7 +214,7 @@ class SNNConfig:
     intensity_range: float = 1.0
 
     # ---- 优化器 / 调度器 ----
-    epochs: int = 20
+    epochs: int = 30
     lr: float = 1.0e-3
     weight_decay: float = 1.0e-4
     grad_clip: float = 1.0
