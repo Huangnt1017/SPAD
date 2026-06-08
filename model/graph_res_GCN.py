@@ -12,11 +12,12 @@
     - GCN_p (位置流): SAGEConv on 坐标空间静态 KNN 图 (预计算复用, 同原版)
 
     Block 内改进 (相比原版 GraphResidualBlock):
-    - SE-style channel gate 替代全局 Q/K/V 注意力
+    - SE-style channel gate 替代原版全局 Q/K/V 注意力 (本版已无 softmax 注意力)
+    - 双流 SAGEConv 输出经 SE 加权后直接 cat + Conv1d 融合, 替代 Q/K/V 投影
     - **坐标编码器残差注入**: 2 层 MLP 对 4D 坐标提取位置特征, 通过残差加法注入到最终特征,
       使每个点特征显式包含其空间位置编码, 改善深度回归 (避免全局池化后位置信息丢失)
 
-    其余 Q/K/V 注意力 + 坐标门控残差逻辑不变 (详见 readme.md 任务 1)。
+    坐标门控残差逻辑沿用原版 (详见 readme.md 任务 1)。
 
 Block 数据流 (全程 (B, C, N) 布局, 无下采样, N=1024):
     f(B,C,N) + p(B,4,N) + p_edge_index(E_total,2) [预计算缓存]
@@ -24,8 +25,8 @@ Block 数据流 (全程 (B, C, N) 布局, 无下采样, N=1024):
     Dynamic KNN from f → idx(B,N,k)   ← 仅特征 KNN 每层重算
     → f_edge_index(E_total,2)
         ↓
-    ┌ GCN_f: SAGEConv(f) + BN1d + LReLU → f_gcn(B,C_out,N)   ← V source
-    └ GCN_p: SAGEConv(p) + BN1d + LReLU → p_gcn(B,C_out,N)   ← K source (复用预计算边)
+    ┌ GCN_f: SAGEConv(f) + BN1d + LReLU → f_gcn(B,C_out,N)   ← SE 加权后融合
+    └ GCN_p: SAGEConv(p) + BN1d + LReLU → p_gcn(B,C_out,N)   ← 复用预计算边
         ↓
     SE gate on f_gcn, 然后 cat(f_gcn_gated, p_gcn) → Conv1d → fused
         ↓
@@ -50,6 +51,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 
+from utils.graph_ops import knn_gpu, weighted_downsample
 from utils.heads import build_standard_cls_head, build_standard_box_head
 
 try:
@@ -70,30 +72,6 @@ except (ImportError, AttributeError):
 
     def _ckpt(fn, *args, **kwargs):
         return fn(*args)
-
-
-# ══════════════════════════════════════════════════
-# GPU KNN (DGCNN 风格: 特征空间, 负距离 topk)
-# ══════════════════════════════════════════════════
-
-def knn_gpu(x: torch.Tensor, k: int) -> torch.Tensor:
-    """在特征空间做 KNN (与 DGCNN 一致)。
-
-    用负平方距离 + topk 实现, 全程 GPU matmul, 无需排序。
-
-    Args:
-        x: (B, C, N) — 任意维特征 (坐标 / 学到的特征均可)。
-        k: 近邻数 (含自身, 因距离为 0 时自身总是最近邻)。
-
-    Returns:
-        idx: (B, N, k), int64。
-    """
-    # (B, N, N) 负平方距离: 越大越近
-    inner = -2.0 * torch.matmul(x.transpose(2, 1), x)
-    xx = torch.sum(x ** 2, dim=1, keepdim=True)
-    neg_dist = -xx - inner - xx.transpose(2, 1)
-    _, idx = neg_dist.topk(k=k, dim=-1)
-    return idx
 
 
 # ══════════════════════════════════════════════════
@@ -138,39 +116,6 @@ def batched_knn_edge_index(
 
     # PyG 格式: row = source (中心), col = target (邻居)
     return torch.stack([row, col], dim=0)                   # (2, B*N*k)
-
-
-# ══════════════════════════════════════════════════
-# 加权下采样 (B, C, N) 布局 — 保留自原版
-# ══════════════════════════════════════════════════
-
-def weighted_downsample(
-    p: torch.Tensor,
-    f: torch.Tensor,
-    target_n: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """按特征 L2 范数做无放回加权采样。
-
-    Args:
-        p: (B, 4, N)。
-        f: (B, C, N)。
-        target_n: 目标点数。
-
-    Returns:
-        (p_down, f_down): (B, 4, target_n), (B, C, target_n)。
-    """
-    B, C, N = f.shape
-    if target_n >= N:
-        return p, f
-
-    scores = f.norm(p=2, dim=1).clamp(min=1e-8)              # (B, N)
-    probs = scores / scores.sum(dim=1, keepdim=True)
-    idx = torch.multinomial(probs, target_n, replacement=False)  # (B, target_n)
-
-    # gather 沿 N 维采样
-    idx_f = idx.unsqueeze(1).expand(-1, C, -1)                # (B, C, target_n)
-    idx_p = idx.unsqueeze(1).expand(-1, 4, -1)                # (B, 4, target_n)
-    return torch.gather(p, 2, idx_p), torch.gather(f, 2, idx_f)
 
 
 # ══════════════════════════════════════════════════
@@ -416,7 +361,8 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         1. Block 内 GCN_f / GCN_p 使用 PyG SAGEConv (真消息传递)
            替代 DGCNN Conv2d EdgeConv
         2. p_graph 缓存从 (B, 8, N, k) 边特征变为 (2, B*N*k) PyG 边索引
-        3. 注意力从 k 邻居 softmax 变为全局 N 点 softmax (GCN 已聚合邻域)
+        3. SAGEConv 已在邻域内做 mean 聚合, 故 Block 内用 SE channel gate 替代
+           原版 Q/K/V 全局注意力 (无 softmax), 计算量更省且避免过拟合
 
     全程 (B, C, N) 布局, Conv+BN+LeakyReLU。
     通道: 4→32→64→64→128→256→512, 点数: 全程 1024 不下采样。

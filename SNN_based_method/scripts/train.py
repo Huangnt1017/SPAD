@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
+from typing import Sequence
 
 import torch
 from torch.utils.data import DataLoader
@@ -32,13 +34,20 @@ from SNN_based_method.utils.runtime import (
     save_checkpoint,
 )
 
+# 数据根目录: 通过环境变量 SPAD_DATA_ROOT 覆盖, 默认指向服务器数据集目录。
+#   本地 Windows: set SPAD_DATA_ROOT=D:\PYproject\SPADdata
+#   服务器 Linux: 无需设置, 使用下方默认值
+SPAD_DATA_ROOT = os.environ.get(
+    "SPAD_DATA_ROOT",
+    "/public/home/202210183047/datasets/0825",
+)
 DEFAULT_TRAIN_DATA_PATHS = [
-    r"D:\PYproject\SPADdata\0825",
-    r"D:\PYproject\SPADdata\0826",
+    os.path.join(SPAD_DATA_ROOT, "0825"),
+    os.path.join(SPAD_DATA_ROOT, "0826"),
 ]
 DEFAULT_TRAIN_CSV_PATHS = [
-    r"D:\PYproject\SPADdata\0825\0825-group.csv",
-    r"D:\PYproject\SPADdata\0826\0826-group.csv",
+    os.path.join(SPAD_DATA_ROOT, "0825", "0825-group.csv"),
+    os.path.join(SPAD_DATA_ROOT, "0826", "0826-group.csv"),
 ]
 
 
@@ -555,12 +564,54 @@ def apply_default_train_paths(cfg: SNNConfig) -> SNNConfig:
     return cfg.clone_with(**updates)
 
 
-def ensure_train_precomputed_labels(cfg: SNNConfig):
-    """训练前检查当前 pages_per_group 的 label 池, 缺失时自动生成。"""
-    if not cfg.return_label or not cfg.use_precomputed_labels:
-        return None
-    if not cfg.data_paths or not cfg.csv_paths:
-        return None
+def _build_existing_label_stats(expected_paths: Sequence[Path]):
+    """把已完整存在的 label 路径汇总为统一统计对象。"""
+    from SNN_based_method.utils.generate_precomputed_labels import GenerateLabelStats
+
+    stats = GenerateLabelStats(
+        planned=len(expected_paths),
+        skipped_existing=len(expected_paths),
+    )
+    stats.label_roots = {
+        str(path.parents[1])
+        for path in expected_paths
+        if len(path.parents) >= 2
+    }
+    return stats
+
+
+def _infer_prior_debug_dir_name(label_dir_name: str | Path) -> Path:
+    """根据 label_prior 目录名推导默认 debug 目录名。"""
+    label_dir = Path(str(label_dir_name).strip())
+    return label_dir.with_name(f"{label_dir.name}_debug")
+
+
+def _generate_train_precomputed_labels(cfg: SNNConfig):
+    """按 ``precomputed_label_dir_name`` 选择对应的预生成 label 实现。"""
+    normalized_label_dir_name = Path(str(cfg.precomputed_label_dir_name).strip()).name.lower()
+
+    if normalized_label_dir_name == "label_prior":
+        from SNN_based_method.scripts.label_generate_new import (
+            NewLabelConfig,
+            run_with_config as run_prior_label_generation,
+        )
+
+        label_config = NewLabelConfig(
+            data_paths=[Path(path) for path in cfg.data_paths or []],
+            csv_paths=[Path(path) for path in cfg.csv_paths or []],
+            pages_per_group=cfg.pages_per_group,
+            total_pages=cfg.total_pages,
+            time_threshold=cfg.time_threshold,
+            label_dir_name=cfg.precomputed_label_dir_name,
+            debug_dir_name=_infer_prior_debug_dir_name(cfg.precomputed_label_dir_name),
+            labels_per_class=cfg.precomputed_labels_per_class,
+            recursive=cfg.recursive,
+            skip_missing_csv_raw=cfg.skip_missing_csv_raw,
+            overwrite=False,
+            dry_run=False,
+            progress_interval=cfg.progress_interval,
+        )
+        return run_prior_label_generation(label_config)
 
     from SNN_based_method.utils.generate_precomputed_labels import (
         GenerateLabelConfig,
@@ -568,8 +619,8 @@ def ensure_train_precomputed_labels(cfg: SNNConfig):
     )
 
     label_config = GenerateLabelConfig(
-        data_paths=[Path(path) for path in cfg.data_paths],
-        csv_paths=[Path(path) for path in cfg.csv_paths],
+        data_paths=[Path(path) for path in cfg.data_paths or []],
+        csv_paths=[Path(path) for path in cfg.csv_paths or []],
         pages_per_group=cfg.pages_per_group,
         total_pages=cfg.total_pages,
         time_threshold=cfg.time_threshold,
@@ -582,19 +633,83 @@ def ensure_train_precomputed_labels(cfg: SNNConfig):
         dry_run=False,
         progress_interval=cfg.progress_interval,
     )
-    stats = ensure_precomputed_labels(label_config)
+    return ensure_precomputed_labels(label_config)
+
+
+def ensure_train_precomputed_labels(cfg: SNNConfig):
+    """训练前检查当前 pages_per_group 的 label 池。
+
+    当 ``require_precomputed_labels=True`` 时, 会先按目录名选择对应生成器补齐
+    缺失 label, 然后再做严格复检; 复检仍缺失时才报错, 不回退到在线弱标签。
+    """
+    if not cfg.return_label or not cfg.use_precomputed_labels:
+        return None
+    if not cfg.data_paths or not cfg.csv_paths:
+        return None
+
+    from SNN_based_method.utils.generate_precomputed_labels import (
+        discover_expected_label_paths,
+    )
+
+    expected_paths = discover_expected_label_paths(
+        cfg.data_paths,
+        cfg.csv_paths,
+        pages_per_group=cfg.pages_per_group,
+        label_dir_name=cfg.precomputed_label_dir_name,
+        labels_per_class=cfg.precomputed_labels_per_class,
+        recursive=cfg.recursive,
+        skip_missing_csv_raw=cfg.skip_missing_csv_raw,
+    )
+    if expected_paths and all(path.is_file() for path in expected_paths):
+        stats = _build_existing_label_stats(expected_paths)
+        existing_key = "required_existing" if cfg.require_precomputed_labels else "skipped_existing"
+        print(
+            "[precomputed labels] "
+            f"pages_per_group={cfg.pages_per_group} {existing_key}={stats.skipped_existing} "
+            f"roots={sorted(stats.label_roots or set())}"
+        )
+        return stats
+
+    stats = _generate_train_precomputed_labels(cfg)
+    if cfg.require_precomputed_labels:
+        expected_paths = discover_expected_label_paths(
+            cfg.data_paths,
+            cfg.csv_paths,
+            pages_per_group=cfg.pages_per_group,
+            label_dir_name=cfg.precomputed_label_dir_name,
+            labels_per_class=cfg.precomputed_labels_per_class,
+            recursive=cfg.recursive,
+            skip_missing_csv_raw=cfg.skip_missing_csv_raw,
+        )
+        if not expected_paths:
+            raise FileNotFoundError(
+                "precomputed label generation found no expected label paths; "
+                "please verify data_paths/csv_paths/target_class columns"
+            )
+        missing_paths = [path for path in expected_paths if not path.is_file()]
+        if missing_paths:
+            preview = "\n".join(str(path) for path in missing_paths[:10])
+            raise FileNotFoundError(
+                f"missing required precomputed labels after generation: "
+                f"{len(missing_paths)}/{len(expected_paths)}\n{preview}"
+            )
     print(
         "[precomputed labels] "
         f"pages_per_group={cfg.pages_per_group} planned={stats.planned} "
         f"generated={stats.generated} skipped_existing={stats.skipped_existing} "
         f"roots={sorted(stats.label_roots or set())}"
+        + (
+            f" rejected={stats.rejected}"
+            if hasattr(stats, "rejected")
+            else ""
+        )
     )
     return stats
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """执行标准训练流程。"""
-    args = build_argparser().parse_args()
+    args = build_argparser().parse_args(argv)
     resume_run_dir = prepare_resume_args(args)
     cfg = config_from_checkpoint_and_args(args)
     cfg = apply_default_train_paths(cfg)
@@ -782,7 +897,17 @@ def main() -> None:
     logger.info("checkpoint_run_dir=%s", checkpoint_run_dir)
 
 
+def main_without_cli() -> None:
+    """无参数运行入口: 完全使用 SNNConfig 默认值启动纯 PLIF 训练。"""
+    main([])
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 1:
+        main()
+    else:
+        main_without_cli()
 # 接续训练命令示例:
 # & D:/Anaconda3/envs/torchnew/python.exe d:/PYproject/SPAD/SNN_based_method/scripts/train.py --resume-run-dir d:/PYproject/SPAD/checkpoints/SNN/train_20260604_113734

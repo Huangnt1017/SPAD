@@ -72,7 +72,7 @@ class DGCNNCls(nn.Module):
     Input:  x [B, N, 4]
     Output:
         logits [B, num_classes]
-        box_pred [B, 6] -> [xmin, xmax, ymin, ymax, zmin, zmax]
+        box_pred [B, 3] -> 中心点 [cx, cy, cz] (center-only 回归)
     """
     def __init__(self, num_classes=26, k=20, emb_dims=1024, dropout=0.3):
         super().__init__()
@@ -177,7 +177,7 @@ def _quick_shape_test():
     pts = torch.randn(4, 1024, 4, device=device)
     cls_logits, box_pred = cls_model(pts)
     print("DGCNNCls logits:", cls_logits.shape)  # [4, 26]
-    print("DGCNNCls box_pred:", box_pred.shape)  # [4, 6]
+    print("DGCNNCls box_pred:", box_pred.shape)  # [4, 3]
 
     # ══════════════════════════════════════════════
     # GPU 显存测试

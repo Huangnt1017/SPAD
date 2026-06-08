@@ -7,8 +7,8 @@ v6 → v7 关键改进 (架构不变, 仅优化计算效率):
     1. 坐标 KNN + graph_feature 预计算: p 全程不变, 在 Net.forward 入口
        一次性计算 knn_p 和 p_graph(B,8,N,k), 4 个 Block 共享复用,
        省掉 3 次 O(N²) KNN + 3 次 gather/permute (约提速 30%)。
-    2. 移除梯度检查点: B=32 峰值显存有余量, 关闭 checkpoint 避免
-       反向时重算前向 (约提速 15%)。
+    2. 梯度检查点可配置 (use_checkpoint, 默认 True): 开启时反向重算前向,
+       省显存适配 12GB 卡; 显存充裕时传 use_checkpoint=False 关闭以提速约 15%。
 
 v6 基础架构 (保留):
     - Conv2d+BN2d EdgeConv, 动态特征空间 KNN, DGCNN 风格 GPU KNN
@@ -45,6 +45,9 @@ import torch
 import torch.nn as nn
 
 from utils.heads import build_standard_cls_head, build_standard_box_head
+# knn_gpu / get_graph_feature / weighted_downsample 集中在 utils.graph_ops,
+# 与 graph_res_GCN.py 共享同一份实现 (避免拷贝漂移)。
+from utils.graph_ops import get_graph_feature, knn_gpu, weighted_downsample
 
 try:
     from torch.utils.checkpoint import checkpoint as _ckpt
@@ -54,94 +57,6 @@ except (ImportError, AttributeError):
 
     def _ckpt(fn, *args, **kwargs):
         return fn(*args)
-
-
-# ══════════════════════════════════════════════════
-# GPU KNN (DGCNN 风格: 特征空间, 负距离 topk)
-# ══════════════════════════════════════════════════
-
-def knn_gpu(x: torch.Tensor, k: int) -> torch.Tensor:
-    """在特征空间做 KNN (与 DGCNN 一致)。
-
-    用负平方距离 + topk 实现, 全程 GPU matmul, 无需排序。
-
-    Args:
-        x: (B, C, N) — 任意维特征 (坐标 / 学到的特征均可)。
-        k: 近邻数 (不含自身, 由 get_graph_feature 的拼接隐式排除)。
-
-    Returns:
-        idx: (B, N, k), int64。
-    """
-    # (B, N, N) 负平方距离: 越大越近
-    inner = -2.0 * torch.matmul(x.transpose(2, 1), x)
-    xx = torch.sum(x ** 2, dim=1, keepdim=True)
-    neg_dist = -xx - inner - xx.transpose(2, 1)
-    _, idx = neg_dist.topk(k=k, dim=-1)
-    return idx
-
-
-# ══════════════════════════════════════════════════
-# 图特征构建 (DGCNN 风格: 全局 flatten 索引)
-# ══════════════════════════════════════════════════
-
-def get_graph_feature(x: torch.Tensor, k: int,
-                      idx: torch.Tensor | None = None) -> torch.Tensor:
-    """构造 EdgeConv 边特征 [x_j - x_i, x_i] (DGCNN 原版写法)。
-
-    Args:
-        x: (B, C, N)。
-        k: 近邻数。
-        idx: (B, N, k), 若 None 则内部调用 knn_gpu。
-
-    Returns:
-        (B, 2C, N, k) — 每点 k 个邻居的边特征。
-    """
-    B, C, N = x.size()
-    if idx is None:
-        idx = knn_gpu(x, k)
-
-    idx_base = torch.arange(0, B, device=x.device).view(-1, 1, 1) * N
-    idx_flat = (idx + idx_base).view(-1)
-
-    x_t = x.transpose(2, 1).contiguous()                   # (B, N, C)
-    nbr = x_t.view(B * N, C)[idx_flat].view(B, N, k, C)    # (B, N, k, C)
-    x_i = x_t.unsqueeze(2).expand_as(nbr)                  # (B, N, k, C)
-
-    # [x_j - x_i, x_i] → (B, 2C, N, k)
-    return torch.cat([nbr - x_i, x_i], dim=-1).permute(0, 3, 1, 2).contiguous()
-
-
-# ══════════════════════════════════════════════════
-# 加权下采样 (B, C, N) 布局
-# ══════════════════════════════════════════════════
-
-def weighted_downsample(
-    p: torch.Tensor,
-    f: torch.Tensor,
-    target_n: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """按特征 L2 范数做无放回加权采样。
-
-    Args:
-        p: (B, 4, N)。
-        f: (B, C, N)。
-        target_n: 目标点数。
-
-    Returns:
-        (p_down, f_down): (B, 4, target_n), (B, C, target_n)。
-    """
-    B, C, N = f.shape
-    if target_n >= N:
-        return p, f
-
-    scores = f.norm(p=2, dim=1).clamp(min=1e-8)              # (B, N)
-    probs = scores / scores.sum(dim=1, keepdim=True)
-    idx = torch.multinomial(probs, target_n, replacement=False)  # (B, target_n)
-
-    # gather 沿 N 维采样
-    idx_f = idx.unsqueeze(1).expand(-1, C, -1)                # (B, C, target_n)
-    idx_p = idx.unsqueeze(1).expand(-1, 4, -1)                # (B, 4, target_n)
-    return torch.gather(p, 2, idx_p), torch.gather(f, 2, idx_f)
 
 
 # ══════════════════════════════════════════════════

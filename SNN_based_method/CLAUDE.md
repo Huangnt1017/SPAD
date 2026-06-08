@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Conda 环境：`torchnew`（Python 路径 `D:\Anaconda3\envs\torchnew\python.exe`）
 - SpikingJelly：使用环境中安装的官方 `spikingjelly.activation_based`，**不要**使用本地的 `spikingjelly1`
-- 任何模型改动都请编辑 `model/SNN_new.py` 或对应的 `model/SNN_c_*.py`
+- 任何模型改动都请编辑 `model/SNN_new.py`（SNN）或 `model/SNN_c_RNN.py` / `SNN_c_LSTM.py` / `SNN_c_GRU.py`（显式 RNN 变体）或 `model/ANN_gated_moment.py`（非脉冲 ANN gate baseline）
 - 所有可调参数的唯一真源：`config/SNN_config.py` 中的 `SNNConfig`（dataclass）。不要在其他地方硬编码常量
 
 ## 常用命令
@@ -51,7 +51,7 @@ $python = "D:\Anaconda3\envs\torchnew\python.exe"
 易踩的几点：
 - 续训时的 `--epochs` 是**总目标 epoch 数**，不是"再训练多少轮"。checkpoint 已训到 epoch 20，想再训 20 轮，应传 `--epochs 40`
 - `--trace-steps 5` 会打印训练循环中 DataLoader 与 GPU 各自的等待点，调 worker 数之前先跑这个
-- `--augment-train` 默认开启，当前默认 `num_aug=1` 且 `keep_original_sample=False`，训练集样本数 = 原始的 1 倍增强样本
+- `--augment-train` 默认开启，当前默认 `num_aug=2` 且 `keep_original_sample=False`，训练集样本数 = 原始的 2 倍增强样本
 
 ## 架构概览
 
@@ -86,37 +86,41 @@ raw ToF [B, 4096, P]
 ### Loss
 
 ```
-L = 0.6·L_GT + 0.5·L_depth_reg + 0.25·L_SSIM + 0.2·L_var + 0.01·L_sparse + 0.02·L_smooth + LUT 正则项
+L = 0.55·L_GT + 0.5·L_depth_reg + 0.25·L_SSIM + 0.2·L_var + 0.03·L_sparse + 0.03·L_smooth + LUT 正则项
 ```
 
 - `SSIMLoss`：7×7 高斯窗口，输入通过 `depth_range=128` 归一化到 `[0,1]`
 - `ImageMetrics`（MAE/RMSE/SSIM/PSNR）：仅用于评估，不参与梯度
-- `w_gt` 与 `w_ssim` 默认不做 mask，因为 label 来自干净数据的弱监督
+- `w_gt` 与 `w_ssim` 默认**开启 mask**（`gt_use_mask=True` / `ssim_use_mask=True`），因为新 label（`label_prior`）的非目标区域为 0
+- `depth_reg_mode` 支持 `mse`（默认）/ `charbonnier` / `l1`
 - LUT 正则项（`w_lut_smooth`、`w_lut_norm`）只在 `encoding_mode="lut"` 时生效
 
 ### 预生成 label 池
 
-`use_precomputed_labels=True`（默认）时，训练会自动生成 `<dataset>/label/<pages_per_group>/<class>/<class>_0..4.npy`。规则：
+`use_precomputed_labels=True`（默认）时，训练会自动生成 `<dataset>/label_prior/<pages_per_group>/<class>/<class>_0..4.npy`。规则：
 - 只有 `fog_level=0` 的 raw 提供 label
 - 每个类别 5 个 label，取自同一个 clean raw 的最后 5 个完整 group
 - pool 以 `pages_per_group` 为键 —— 改 P 会生成独立 pool，不会混用
 - ToF-shift 增强会同步平移 label 的 depth 通道
+- 新 label 使用目标/雾/背景 bin 先验，非目标区域为 0
 
 ## 当前默认值（来自 `SNNConfig`）
 
 | 参数 | 取值 | 说明 |
 |---|---|---|
 | `time_threshold` | 128 | 超过该值的 ToF 置 0 |
-| `pages_per_group` | 128 | 每个样本的 page 数 P |
-| `batch_size` | 8 | |
-| `grad_accum_steps` | 8 | 等效 batch = 64 |
-| `C` | 16 | backbone 通道数 |
-| `chunk_size` | 64 | 显存旋钮；P=128 → 2 个 chunk |
+| `pages_per_group` | 640 | 每个样本的 page 数 P；建议整除 48000（128/384/480/640/960/...） |
+| `batch_size` | 2 | |
+| `grad_accum_steps` | 8 | 等效 batch = 16 |
+| `num_workers` | 4 | |
+| `C` | 32 | backbone 通道数 |
+| `chunk_size` | 64 | 显存旋钮；P=640 → 10 个 chunk |
 | `num_blocks` | 1 | |
 | `encoding_mode` | `sinusoidal` | `n_freq=8` → 17 通道 |
 | `spike_mode` | `plif` | 默认使用可学习膜时间常数 |
-| `spike_tau` | 2.0 | LIF/PLIF 膜时间常数初值 |
+| `spike_tau` | 1.5 | LIF/PLIF 膜时间常数初值（PLIF 要求 >1.0） |
 | `spike_backend` | `cupy` | 可显式改为 `auto` 或 `torch` |
+| `model_backend` | `new` | 可选 `new`/`ann_gate`/`rnn`/`lstm`/`gru` |
 
 ## 数据布局
 
@@ -124,7 +128,7 @@ L = 0.6·L_GT + 0.5·L_depth_reg + 0.25·L_SSIM + 0.2·L_var + 0.01·L_sparse + 
 D:\PYproject\SPADdata\
   0825/                          # 训练集
     0825-group.csv               # 必须含 file_path 列；label 池还需 fog_level + target_class
-    label/128/<class>/<class>_0..4.npy
+    label_prior/640/<class>/<class>_0..4.npy
   0826/                          # 训练集
   0917/                          # 测试集（test.py 自动选用）
     917group.csv

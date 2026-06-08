@@ -18,9 +18,17 @@ import math
 
 # spikingjelly 导入前设置 CUDA_PATH, 否则 cupy backend 探测时找不到 CUDA headers
 if "CUDA_PATH" not in os.environ:
+    # Windows 默认安装路径; Linux 上该目录不存在会自动跳过
     _default_cuda = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
     if os.path.isdir(_default_cuda):
         os.environ["CUDA_PATH"] = _default_cuda
+    else:
+        # Linux: 优先用 module load cuda 提供的 CUDA_HOME, 否则探测常见前缀
+        _cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_ROOT")
+        if _cuda_home and os.path.isdir(_cuda_home):
+            os.environ["CUDA_PATH"] = _cuda_home
+        elif os.path.isdir("/usr/local/cuda"):
+            os.environ["CUDA_PATH"] = "/usr/local/cuda"
 
 import torch
 import torch.nn as nn

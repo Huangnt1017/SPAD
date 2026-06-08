@@ -35,8 +35,10 @@ SNN_based_method/
                         PLIF tau、参数量和 spike 指标分析入口
     visualize_encoding.py
                         ToF 编码可视化入口
+    label_generate_new.py
+                        默认 label_prior 生成器, 基于目标/雾/背景 bin 先验
     generate_precomputed_labels.py
-                        预生成类别级 label 池
+                        旧版 label 目录生成器
     vis_label.py        预生成 label 池可视化入口
   experiments/
     chapter_grid.json   论文章节对比实验矩阵示例
@@ -127,11 +129,13 @@ D:\PYproject\SPAD\SNN_based_method\artifacts\
 预生成 label 池：
 
 ```text
-D:\PYproject\SPADdata\0825\label\128\A\A_0.npy ... A_4.npy
-D:\PYproject\SPADdata\0826\label\128\A\A_0.npy ... A_4.npy
+D:\PYproject\SPADdata\0825\label_prior\640\A\A_0.npy ... A_4.npy
+D:\PYproject\SPADdata\0826\label_prior\640\A\A_0.npy ... A_4.npy
+D:\PYproject\SPADdata\0825\label_prior_debug\640\summary.csv
+D:\PYproject\SPADdata\0826\label_prior_debug\640\summary.csv
 ```
 
-其中 `128` 是当前 `pages_per_group`。如果训练改成 `--pages-per-group 64`，会检查或生成 `label\64\...`，不会混用不同 P 的 label。
+其中 `640` 是当前默认 `pages_per_group`。如果训练改成 `--pages-per-group 128`，会检查或生成 `label_prior\128\...`，不会混用不同 P 的 label。若把 `precomputed_label_dir_name` 改成 `label`，训练会改用旧版 `label\<P>\...` 目录结构。
 
 训练日志只输出一个 `.log` 文件。开头记录主要配置，之后每个 epoch 输出：
 
@@ -428,7 +432,15 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 
 ## 8. 预生成 label 池
 
-默认训练启用 `use_precomputed_labels=True`。训练脚本会在构建 DataLoader 前检查 label 池：
+默认训练启用 `use_precomputed_labels=True`、`require_precomputed_labels=True`，且 `precomputed_label_dir_name='label_prior'`。训练脚本会在构建 DataLoader 前检查当前目录名对应的 label 池：
+
+```text
+<dataset>\label_prior\<pages_per_group>\<class>\<class>_0.npy
+...
+<dataset>\label_prior\<pages_per_group>\<class>\<class>_4.npy
+```
+
+兼容旧版目录：
 
 ```text
 <dataset>\label\<pages_per_group>\<class>\<class>_0.npy
@@ -436,52 +448,77 @@ D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts
 <dataset>\label\<pages_per_group>\<class>\<class>_4.npy
 ```
 
-当前规则：
+训练前流程：
 
 ```text
-1. 只使用 CSV 中 fog_level=0 的 raw 作为 label 来源。
-2. 每个数据集、每个 target_class 只取一个 clean raw。
-3. 每个 class 只取该 clean raw 的最后 5 个完整 group。
-4. 每个 label 保存为 float32, shape=(2,64,64)。
-5. 训练时同一 target_class 的样本随机抽取这 5 个 label 之一。
-6. 若训练增强做 ToF shift，预生成 label 的 depth 通道会同步平移。
+1. 先根据 `data_paths`、`csv_paths`、`target_class` 和当前 `pages_per_group` 计算本次训练应存在的 label 路径。
+2. 若 label 池已完整存在，直接进入训练。
+3. 若有缺失，`train.py` 会按 `precomputed_label_dir_name` 自动调用对应生成器补齐：
+   - `label_prior` -> `SNN_based_method/scripts/label_generate_new.py`
+   - `label` -> `SNN_based_method/scripts/generate_precomputed_labels.py`
+4. 若 `require_precomputed_labels=True`，生成后仍缺失才报错，不会直接跳过生成。
+5. 若 `require_precomputed_labels=False`，训练允许对仍缺失的样本回退为在线弱标签。
 ```
 
-通道约定：
+默认 `label_prior` 生成规则：
+
+```text
+1. 只使用 CSV 中 `fog_level=0` 的 raw 作为候选来源。
+2. 对每个 clean raw 的多个 group 按 0825/0826 的目标 bin 先验进行评分。
+3. 每个数据集、每个 `target_class` 选取得分最高且通过 mask 面积筛选的前 5 个 group。
+4. 每个 label 保存为 `float32`，shape=`(2,64,64)`。
+5. 训练时同一 `target_class` 的样本随机抽取这 5 个 label 之一。
+6. 若训练增强做 ToF shift，预生成 label 的 depth 通道会同步平移。
+7. 生成时还会写出 `label_prior_debug\<P>\summary.csv` 和每个 label 的 `.npz` 诊断文件。
+```
+
+默认 `label_prior` 通道约定：
 
 ```text
 label[0] = depth, 单位 ToF bin
-label[1] = intensity, 范围 [0,1]
+label[1] = confidence, 范围 [0,1]
 ```
 
-手动 dry-run 查看将生成哪些 label，不写文件：
+手动 dry-run 查看默认 `label_prior` 将生成哪些 label，不写文件：
 
 ```powershell
-D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\generate_precomputed_labels.py `
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\label_generate_new.py `
   --data-paths D:\PYproject\SPADdata\0825 D:\PYproject\SPADdata\0826 `
   --csv-paths D:\PYproject\SPADdata\0825\0825-group.csv D:\PYproject\SPADdata\0826\0826-group.csv `
-  --pages-per-group 128 `
+  --pages-per-group 640 `
+  --label-dir-name label_prior `
   --dry-run
 ```
 
-手动生成 label：
+手动生成默认 `label_prior`：
+
+```powershell
+D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\label_generate_new.py `
+  --data-paths D:\PYproject\SPADdata\0825 D:\PYproject\SPADdata\0826 `
+  --csv-paths D:\PYproject\SPADdata\0825\0825-group.csv D:\PYproject\SPADdata\0826\0826-group.csv `
+  --pages-per-group 640 `
+  --label-dir-name label_prior
+```
+
+如需兼容旧版 `label` 目录，可改用：
 
 ```powershell
 D:\Anaconda3\envs\torchnew\python.exe D:\PYproject\SPAD\SNN_based_method\scripts\generate_precomputed_labels.py `
   --data-paths D:\PYproject\SPADdata\0825 D:\PYproject\SPADdata\0826 `
   --csv-paths D:\PYproject\SPADdata\0825\0825-group.csv D:\PYproject\SPADdata\0826\0826-group.csv `
-  --pages-per-group 128
+  --pages-per-group 640 `
+  --label-dir-name label
 ```
 
-无参数运行 `generate_precomputed_labels.py` 默认是 dry-run，避免误写数据。实际训练不需要手动先运行这个脚本；`train.py` 会自动检查和生成。
+`label_generate_new.py` 和 `generate_precomputed_labels.py` 的无参数运行都默认走 dry-run，避免误写数据。实际训练通常不需要手动先运行这些脚本；`train.py` 会按 `precomputed_label_dir_name` 自动检查并生成。
 
 可视化已生成的 label 池：
 
 ```powershell
-D:\Anaconda3\envs\torchnew\python.exe -c "from SNN_based_method.scripts.vis_label import visualize_labels; visualize_labels(r'D:\PYproject\SPADdata\0825\label', '128', 'K')"
+D:\Anaconda3\envs\torchnew\python.exe -c "from SNN_based_method.scripts.vis_label import visualize_labels; visualize_labels(r'D:\PYproject\SPADdata\0825\label_prior', '640', 'K')"
 ```
 
-`vis_label.py` 会逐个显示 `label[0]` depth 和 `label[1]` intensity，用于检查 clean label 来源、ToF shift 同步平移和不同类别 label 是否异常。
+`vis_label.py` 会逐个显示 `label[0]` depth 和 `label[1]` confidence；若查看旧版 `label` 目录，则第二通道仍可按旧 intensity 语义理解。该脚本主要用于检查 label 来源、ToF shift 同步平移和不同类别 label 是否异常。
 
 ## 9. 测试命令
 
@@ -532,16 +569,17 @@ D:\PYproject\SPAD\logs\SNN\test1_YYYYMMDD_HHMMSS\
 
 | 参数 | 默认 | 说明 |
 |---|---:|---|
-| `pages_per_group` | `128` | 每个样本使用的 page 数 `P` |
+| `pages_per_group` | `640` | 每个样本使用的 page 数 `P` |
 | `time_threshold` | `128` | 大于该 ToF 的值置 `0` |
 | `raw_load_mode` | `group` | 直接读取当前 group, 减少整文件读取开销 |
 | `split_ratios` | `0.8,0.2,0.0` | 训练/验证/测试划分 |
-| `batch_size` | `8` | 单步 batch |
+| `batch_size` | `2` | 单步 batch |
 | `grad_accum_steps` | `8` | 梯度累积, 等效 batch 为 `batch_size * grad_accum_steps` |
 | `use_precomputed_labels` | `True` | 优先读取预生成 label 池 |
-| `precomputed_label_dir_name` | `label` | label 池父目录名 |
+| `require_precomputed_labels` | `True` | 预生成 label 缺失时先自动补齐, 仍缺失才报错 |
+| `precomputed_label_dir_name` | `label_prior` | 默认 label 池父目录名 |
 | `precomputed_labels_per_class` | `5` | 每个类别随机抽取的 label 数量 |
-| `num_aug` | `1` | 每个训练样本额外生成的增强份数 |
+| `num_aug` | `2` | 每个训练样本额外生成的增强份数 |
 
 常用加速参数：
 
@@ -586,13 +624,13 @@ ToF shift：
 逻辑：
 
 ```text
-1. 当前默认 augment_train=True, num_aug=1, keep_original_sample=False
-2. 默认每个训练样本只保留 1 份增强样本, 不保留 aug_index=0 原始样本
+1. 当前默认 augment_train=True, num_aug=2, keep_original_sample=False
+2. 默认每个训练样本保留 2 份增强样本, 不保留 aug_index=0 原始样本
 3. 使用 --keep-original-sample 可额外保留原始样本
-4. 若 num_aug=1 且保留原始样本, 训练集样本数变为原始训练集的 2 倍
-5. 若 num_aug=1 且不保留原始样本, 训练集样本数变为原始训练集的 1 倍增强样本
+4. 若 `keep_original_sample=True`, 训练集样本数变为原始训练集的 `num_aug + 1` 倍
+5. 若 `keep_original_sample=False`, 训练集样本数变为原始训练集的 `num_aug` 倍
 6. 增强发生在原始 raw group 上, 先于 time_threshold 裁剪
-7. 对所有非零 ToF 加同一个随机整数 delta, delta 属于 [-20, 20]
+7. 对所有非零 ToF 加同一个随机整数 delta, delta 属于 `[-tof_shift_max, tof_shift_max]`
 8. 增强后小于 1 或大于 time_threshold 的值置 0
 9. 输入 group 和 label group 同步 shift
 ```

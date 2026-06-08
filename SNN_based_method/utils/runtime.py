@@ -292,7 +292,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
         dest="require_precomputed_labels",
         action="store_true",
         default=None,
-        help="预生成标签缺失时直接报错, 不回退到在线弱标签",
+        help="预生成标签缺失时必须先补齐; 会按目录名自动生成, 仍缺失才报错",
     )
     require_precomputed_group.add_argument(
         "--no-require-precomputed-labels",

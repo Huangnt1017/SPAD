@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -30,11 +31,18 @@ from SNN_based_method.utils.runtime import (
     update_average,
 )
 
-DEFAULT_TEST_DATA_PATHS = [r"D:\PYproject\SPADdata\0917"]
-DEFAULT_TEST_CSV_PATHS = [r"D:\PYproject\SPADdata\0917\917group.csv"]
+# 数据根目录: 通过环境变量 SPAD_DATA_ROOT 覆盖, 默认指向服务器数据集目录。
+#   本地 Windows: set SPAD_DATA_ROOT=D:\PYproject\SPADdata
+#   服务器 Linux: 无需设置, 使用下方默认值
+SPAD_DATA_ROOT = os.environ.get(
+    "SPAD_DATA_ROOT",
+    "/public/home/202210183047/datasets/0825",
+)
+DEFAULT_TEST_DATA_PATHS = [os.path.join(SPAD_DATA_ROOT, "0917")]
+DEFAULT_TEST_CSV_PATHS = [os.path.join(SPAD_DATA_ROOT, "0917", "917group.csv")]
 DEFAULT_TRAIN_DATA_PATHS = [
-    r"D:\PYproject\SPADdata\0825",
-    r"D:\PYproject\SPADdata\0826",
+    os.path.join(SPAD_DATA_ROOT, "0825"),
+    os.path.join(SPAD_DATA_ROOT, "0826"),
 ]
 
 

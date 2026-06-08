@@ -45,7 +45,7 @@ class SNNConfig:
     skip_missing_csv_raw: bool = False
     """CSV 中 raw 文件缺失时是否跳过; 默认严格报错, 避免静默丢样本。"""
 
-    pages_per_group: int = 960
+    pages_per_group: int = 640
     """单个训练样本包含的 raw page 数, 即 ``P``。最好整除48000，例如：128，384，480，640，960，1000，1200，2400等"""
 
     total_pages: Optional[int] = None
@@ -63,11 +63,11 @@ class SNNConfig:
     use_precomputed_labels: bool = True
     """是否优先读取 CSV 对应的预生成 ``.npy`` 标签。"""
 
-    require_precomputed_labels: bool = False
-    """预生成标签缺失时是否直接报错; 默认回退为在线弱标签生成。"""
+    require_precomputed_labels: bool = True
+    """预生成标签是否必须补齐; 缺失时会先自动生成, 仍缺失才报错。"""
 
-    precomputed_label_dir_name: str = "label"
-    """预生成标签目录名; 相对路径按 CSV 所在目录解析。"""
+    precomputed_label_dir_name: str = "label_prior"
+    """预生成标签目录名; 默认使用基于目标/雾/背景 bin 先验的新 label。"""
 
     precomputed_labels_per_class: int = 5
     """每个 ``target_class`` 预生成并随机抽取的 label 数量。"""
@@ -81,13 +81,13 @@ class SNNConfig:
     augment_train: bool = True
     """是否在训练集启用 raw group 级数据增强。"""
 
-    num_aug: int = 1
+    num_aug: int = 2
     """每个训练样本额外生成的增强样本份数，仅训练集。"""
 
     keep_original_sample: bool = False
     """训练增强展开时是否保留 ``aug_index=0`` 的原始样本。"""
 
-    tof_shift_max: int = 30
+    tof_shift_max: int = 25
     """训练增强的最大整数 ToF 偏移; 增强后小于 1 或大于 time_threshold 的值置 0。"""
 
     tof_shift_prob: float = 0.9
@@ -111,7 +111,7 @@ class SNNConfig:
     split_ratios: tuple[float, float, float] = (0.8, 0.2, 0.0)
     """train/val/test 划分比例。"""
 
-    filter_split_by_fog_level: bool = False
+    filter_split_by_fog_level: bool = True
     """是否启用 fog_level 分段筛选后再做 train/val/test 划分。"""
 
     # ---- Dataloader ----
@@ -134,8 +134,8 @@ class SNNConfig:
     encoding_mode: str = "sinusoidal"
     """``sinusoidal`` or ``lut``."""
 
-    n_freq: int = 8
-    embed_dim: int = 16
+    n_freq: int = 8 # 仅 encoding_mode=sinusoidal 时生效, 表示正弦编码的频率数量。
+    embed_dim: int = 32  # 仅 encoding_mode=lut 时生效, 表示 LUT 编码的输出维度。
     lut_init: str = "sinusoidal"
     lut_max_norm: Optional[float] = None
 
@@ -143,8 +143,8 @@ class SNNConfig:
     model_backend: str = "new"
     """模型后端: ``new`` 为 SNN, ``ann_gate`` 为非脉冲 gate baseline, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
 
-    C: int = 16  # 隐含层通道数
-    chunk_size: int = 64
+    C: int = 32  # 隐含层通道数,STEM的输出
+    chunk_size: int = 64  # 分页处理时的页数
     spike_mode: str = "plif"
     spike_tau: float = 1.5
     """LIF/PLIF 膜时间常数; IF 模式下忽略。"""
@@ -164,14 +164,14 @@ class SNNConfig:
     """是否返回完整 gate/tof/valid 时间序列; 训练 var/sparse loss 时需要开启。"""
 
     # ---- 损失权重 ----
-    w_gt: float = 0.6
+    w_gt: float = 0.55
     w_depth_reg: float = 0.5
     """有效 depth 区域回归项权重, 直接压低 RMSE/提升 PSNR。"""
 
     w_ssim: float = 0.25
     w_var: float = 0.2
-    w_sparse: float = 0.01
-    w_smooth: float = 0.02
+    w_sparse: float = 0.03
+    w_smooth: float = 0.03
     w_lut_smooth: float = 0.01
     w_lut_norm: float = 0.005
 
@@ -190,11 +190,11 @@ class SNNConfig:
     ssim_smooth_kernel_size: int = 3
     """SSIM 前对预测和标签做轻量均值滤波的窗口; 1 表示关闭。"""
 
-    gt_use_mask: bool = False
-    """GT L1 是否仅在 depth_gt > 0 区域计算; 干净 GT 默认全图计算。"""
+    gt_use_mask: bool = True
+    """GT L1 是否仅在 depth_gt > 0 区域计算; 新 label 的非目标区域为 0。"""
 
-    ssim_use_mask: bool = False
-    """SSIM 是否仅在 depth_gt > 0 区域计算; 干净 GT 默认全图计算。"""
+    ssim_use_mask: bool = True
+    """SSIM 是否仅在 depth_gt > 0 区域计算; 新 label 的非目标区域为 0。"""
 
     depth_reg_mode: str = "mse"
     """depth 回归项类型: mse 直接对齐 PSNR, charbonnier 更抗噪, l1 更稳健。"""
@@ -216,7 +216,7 @@ class SNNConfig:
     grad_accum_steps: int = 8
     """梯度累积步数; 实际等效 batch_size = batch_size * grad_accum_steps。"""
 
-    amp: bool = False
+    amp: bool = True
     tf32: bool = True
     """允许 Ampere/Ada GPU 使用 TF32 加速 matmul/conv。"""
 

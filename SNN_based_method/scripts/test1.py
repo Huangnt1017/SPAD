@@ -442,10 +442,10 @@ def main_without_cli() -> None:
     """无 CLI 直接运行入口; 在这里显式修改单样本测试参数。"""
     # ===== Editable parameters =====
     # checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260604_113734\\last.pth"
-    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\lif_to_plif_20260607_012227\\plif_stage\\last.pth"
-    raw_path = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_16-59-40_Delay-0_Width-2000.raw"  # 
-    pages_per_group = 2400
-    group_index = 2
+    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\lif_to_plif_20260608_005836_P640_plif\\plif_stage\\best.pth"
+    raw_path = r"D:\\PYproject\\SPADdata\\0917\\2025-09-17_17-33-29_Delay-0_Width-2000.raw"  # 
+    pages_per_group = 960*2
+    group_index = 4
     save_prediction = True
 
     # 测试输入参数显式在这里指定, 不从 checkpoint/config 继承。
