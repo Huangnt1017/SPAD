@@ -27,6 +27,18 @@ def _as_list(values: Sequence[str] | None) -> list[str]:
     return [str(value) for value in values]
 
 
+def _normalize_loaded_config(data: dict[str, Any]) -> dict[str, Any]:
+    """兼容旧配置字段名, 但不静默吞掉未知字段。"""
+    normalized = dict(data)
+    if "split_ratios" in normalized:
+        normalized["split_ratios"] = tuple(normalized["split_ratios"])
+    if "refine_max_intensity_scale" in normalized:
+        if "refine_max_intensity_blend" not in normalized:
+            normalized["refine_max_intensity_blend"] = normalized["refine_max_intensity_scale"]
+        del normalized["refine_max_intensity_scale"]
+    return normalized
+
+
 @dataclass
 class SNNConfig:
     """SPAD SNN 的全局配置对象。
@@ -45,7 +57,7 @@ class SNNConfig:
     skip_missing_csv_raw: bool = False
     """CSV 中 raw 文件缺失时是否跳过; 默认严格报错, 避免静默丢样本。"""
 
-    pages_per_group: int = 640
+    pages_per_group: int = 500
     """单个训练样本包含的 raw page 数, 即 ``P``。最好整除48000，例如：128，384，480，640，960，1000，1200，2400等"""
 
     total_pages: Optional[int] = None
@@ -81,8 +93,11 @@ class SNNConfig:
     augment_train: bool = True
     """是否在训练集启用 raw group 级数据增强。"""
 
-    num_aug: int = 2
-    """每个训练样本额外生成的增强样本份数，仅训练集。"""
+    num_aug: int = 1
+    """每个训练样本额外生成的增强样本份数，仅训练集。
+
+    方法可行性验证阶段降到 1 (原 2): 训练集样本数减半, 单 epoch 提速约 2×,
+    不影响 num_blocks=1 的可行性结论。确认方法有效后再调回 2 做完整实验。"""
 
     keep_original_sample: bool = False
     """训练增强展开时是否保留 ``aug_index=0`` 的原始样本。"""
@@ -140,11 +155,11 @@ class SNNConfig:
     lut_max_norm: Optional[float] = None
 
     # ---- 网络 ----
-    model_backend: str = "new"
-    """模型后端: ``new`` 为 SNN, ``ann_gate`` 为非脉冲 gate baseline, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
+    model_backend: str = "frame_photon"
+    """模型后端: ``new`` 为 SNN, ``ann``/``ann_gate`` 为非脉冲 ANN gate baseline, ``frame_photon`` 为全量时间压缩 ANN, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
 
     C: int = 32  # 隐含层通道数,STEM的输出
-    chunk_size: int = 64  # 分页处理时的页数
+    chunk_size: int = 128  # 分页处理时的页数
     spike_mode: str = "plif"
     spike_tau: float = 1.5
     """LIF/PLIF 膜时间常数; IF 模式下忽略。"""
@@ -158,8 +173,11 @@ class SNNConfig:
     spike_backend: str = "cupy"
     """spikingjelly 神经元后端: ``auto`` 优先 cupy, 也可显式 ``cupy``/``torch``。"""
 
-    num_blocks: int = 2
+    num_blocks: int = 1
     refine_mid: int = 8
+    depth_peak_half_width: int = 2
+    refine_max_depth_delta: float = 0.10
+    refine_max_intensity_blend: float = 1.0
     return_sequence: bool = True
     """是否返回完整 gate/tof/valid 时间序列; 训练 var/sparse loss 时需要开启。"""
 
@@ -177,6 +195,7 @@ class SNNConfig:
     强化 gate 围绕真实回波峰值收窄的压力, 逼出 gate 选择性 (压制雾光子)。"""
     w_sparse: float = 0.03
     w_smooth: float = 0.03
+    w_coarse: float = 0.20
     w_lut_smooth: float = 0.01
     w_lut_norm: float = 0.005
 
@@ -196,10 +215,19 @@ class SNNConfig:
     """SSIM 前对预测和标签做轻量均值滤波的窗口; 1 表示关闭。"""
 
     gt_use_mask: bool = True
-    """GT L1 是否仅在 depth_gt > 0 区域计算; 新 label 的非目标区域为 0。"""
+    """GT L1 是否仅在 depth_gt > 0 区域计算; label_prior 的背景 depth 通常非零。"""
 
     ssim_use_mask: bool = True
-    """SSIM 是否仅在 depth_gt > 0 区域计算; 新 label 的非目标区域为 0。"""
+    """SSIM 是否仅在 depth_gt > 0 区域计算; label_prior 下通常等价于全图 depth SSIM。"""
+
+    intensity_use_mask: bool = True
+    """强度/confidence 是否聚焦正样本区域; 背景仍保留弱约束。"""
+
+    intensity_pos_weight: float = 2.0
+    """强度正样本区域的 L1 加权系数, 用于缓解稀疏 confidence 图的背景主导问题。"""
+
+    intensity_bg_weight: float = 0.25
+    """强度背景区域的 L1 加权系数, 保留零背景约束但降低其主导性。"""
 
     depth_reg_mode: str = "mse"
     """depth 回归项类型: mse 直接对齐 PSNR, charbonnier 更抗噪, l1 更稳健。"""
@@ -218,7 +246,7 @@ class SNNConfig:
     lr: float = 1.0e-3
     weight_decay: float = 1.0e-4
     grad_clip: float = 1.0
-    grad_accum_steps: int = 8
+    grad_accum_steps: int = 4
     """梯度累积步数; 实际等效 batch_size = batch_size * grad_accum_steps。"""
 
     amp: bool = True
@@ -234,8 +262,11 @@ class SNNConfig:
     progress_interval: int = 20
     """训练/验证进度条每 N 个 batch 同步一次 loss, 降低 CPU-GPU 同步频率。"""
 
-    log_spike_stats: bool = True
-    """是否统计并输出脉冲神经元放电率。"""
+    log_spike_stats: bool = False
+    """是否统计并输出脉冲神经元放电率。
+
+    方法验证阶段关闭 (原 True): 每次 forward 对每个脉冲节点做全张量 sum 累计,
+    逐 chunk 逐节点开销不小。需要诊断 gate/发放率时再开。"""
 
     # ---- 运行时 / 实验产物 ----
     device: str = "auto"
@@ -253,7 +284,7 @@ class SNNConfig:
     save_every: int = 1
 
     def __post_init__(self) -> None:
-        """把旧后端名归一化为官方 activation_based 实现, 并校验枚举项。"""
+        """归一化模型后端别名并校验枚举项。"""
         backend = str(self.model_backend).lower()
         if backend in {"legacy", "clock", "clock_driven"}:
             self.model_backend = "new"
@@ -261,6 +292,8 @@ class SNNConfig:
             self.model_backend = "new"
         elif backend in {"ann", "ann_gate", "ann-gate", "gated_ann", "gated-ann"}:
             self.model_backend = "ann_gate"
+        elif backend in {"frame_photon", "frame-photon", "framephoton"}:
+            self.model_backend = "frame_photon"
         elif backend in {"recurrent", "srnn"}:
             self.model_backend = "rnn"
         elif backend in {"clstm", "convlstm"}:
@@ -304,11 +337,29 @@ class SNNConfig:
         if self.rho_min is not None and self.rho_max is not None and self.rho_min > self.rho_max:
             raise ValueError("rho_min must be <= rho_max")
 
+        self.depth_peak_half_width = int(self.depth_peak_half_width)
+        if self.depth_peak_half_width < 0:
+            raise ValueError("depth_peak_half_width must be non-negative")
+        self.refine_max_depth_delta = float(self.refine_max_depth_delta)
+        if self.refine_max_depth_delta <= 0:
+            raise ValueError("refine_max_depth_delta must be positive")
+        self.refine_max_intensity_blend = float(self.refine_max_intensity_blend)
+        if not 0 < self.refine_max_intensity_blend <= 1:
+            raise ValueError("refine_max_intensity_blend must be in (0, 1]")
+
         self.depth_reg_mode = str(self.depth_reg_mode).lower()
         if self.depth_reg_mode not in {"mse", "charbonnier", "l1"}:
             raise ValueError("depth_reg_mode must be 'mse', 'charbonnier' or 'l1'")
         if self.depth_reg_charbonnier_eps <= 0:
             raise ValueError("depth_reg_charbonnier_eps must be positive")
+        self.w_coarse = float(self.w_coarse)
+        if self.w_coarse < 0:
+            raise ValueError("w_coarse must be non-negative")
+        self.intensity_use_mask = bool(self.intensity_use_mask)
+        self.intensity_pos_weight = float(self.intensity_pos_weight)
+        self.intensity_bg_weight = float(self.intensity_bg_weight)
+        if self.intensity_pos_weight < 0 or self.intensity_bg_weight < 0:
+            raise ValueError("intensity_pos_weight and intensity_bg_weight must be non-negative")
 
     @property
     def t_max(self) -> int:
@@ -331,7 +382,7 @@ class SNNConfig:
         return torch.device(self.device)
 
     def build_model(self) -> torch.nn.Module:
-        """根据当前配置构建 SNN 或其显式时序递推等价模型。"""
+        """根据当前配置构建 SNN、ANN baseline 或显式时序递推模型。"""
         backend = self.model_backend.lower()
         if backend in {"new", "activation", "activation_based"}:
             from SNN_based_method.model.SNN_new import SPADSpikeNet
@@ -347,8 +398,10 @@ class SNNConfig:
             from SNN_based_method.model.SNN_c_GRU import SNN_c_GRU as SPADSpikeNet
         elif backend in {"ann_gate", "ann", "gated_ann"}:
             from SNN_based_method.model.ANN_gated_moment import ANNGatedMomentNet as SPADSpikeNet
+        elif backend in {"frame_photon", "frame-photon", "framephoton"}:
+            from SNN_based_method.model.frame_photon import FramePhotonNet as SPADSpikeNet
         else:
-            raise ValueError("model_backend must be 'new'/'activation_based'/'ann_gate'/'rnn'/'lstm'/'gru'")
+            raise ValueError("model_backend must be 'new'/'activation_based'/'ann'/'ann_gate'/'frame_photon'/'rnn'/'lstm'/'gru'")
 
         return SPADSpikeNet(
             C=self.C,
@@ -365,6 +418,9 @@ class SNNConfig:
             embed_dim=self.embed_dim,
             lut_init=self.lut_init,
             refine_mid=self.refine_mid,
+            depth_peak_half_width=self.depth_peak_half_width,
+            refine_max_depth_delta=self.refine_max_depth_delta,
+            refine_max_intensity_blend=self.refine_max_intensity_blend,
             return_sequence=self.return_sequence,
         )
 
@@ -379,6 +435,7 @@ class SNNConfig:
             w_var=self.w_var,
             w_sparse=self.w_sparse,
             w_smooth=self.w_smooth,
+            w_coarse=self.w_coarse,
             w_lut_smooth=self.w_lut_smooth,
             w_lut_norm=self.w_lut_norm,
             sigma_target=self.sigma_target,
@@ -391,6 +448,9 @@ class SNNConfig:
             ssim_smooth_kernel_size=self.ssim_smooth_kernel_size,
             gt_use_mask=self.gt_use_mask,
             ssim_use_mask=self.ssim_use_mask,
+            intensity_use_mask=self.intensity_use_mask,
+            intensity_pos_weight=self.intensity_pos_weight,
+            intensity_bg_weight=self.intensity_bg_weight,
             depth_reg_mode=self.depth_reg_mode,
             depth_reg_use_mask=self.depth_reg_use_mask,
             depth_reg_charbonnier_eps=self.depth_reg_charbonnier_eps,
@@ -508,9 +568,12 @@ class SNNConfig:
         """从 JSON 文件加载配置。"""
         with Path(path).open("r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
-        if "split_ratios" in data:
-            data["split_ratios"] = tuple(data["split_ratios"])
-        return cls(**data)
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SNNConfig":
+        """从 dict 创建配置, 并处理少量明确的旧字段别名。"""
+        return cls(**_normalize_loaded_config(data))
 
     def clone_with(self, **updates: Any) -> "SNNConfig":
         """创建一个覆盖指定字段的新配置。"""
@@ -555,16 +618,23 @@ class SNNConfig:
             f"spike_mode={self.spike_mode}, spike_tau={self.spike_tau}, "
             f"spike_v_threshold={self.spike_v_threshold}, spike_v_reset={self.spike_v_reset}, "
             f"spike_backend={self.spike_backend}, refine_mid={self.refine_mid}, "
+            f"depth_peak_half_width={self.depth_peak_half_width}, "
+            f"refine_max_depth_delta={self.refine_max_depth_delta}, "
+            f"refine_max_intensity_blend={self.refine_max_intensity_blend}, "
             f"return_sequence={self.return_sequence}"
         )
         lines.append(
             f"  loss_weights: gt={self.w_gt}, depth_reg={self.w_depth_reg}, ssim={self.w_ssim}, "
-            f"var={self.w_var}, sparse={self.w_sparse}, smooth={self.w_smooth}"
+            f"var={self.w_var}, sparse={self.w_sparse}, smooth={self.w_smooth}, "
+            f"coarse={self.w_coarse}"
         )
         lines.append(
             f"  loss_params: depth_reg_mode={self.depth_reg_mode}, "
             f"depth_reg_use_mask={self.depth_reg_use_mask}, sparse_mode={self.sparse_mode}, "
-            f"rho_target={self.rho_target}, rho_min={self.rho_min}, rho_max={self.rho_max}"
+            f"rho_target={self.rho_target}, rho_min={self.rho_min}, rho_max={self.rho_max}, "
+            f"intensity_use_mask={self.intensity_use_mask}, "
+            f"intensity_pos_weight={self.intensity_pos_weight}, "
+            f"intensity_bg_weight={self.intensity_bg_weight}"
         )
         lines.append(
             f"  epochs={self.epochs}, lr={self.lr}, weight_decay={self.weight_decay}, "

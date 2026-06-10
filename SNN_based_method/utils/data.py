@@ -44,10 +44,10 @@ DEFAULT_SEED = 42
 DEFAULT_LABEL_DIR_NAME = "label"
 DEFAULT_LABELS_PER_CLASS = 5
 FOG_LEVEL_SPLIT_WINDOWS: dict[int, tuple[float, float]] = {
-    0: (0.0, 0.4),
+    0: (0.0, 0.2),
     1: (0.0, 1.0),
     2: (0.0, 1.0),
-    3: (0.6, 1.0),
+    3: (0.8, 1.0),
 }
 
 

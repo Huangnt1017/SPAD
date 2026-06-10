@@ -13,6 +13,8 @@ __all__ = [
     "SPADSpikeGRU",
     "ANNGatedMomentNet",
     "SPADANNGatedMoment",
+    "FramePhotonNet",
+    "SPADFramePhoton",
 ]
 
 
@@ -40,5 +42,12 @@ def __getattr__(name: str):
         return {
             "ANNGatedMomentNet": ANNGatedMomentNet,
             "SPADANNGatedMoment": SPADANNGatedMoment,
+        }[name]
+    if name in {"FramePhotonNet", "SPADFramePhoton"}:
+        from SNN_based_method.model.frame_photon import FramePhotonNet, SPADFramePhoton
+
+        return {
+            "FramePhotonNet": FramePhotonNet,
+            "SPADFramePhoton": SPADFramePhoton,
         }[name]
     raise AttributeError(f"module 'SNN_based_method.model' has no attribute {name!r}")

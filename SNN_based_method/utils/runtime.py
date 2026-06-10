@@ -141,6 +141,9 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
             "ann-gate",
             "gated_ann",
             "gated-ann",
+            "frame_photon",
+            "frame-photon",
+            "framephoton",
             "rnn",
             "recurrent",
             "srnn",
@@ -152,7 +155,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
             "convgru",
         ],
         default=None,
-        help="模型后端; new 为官方 activation_based SNN, ann_gate 为非脉冲 gate baseline, rnn/lstm/gru 为显式时序递推版本",
+        help="模型后端; new 为官方 activation_based SNN, ann/ann_gate 为非脉冲 ANN gate baseline, frame_photon 为全量时间压缩 ANN, rnn/lstm/gru 为显式时序递推版本",
     )
     parser.add_argument("--encoding-mode", choices=["sinusoidal", "lut"], default=None, help="ToF 编码方式")
     parser.add_argument("--embed-dim", type=int, default=None, help="LUT 编码维度")
@@ -176,6 +179,9 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--num-blocks", type=int, default=None, help="SpikeBlock 数量")
     parser.add_argument("--refine-mid", type=int, default=None, help="深度/强度精修头的中间通道数")
+    parser.add_argument("--depth-peak-half-width", type=int, default=None, help="coarse depth 的峰值局部质心半窗口")
+    parser.add_argument("--refine-max-depth-delta", type=float, default=None, help="refine depth 归一化残差上限")
+    parser.add_argument("--refine-max-intensity-blend", type=float, default=None, help="refine intensity/confidence 候选图最大融合比例")
     sequence_group = parser.add_mutually_exclusive_group()
     sequence_group.add_argument(
         "--return-sequence",
@@ -196,6 +202,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--w-var", type=float, default=None, help="gate 方差 loss 权重")
     parser.add_argument("--w-sparse", type=float, default=None, help="gate 稀疏 loss 权重")
     parser.add_argument("--w-smooth", type=float, default=None, help="强度引导平滑 loss 权重")
+    parser.add_argument("--w-coarse", type=float, default=None, help="coarse 输出辅助监督权重")
     parser.add_argument("--w-lut-smooth", type=float, default=None, help="LUT 相邻 bin 平滑正则权重")
     parser.add_argument("--w-lut-norm", type=float, default=None, help="LUT 范数一致性正则权重")
     parser.add_argument("--sigma-target", type=float, default=None, help="gate 方差 loss 的目标 sigma, 单位为 bin")
@@ -270,6 +277,22 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         help="SSIM 在全图计算",
     )
+    intensity_mask_group = parser.add_mutually_exclusive_group()
+    intensity_mask_group.add_argument(
+        "--intensity-use-mask",
+        dest="intensity_use_mask",
+        action="store_true",
+        default=None,
+        help="强度/confidence 结构项聚焦正样本区域",
+    )
+    intensity_mask_group.add_argument(
+        "--no-intensity-mask",
+        dest="intensity_use_mask",
+        action="store_false",
+        help="强度/confidence 使用全图平均监督",
+    )
+    parser.add_argument("--intensity-pos-weight", type=float, default=None, help="强度正样本区域 L1 权重")
+    parser.add_argument("--intensity-bg-weight", type=float, default=None, help="强度背景区域 L1 权重")
     parser.add_argument("--recursive", action="store_true", help="递归搜索数据目录")
     parser.add_argument("--no-label", action="store_true", help="关闭弱标签生成")
     precomputed_labels_group = parser.add_mutually_exclusive_group()
@@ -463,6 +486,9 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "spike_backend",
         "num_blocks",
         "refine_mid",
+        "depth_peak_half_width",
+        "refine_max_depth_delta",
+        "refine_max_intensity_blend",
         "return_sequence",
         "w_gt",
         "w_depth_reg",
@@ -470,6 +496,7 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "w_var",
         "w_sparse",
         "w_smooth",
+        "w_coarse",
         "w_lut_smooth",
         "w_lut_norm",
         "sigma_target",
@@ -485,6 +512,9 @@ def config_from_args(args: argparse.Namespace) -> SNNConfig:
         "depth_reg_charbonnier_eps",
         "gt_use_mask",
         "ssim_use_mask",
+        "intensity_use_mask",
+        "intensity_pos_weight",
+        "intensity_bg_weight",
         "use_precomputed_labels",
         "require_precomputed_labels",
         "precomputed_label_dir_name",
@@ -537,9 +567,7 @@ def config_from_checkpoint_and_args(args: argparse.Namespace) -> SNNConfig:
             checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
             checkpoint_config = checkpoint.get("config")
             if checkpoint_config is not None:
-                if "split_ratios" in checkpoint_config:
-                    checkpoint_config["split_ratios"] = tuple(checkpoint_config["split_ratios"])
-                cfg = SNNConfig(**checkpoint_config)
+                cfg = SNNConfig.from_dict(checkpoint_config)
         except Exception:
             cfg = None
 
@@ -600,6 +628,9 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "spike_backend",
         "num_blocks",
         "refine_mid",
+        "depth_peak_half_width",
+        "refine_max_depth_delta",
+        "refine_max_intensity_blend",
         "return_sequence",
         "w_gt",
         "w_depth_reg",
@@ -607,6 +638,7 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "w_var",
         "w_sparse",
         "w_smooth",
+        "w_coarse",
         "w_lut_smooth",
         "w_lut_norm",
         "sigma_target",
@@ -622,6 +654,9 @@ def _apply_arg_overrides(cfg: SNNConfig, args: argparse.Namespace) -> SNNConfig:
         "depth_reg_charbonnier_eps",
         "gt_use_mask",
         "ssim_use_mask",
+        "intensity_use_mask",
+        "intensity_pos_weight",
+        "intensity_bg_weight",
         "use_precomputed_labels",
         "require_precomputed_labels",
         "precomputed_label_dir_name",

@@ -16,6 +16,8 @@ from SNN_based_method.model.SNN_new import (
     LearnableTofEmbedding,
     MultiScaleDSConv,
     SpatialRefineHead,
+    _accumulate_gate_hist,
+    _finalize_gated_peak_maps,
     encode_tof,
 )
 
@@ -104,6 +106,9 @@ class ANNGatedMomentNet(nn.Module):
         embed_dim: int = 16,
         lut_init: str = "sinusoidal",
         refine_mid: int = 8,
+        depth_peak_half_width: int = 2,
+        refine_max_depth_delta: float = 0.10,
+        refine_max_intensity_blend: float = 1.0,
         return_sequence: bool = True,
         spike_backend: str = "auto",
     ) -> None:
@@ -114,6 +119,9 @@ class ANNGatedMomentNet(nn.Module):
         self.n_freq = int(n_freq)
         self.encoding_mode = str(encoding_mode).lower()
         self.return_sequence = bool(return_sequence)
+        self.depth_peak_half_width = int(depth_peak_half_width)
+        if self.depth_peak_half_width < 0:
+            raise ValueError("depth_peak_half_width must be non-negative")
 
         if self.encoding_mode == "lut":
             self.tof_embedding = LearnableTofEmbedding(
@@ -132,7 +140,12 @@ class ANNGatedMomentNet(nn.Module):
         self.stem = _ANNStem(c_enc, self.C)
         self.blocks = nn.ModuleList([ANNGatedBlock(self.C) for _ in range(num_blocks)])
         self.gate_head = _ANNGateHead(self.C)
-        self.refine = SpatialRefineHead(mid=refine_mid, depth_range=self.t_max)
+        self.refine = SpatialRefineHead(
+            mid=refine_mid,
+            depth_range=self.t_max,
+            max_depth_delta=refine_max_depth_delta,
+            max_intensity_blend=refine_max_intensity_blend,
+        )
 
     def _encode_chunk(
         self,
@@ -181,6 +194,7 @@ class ANNGatedMomentNet(nn.Module):
         device = raw_data.device
         weighted_sum = torch.zeros(batch_size, 1, height, width, device=device)
         weight_sum = torch.zeros(batch_size, 1, height, width, device=device)
+        gate_hist = torch.zeros(self.t_max + 1, batch_size * height * width, device=device)
         all_gates: list[torch.Tensor] = []
         all_tofs: list[torch.Tensor] = []
         all_valids: list[torch.Tensor] = []
@@ -196,15 +210,29 @@ class ANNGatedMomentNet(nn.Module):
             valid_exp = valid.unsqueeze(2)
             weighted_sum = weighted_sum + (gate * tof_exp * valid_exp).sum(0)
             weight_sum = weight_sum + (gate * valid_exp).sum(0)
+            gate_hist = _accumulate_gate_hist(
+                gate_hist,
+                gate,
+                tof,
+                valid,
+                self.t_max,
+            )
 
             if should_return_sequence:
                 all_gates.append(gate)
                 all_tofs.append(tof)
                 all_valids.append(valid)
 
-        depth = weighted_sum / (weight_sum + 1.0e-6)
-        intensity = weight_sum / num_pages
-        confidence = (weight_sum / (weight_sum + 1.0)).clamp(0.0, 1.0)
+        maps = _finalize_gated_peak_maps(
+            weighted_sum=weighted_sum,
+            weight_sum=weight_sum,
+            gate_hist=gate_hist,
+            num_pages=num_pages,
+            depth_peak_half_width=self.depth_peak_half_width,
+        )
+        depth = maps["depth"]
+        intensity = maps["intensity"]
+        confidence = maps["confidence"]
         coarse = torch.cat([depth, intensity], dim=1)
         output = self.refine(coarse, confidence)
 
@@ -215,6 +243,8 @@ class ANNGatedMomentNet(nn.Module):
             "depth_coarse": depth,
             "intensity_coarse": intensity,
             "confidence": confidence,
+            "support": maps["support"],
+            "selectivity": maps["selectivity"],
         }
         if should_return_sequence:
             result["gate"] = torch.cat(all_gates, dim=0)

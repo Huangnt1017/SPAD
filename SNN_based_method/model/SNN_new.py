@@ -184,6 +184,99 @@ def _collect_module_spike_stats(root: nn.Module) -> dict[str, dict[str, torch.Te
     }
 
 
+def _local_peak_centroid(
+    hist: torch.Tensor,
+    peak_bin: torch.Tensor,
+    half_width: int,
+) -> torch.Tensor:
+    """从 gate 加权直方图的峰值邻域估计局部质心深度。
+
+    ``weighted_sum / weight_sum`` 会被宽雾峰或背景拖偏。这里先找每个像素
+    的主峰，再只在主峰附近做局部加权平均，保留峰值位置的物理含义。
+    """
+    if hist.dim() != 2:
+        raise ValueError("hist must have shape [T, num_pixels]")
+    if half_width <= 0:
+        return peak_bin.to(hist.dtype)
+
+    offsets = torch.arange(-int(half_width), int(half_width) + 1, device=hist.device)
+    window_bins = peak_bin.unsqueeze(0) + offsets.unsqueeze(1)
+    window_bins = window_bins.clamp(1, hist.shape[0])
+    window_hist = hist.gather(0, window_bins - 1)
+    numerator = (window_hist * window_bins.to(hist.dtype)).sum(0)
+    denominator = window_hist.sum(0).clamp_min(1e-6)
+    return numerator / denominator
+
+
+def _finalize_gated_peak_maps(
+    weighted_sum: torch.Tensor,
+    weight_sum: torch.Tensor,
+    gate_hist: torch.Tensor,
+    num_pages: int,
+    depth_peak_half_width: int,
+) -> dict[str, torch.Tensor]:
+    """把累计量转换为 coarse 图和选择性诊断图。
+
+    该函数是 SNN/RNN/LSTM/GRU/ANN gate-moment 后端共用的输出口径。
+    ``gate_hist`` 形状为 ``[t_max + 1, B*H*W]``，第 0 个 bin 保留给无效 ToF。
+    """
+    if weight_sum.dim() != 4 or weight_sum.shape[1] != 1:
+        raise ValueError("weight_sum must have shape [B, 1, H, W]")
+    if gate_hist.dim() != 2:
+        raise ValueError("gate_hist must have shape [t_max + 1, B*H*W]")
+    if num_pages <= 0:
+        raise ValueError("num_pages must be positive")
+
+    batch_size, _, height, width = weight_sum.shape
+    weight_sum_flat = weight_sum.reshape(-1)
+    depth_mean = (weighted_sum / (weight_sum + 1e-6)).reshape(-1)
+
+    gate_hist_valid = gate_hist[1:]
+    peak_count, peak_index = gate_hist_valid.max(dim=0)
+    peak_bin = peak_index + 1
+    depth_peak = _local_peak_centroid(
+        gate_hist_valid,
+        peak_bin,
+        int(depth_peak_half_width),
+    )
+    depth_flat = torch.where(peak_count > 0, depth_peak, depth_mean)
+    depth = depth_flat.reshape(batch_size, 1, height, width)
+
+    intensity = (peak_count / float(num_pages)).reshape(batch_size, 1, height, width)
+    support = (weight_sum_flat / (weight_sum_flat + 1.0)).clamp(0.0, 1.0)
+    selectivity = (peak_count / (weight_sum_flat + 1e-6)).clamp(0.0, 1.0)
+    confidence = (peak_count / (weight_sum_flat + 1.0)).clamp(0.0, 1.0)
+
+    return {
+        "depth": depth,
+        "intensity": intensity,
+        "confidence": confidence.reshape(batch_size, 1, height, width),
+        "support": support.reshape(batch_size, 1, height, width),
+        "selectivity": selectivity.reshape(batch_size, 1, height, width),
+    }
+
+
+def _accumulate_gate_hist(
+    gate_hist: torch.Tensor,
+    gate: torch.Tensor,
+    tof: torch.Tensor,
+    valid: torch.Tensor,
+    t_max: int,
+) -> torch.Tensor:
+    """把当前 chunk 的 gate 加权 ToF 计数累积进直方图。"""
+    if gate.dim() != 5 or gate.shape[2] != 1:
+        raise ValueError("gate must have shape [T, B, 1, H, W]")
+    t_actual = gate.shape[0]
+    num_pixels = gate.shape[1] * gate.shape[3] * gate.shape[4]
+    gate_weight = (
+        (gate.squeeze(2) * valid)
+        .reshape(t_actual, num_pixels)
+        .to(gate_hist.dtype)
+    )
+    bin_index = tof.long().clamp(0, int(t_max)).reshape(t_actual, num_pixels)
+    return gate_hist.scatter_add(0, bin_index, gate_weight)
+
+
 # 这版 spikingjelly 的 IF/LIF 在 CUDA + step_mode='m' + eval() 下会优先尝试 Triton，
 # 即使用户显式指定了 backend='cupy' 或 backend='torch'。Windows 环境通常未安装
 # Triton，于是验证阶段会直接报错。这里用轻量兼容子类强制尊重显式后端选择。
@@ -655,16 +748,35 @@ class SpikeBlock(nn.Module):
 
 
 class SpatialRefineHead(nn.Module):
-    """深度/强度分离的置信度调制精修头, 并将输出约束到物理有效范围.
+    """深度/强度分离的保守精修头, 并将输出约束到物理有效范围.
+
+    中间层使用 ReLU 不会限制残差符号；真正需要限制的是最后输出残差
+    的幅度。depth 使用有界加性小残差，intensity/confidence 使用有界
+    learned confidence candidate 的门控融合，避免加性负残差把 coarse 强度图
+    整片压成 0，同时允许把低计数但高选择性的目标映射成高 confidence。
 
     Args:
         mid: 中间通道数
         depth_range: depth 输出最大 ToF bin
+        max_depth_delta: depth 归一化残差上限, 0.1 表示最多修正 10% ToF range
+        max_intensity_blend: intensity/confidence 候选图的最大融合比例
     """
 
-    def __init__(self, mid: int = 8, depth_range: float = 128.0):
+    def __init__(
+        self,
+        mid: int = 8,
+        depth_range: float = 128.0,
+        max_depth_delta: float = 0.10,
+        max_intensity_blend: float = 1.0,
+    ):
         super().__init__()
         self.depth_range = float(depth_range)
+        self.max_depth_delta = float(max_depth_delta)
+        self.max_intensity_blend = float(max_intensity_blend)
+        if self.max_depth_delta <= 0:
+            raise ValueError("max_depth_delta must be positive")
+        if not 0 < self.max_intensity_blend <= 1:
+            raise ValueError("max_intensity_blend must be in (0, 1]")
         self.depth_net = nn.Sequential(
             nn.Conv2d(3, mid, 3, padding=1, bias=False),
             nn.BatchNorm2d(mid),
@@ -702,12 +814,16 @@ class SpatialRefineHead(nn.Module):
             dim=1,
         )
         refine_input = torch.cat([coarse_norm, confidence], dim=1)
-        depth_norm = (
-            coarse_norm[:, 0:1] + self.depth_net(refine_input) * confidence
-        ).clamp(0.0, 1.0)
-        intensity = (
-            coarse_norm[:, 1:2] + self.intensity_net(refine_input) * confidence
-        ).clamp(0.0, 1.0)
+        depth_raw = self.depth_net(refine_input).to(coarse_norm.dtype)
+        depth_delta = torch.tanh(depth_raw) * self.max_depth_delta
+        depth_norm = (coarse_norm[:, 0:1] + depth_delta * confidence).clamp(0.0, 1.0)
+
+        intensity_raw = self.intensity_net(refine_input).to(coarse_norm.dtype)
+        intensity_candidate = torch.sigmoid(intensity_raw)
+        intensity_blend = (confidence * self.max_intensity_blend).clamp(0.0, 1.0)
+        intensity_blend = intensity_blend.to(coarse_norm.dtype)
+        intensity = torch.lerp(coarse_norm[:, 1:2], intensity_candidate, intensity_blend)
+        intensity = intensity.clamp(0.0, 1.0)
         depth = depth_norm * self.depth_range
         return torch.cat([depth, intensity], dim=1)
 
@@ -859,6 +975,9 @@ class SPADSpikeNet(nn.Module):
         embed_dim: int = 16,
         lut_init: str = "sinusoidal",
         refine_mid: int = 8,
+        depth_peak_half_width: int = 2,
+        refine_max_depth_delta: float = 0.10,
+        refine_max_intensity_blend: float = 1.0,
         return_sequence: bool = True,
         spike_backend: str = "auto",
     ):
@@ -869,6 +988,9 @@ class SPADSpikeNet(nn.Module):
         self.n_freq = n_freq
         self.encoding_mode = encoding_mode
         self.return_sequence = bool(return_sequence)
+        self.depth_peak_half_width = int(depth_peak_half_width)
+        if self.depth_peak_half_width < 0:
+            raise ValueError("depth_peak_half_width must be non-negative")
         self.spike_mode = str(spike_mode).lower()
         self.spike_backend = str(spike_backend).lower()
         self.spike_tau = float(spike_tau)
@@ -915,7 +1037,12 @@ class SPADSpikeNet(nn.Module):
             spike_v_reset=self.spike_v_reset,
             spike_backend=self.spike_backend,
         )
-        self.refine = SpatialRefineHead(mid=refine_mid, depth_range=t_max)
+        self.refine = SpatialRefineHead(
+            mid=refine_mid,
+            depth_range=t_max,
+            max_depth_delta=refine_max_depth_delta,
+            max_intensity_blend=refine_max_intensity_blend,
+        )
 
     def _encode_chunk(
         self, chunk: torch.Tensor
@@ -991,6 +1118,9 @@ class SPADSpikeNet(nn.Module):
 
         weighted_sum = torch.zeros(B, 1, H, W, device=device)
         weight_sum = torch.zeros(B, 1, H, W, device=device)
+        # gate 加权 ToF 直方图: 逐像素逐 bin 累积 gate·valid, 用于强度峰值占比。
+        # 形状 [t_max+1, B*H*W]: bin 维放第 0 维便于 scatter_add 沿 T 累加。
+        gate_hist = torch.zeros(self.t_max + 1, B * H * W, device=device)
         all_gates, all_tofs, all_valids = [], [], []
 
         n_chunks = math.ceil(P / T_chunk)
@@ -1018,6 +1148,14 @@ class SPADSpikeNet(nn.Module):
             weighted_sum = weighted_sum + (gate * tof_exp * v_exp).sum(0)
             weight_sum = weight_sum + (gate * v_exp).sum(0)
 
+            gate_hist = _accumulate_gate_hist(
+                gate_hist,
+                gate,
+                tof,
+                valid,
+                self.t_max,
+            )
+
             if should_return_sequence:
                 all_gates.append(gate)
                 all_tofs.append(tof)
@@ -1027,13 +1165,20 @@ class SPADSpikeNet(nn.Module):
             if i < n_chunks - 1:
                 functional.detach_net(self)
 
-        depth = weighted_sum / (weight_sum + 1e-6)      # [B, 1, H, W]
-        intensity = weight_sum / P                      # [B, 1, H, W]
-        confidence = (weight_sum / (weight_sum + 1.0)).clamp(0.0, 1.0)
+        maps = _finalize_gated_peak_maps(
+            weighted_sum=weighted_sum,
+            weight_sum=weight_sum,
+            gate_hist=gate_hist,
+            num_pages=P,
+            depth_peak_half_width=self.depth_peak_half_width,
+        )
+        depth = maps["depth"]
+        intensity = maps["intensity"]
 
         # [B, 1, H, W] × 2 → [B, 2, H, W]
         coarse = torch.cat([depth, intensity], dim=1)
-        output = self.refine(coarse, confidence)        # [B, 2, H, W]
+        confidence_map = maps["confidence"]
+        output = self.refine(coarse, confidence_map)    # [B, 2, H, W]
 
         spike_stats = _collect_module_spike_stats(self)
         functional.reset_net(self)
@@ -1044,8 +1189,19 @@ class SPADSpikeNet(nn.Module):
             "intensity": output[:, 1:2],
             "depth_coarse": depth,
             "intensity_coarse": intensity,
-            "confidence": confidence,
+            "confidence": confidence_map,
+            "support": maps["support"],
+            "selectivity": maps["selectivity"],
         }
+        # gate 加权 ToF 直方图, 供诊断逐像素查看 gate 在各 bin 的累积权重。
+        # 像素维按 (B, H, W) row-major 展平 (见 _accumulate_gate_hist)。
+        # [t_max+1, B*H*W] → [t_max+1, B, H, W] → [B, t_max+1, H, W]
+        out["gate_hist"] = (
+            gate_hist.detach()
+            .reshape(self.t_max + 1, B, H, W)
+            .permute(1, 0, 2, 3)
+            .contiguous()
+        )
         if should_return_sequence:
             out["gate"] = torch.cat(all_gates, dim=0)   # [P, B, 1, H, W]
             out["tof"] = torch.cat(all_tofs, dim=0)     # [P, B, H, W]
@@ -1082,9 +1238,21 @@ def _benchmark_forward_5d_full_network(
     time_bins = time_bins.view(T, 1, 1, 1, 1)
 
     weight_sum = gate.sum(0)  # [B, 1, H, W]
-    depth = (gate * time_bins).sum(0) / (weight_sum + 1e-6)
-    intensity = weight_sum / T
-    confidence = (weight_sum / (weight_sum + 1.0)).clamp(0.0, 1.0)
+    weight_sum_flat = weight_sum.reshape(-1)
+    gate_hist = gate.squeeze(2).reshape(T, -1)
+    peak_count, peak_index = gate_hist.max(dim=0)
+    peak_bin = peak_index + 1
+    depth_mean = ((gate * time_bins).sum(0) / (weight_sum + 1e-6)).reshape(-1)
+    depth_peak = _local_peak_centroid(
+        gate_hist,
+        peak_bin,
+        model.depth_peak_half_width,
+    )
+    depth = torch.where(peak_count > 0, depth_peak, depth_mean).reshape_as(weight_sum)
+    intensity = (peak_count / T).reshape_as(weight_sum)
+    support = (weight_sum_flat / (weight_sum_flat + 1.0)).clamp(0.0, 1.0)
+    selectivity = (peak_count / (weight_sum_flat + 1e-6)).clamp(0.0, 1.0)
+    confidence = (peak_count / (weight_sum_flat + 1.0)).clamp(0.0, 1.0).reshape_as(weight_sum)
     output = model.refine(torch.cat([depth, intensity], dim=1), confidence)
 
     return {
@@ -1092,6 +1260,8 @@ def _benchmark_forward_5d_full_network(
         "depth_coarse": depth,
         "intensity_coarse": intensity,
         "confidence": confidence,
+        "support": support.reshape_as(weight_sum),
+        "selectivity": selectivity.reshape_as(weight_sum),
         "gate": gate,
     }
 

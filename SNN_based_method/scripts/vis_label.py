@@ -149,5 +149,5 @@ def _normalize_intensity(intensity_map: np.ndarray) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    demo_label_root = r"D:\\PYproject\\SPADdata\\0825\\label"
-    visualize_labels(demo_label_root, "128", "K")
+    demo_label_root = r"D:\\PYproject\\SPADdata\\0825\\label_prior"
+    visualize_labels(demo_label_root, "640", "5")

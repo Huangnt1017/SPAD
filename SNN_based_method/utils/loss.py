@@ -108,6 +108,9 @@ class WeakGTLoss(nn.Module):
         depth_range=128.0,
         intensity_range=1.0,
         use_mask: bool = False,
+        intensity_use_mask: bool = True,
+        intensity_pos_weight: float = 2.0,
+        intensity_bg_weight: float = 0.25,
     ):
         super().__init__()
         self.w_depth = w_depth
@@ -115,6 +118,11 @@ class WeakGTLoss(nn.Module):
         self.depth_range = float(depth_range)
         self.intensity_range = float(intensity_range)
         self.use_mask = bool(use_mask)
+        self.intensity_use_mask = bool(intensity_use_mask)
+        self.intensity_pos_weight = float(intensity_pos_weight)
+        self.intensity_bg_weight = float(intensity_bg_weight)
+        if self.intensity_pos_weight < 0 or self.intensity_bg_weight < 0:
+            raise ValueError("intensity loss weights must be non-negative")
 
     def forward(self, result, gt):
         """
@@ -127,14 +135,28 @@ class WeakGTLoss(nn.Module):
         d_gt = (gt[:, 0:1] / self.depth_range).clamp(0.0, 1.0)
         i_gt = (gt[:, 1:2] / self.intensity_range).clamp(0.0, 1.0)
 
+        # depth mask 只依赖 d_gt>0。label_prior 的背景 depth 通常非零,
+        # 因此这里会保留背景深度监督；旧 weak label 才会只约束前景。
         if self.use_mask:
             mask = (d_gt > 0).float()
             normalizer = mask.sum() + 1e-6
             loss_d = (torch.abs(d_pred - d_gt) * mask).sum() / normalizer
-            loss_i = (torch.abs(i_pred - i_gt) * mask).sum() / normalizer
         else:
             loss_d = torch.abs(d_pred - d_gt).mean()
-            loss_i = torch.abs(i_pred - i_gt).mean()
+        i_error = torch.abs(i_pred - i_gt)
+        if self.intensity_use_mask:
+            # label_prior 的第 2 通道是稀疏 confidence: 背景为 0。
+            # 全图均值会被背景零值主导，容易把目标形状也压没。
+            pos_mask = (i_gt > 0).float()
+            neg_mask = 1.0 - pos_mask
+            pos_loss = (i_error * pos_mask).sum() / pos_mask.sum().clamp(min=1.0)
+            neg_loss = (i_error * neg_mask).sum() / neg_mask.sum().clamp(min=1.0)
+            loss_i = (
+                self.intensity_pos_weight * pos_loss
+                + self.intensity_bg_weight * neg_loss
+            )
+        else:
+            loss_i = i_error.mean()
 
         return self.w_depth * loss_d + self.w_intensity * loss_i
 
@@ -324,6 +346,7 @@ class SSIMLoss(nn.Module):
         depth_range=128.0,
         intensity_range=1.0,
         use_mask: bool = False,
+        intensity_use_mask: bool = True,
         smooth_kernel_size: int = 3,
     ):
         super().__init__()
@@ -333,6 +356,7 @@ class SSIMLoss(nn.Module):
         self.depth_range = depth_range
         self.intensity_range = intensity_range
         self.use_mask = bool(use_mask)
+        self.intensity_use_mask = bool(intensity_use_mask)
         self.smooth_kernel_size = int(smooth_kernel_size)
 
     def _smooth_for_ssim(self, x: torch.Tensor) -> torch.Tensor:
@@ -365,13 +389,26 @@ class SSIMLoss(nn.Module):
         i_gt = self._smooth_for_ssim(i_gt)
 
         mask = (d_gt > 0).float() if self.use_mask else None
+        intensity_mask = (i_gt > 0).float() if self.intensity_use_mask else None
 
+        # depth: 按 d_gt>0 mask；label_prior 下通常覆盖全图 depth。
         ssim_d = _compute_ssim(d_pred, d_gt, mask=mask,
                                kernel_size=self.kernel_size,
                                data_range=1.0)
-        ssim_i = _compute_ssim(i_pred, i_gt, mask=mask,
-                               kernel_size=self.kernel_size,
-                               data_range=1.0)
+        # intensity/confidence: label_prior 背景为 0, 结构项应聚焦目标 support。
+        if intensity_mask is not None:
+            ssim_i_pos = _compute_ssim(i_pred, i_gt, mask=intensity_mask,
+                                       kernel_size=self.kernel_size,
+                                       data_range=1.0)
+            ssim_i_full = _compute_ssim(i_pred, i_gt, mask=None,
+                                        kernel_size=self.kernel_size,
+                                        data_range=1.0)
+            has_positive = (intensity_mask.sum() > 0).to(i_pred.dtype)
+            ssim_i = has_positive * ssim_i_pos + (1.0 - has_positive) * ssim_i_full
+        else:
+            ssim_i = _compute_ssim(i_pred, i_gt, mask=None,
+                                   kernel_size=self.kernel_size,
+                                   data_range=1.0)
 
         loss = self.w_depth * (1.0 - ssim_d) + self.w_intensity * (1.0 - ssim_i)
         return loss
@@ -406,6 +443,7 @@ class SPADImagingLoss(nn.Module):
 
     L = w_gt * L_GT + w_depth_reg * L_depth_reg + w_ssim * L_SSIM
         + w_var * L_var + w_sparse * L_sparse + w_smooth * L_smooth
+        + w_coarse * L_coarse_aux
         [+ w_lut_smooth * L_lut_smooth + w_lut_norm * L_lut_norm]   (仅 LUT 编码模式)
 
     Args:
@@ -433,6 +471,7 @@ class SPADImagingLoss(nn.Module):
         w_var=0.2,
         w_sparse=0.01,
         w_smooth=0.02,
+        w_coarse=0.20,
         w_lut_smooth=0.01,
         w_lut_norm=0.005,
         sigma_target=4.0,
@@ -445,6 +484,9 @@ class SPADImagingLoss(nn.Module):
         ssim_smooth_kernel_size=3,
         gt_use_mask=False,
         ssim_use_mask=False,
+        intensity_use_mask=True,
+        intensity_pos_weight=2.0,
+        intensity_bg_weight=0.25,
         depth_reg_mode="mse",
         depth_reg_use_mask=True,
         depth_reg_charbonnier_eps=1.0e-3,
@@ -458,6 +500,9 @@ class SPADImagingLoss(nn.Module):
         self.w_var = w_var
         self.w_sparse = w_sparse
         self.w_smooth = w_smooth
+        self.w_coarse = float(w_coarse)
+        if self.w_coarse < 0:
+            raise ValueError("w_coarse must be non-negative")
         self.w_lut_smooth = w_lut_smooth
         self.w_lut_norm = w_lut_norm
 
@@ -465,6 +510,9 @@ class SPADImagingLoss(nn.Module):
             depth_range=depth_range,
             intensity_range=intensity_range,
             use_mask=gt_use_mask,
+            intensity_use_mask=intensity_use_mask,
+            intensity_pos_weight=intensity_pos_weight,
+            intensity_bg_weight=intensity_bg_weight,
         )
         self.depth_reg_loss = DepthRegressionLoss(
             depth_range=depth_range,
@@ -477,6 +525,7 @@ class SPADImagingLoss(nn.Module):
             depth_range=depth_range,
             intensity_range=intensity_range,
             use_mask=ssim_use_mask,
+            intensity_use_mask=intensity_use_mask,
             smooth_kernel_size=ssim_smooth_kernel_size,
         )
         self.var_loss = GatedMomentVarianceLoss(
@@ -525,6 +574,33 @@ class SPADImagingLoss(nn.Module):
             losses["ssim"] = l_ssim.detach()
             losses["weighted_ssim"] = (self.w_ssim * l_ssim).detach()
             total = total + self.w_ssim * l_ssim
+
+        if gt is not None and self.w_coarse > 0 and all(
+            key in result for key in ("depth_coarse", "intensity_coarse")
+        ):
+            coarse_result = {
+                "output": torch.cat(
+                    [result["depth_coarse"], result["intensity_coarse"]],
+                    dim=1,
+                )
+            }
+            l_coarse = total.new_tensor(0.0)
+            if self.w_gt > 0:
+                coarse_gt = self.gt_loss(coarse_result, gt)
+                losses["coarse_gt"] = coarse_gt.detach()
+                l_coarse = l_coarse + self.w_gt * coarse_gt
+            if self.w_depth_reg > 0:
+                coarse_depth_reg = self.depth_reg_loss(coarse_result, gt)
+                losses["coarse_depth_reg"] = coarse_depth_reg.detach()
+                l_coarse = l_coarse + self.w_depth_reg * coarse_depth_reg
+            if self.w_ssim > 0:
+                coarse_ssim = self.ssim_loss(coarse_result, gt)
+                losses["coarse_ssim"] = coarse_ssim.detach()
+                l_coarse = l_coarse + self.w_ssim * coarse_ssim
+
+            losses["coarse"] = l_coarse.detach()
+            losses["weighted_coarse"] = (self.w_coarse * l_coarse).detach()
+            total = total + self.w_coarse * l_coarse
 
         has_sequence = all(key in result for key in ("gate", "tof", "valid"))
         if self.w_var > 0 and has_sequence:
@@ -633,19 +709,42 @@ class ImageMetrics:
         scores["depth_psnr"] = self._psnr(d_mse, 1.0)
 
         # ── Intensity 指标 (已在 [0, 1] 范围, 直接计算) ──
+        # 保留全图指标用于衡量背景误报；额外的 intensity_fg_* 才反映
+        # label_prior confidence 正样本区域的形状恢复质量。
+        num_all = torch.as_tensor(
+            float(i_pred.numel()), device=i_pred.device, dtype=i_pred.dtype
+        ).clamp(min=1.0)
         i_pred_norm = i_pred / self.intensity_range
         i_gt_norm = i_gt / self.intensity_range
-        i_err = (i_pred_norm - i_gt_norm) * mask
-        scores["intensity_mae"] = i_err.abs().sum() / num_valid
-        i_mse = (i_err ** 2).sum() / num_valid
+        i_err = i_pred_norm - i_gt_norm
+        scores["intensity_mae"] = i_err.abs().sum() / num_all
+        i_mse = (i_err ** 2).sum() / num_all
         scores["intensity_rmse"] = torch.sqrt(i_mse)
         scores["intensity_ssim"] = _compute_ssim(
-            i_pred_norm, i_gt_norm, mask=mask,
+            i_pred_norm, i_gt_norm, mask=None,
             kernel_size=self.ssim_kernel_size,
             data_range=1.0,
         )
         # PSNR = 10 * log10(1^2 / MSE)
         scores["intensity_psnr"] = self._psnr(i_mse, 1.0)
+
+        intensity_mask = (i_gt > 0).float()
+        num_positive = intensity_mask.sum().clamp(min=1.0)
+        has_positive = (intensity_mask.sum() > 0).to(i_pred.dtype)
+        i_err_pos = i_err * intensity_mask
+        i_mse_pos = (i_err_pos ** 2).sum() / num_positive
+        intensity_ssim_pos = _compute_ssim(
+            i_pred_norm, i_gt_norm, mask=intensity_mask,
+            kernel_size=self.ssim_kernel_size,
+            data_range=1.0,
+        )
+        fg_mae = i_err_pos.abs().sum() / num_positive
+        fg_rmse = torch.sqrt(i_mse_pos)
+        fg_psnr = self._psnr(i_mse_pos, 1.0)
+        scores["intensity_fg_mae"] = has_positive * fg_mae + (1.0 - has_positive) * scores["intensity_mae"]
+        scores["intensity_fg_rmse"] = has_positive * fg_rmse + (1.0 - has_positive) * scores["intensity_rmse"]
+        scores["intensity_fg_ssim"] = has_positive * intensity_ssim_pos + (1.0 - has_positive) * scores["intensity_ssim"]
+        scores["intensity_fg_psnr"] = has_positive * fg_psnr + (1.0 - has_positive) * scores["intensity_psnr"]
 
         return scores
 
@@ -695,5 +794,12 @@ class ImageMetrics:
             lines.append(
                 f"  {channel:10s} | MAE={mae:.4f} | RMSE={rmse:.4f} "
                 f"| SSIM={ssim:.4f} | PSNR={psnr:.2f}dB"
+            )
+        if "intensity_fg_mae" in scores:
+            lines.append(
+                f"  intensity_fg | MAE={scores['intensity_fg_mae']:.4f} | "
+                f"RMSE={scores['intensity_fg_rmse']:.4f} | "
+                f"SSIM={scores['intensity_fg_ssim']:.4f} | "
+                f"PSNR={scores['intensity_fg_psnr']:.2f}dB"
             )
         return "\n".join(lines)

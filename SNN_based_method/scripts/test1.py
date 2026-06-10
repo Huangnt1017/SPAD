@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 import matplotlib
 matplotlib.use("Agg")
@@ -24,6 +25,8 @@ from SNN_based_method.config.SNN_config import SNNConfig
 from SNN_based_method.utils.data import (
     RawGroupSample,
     SpadRawGroupDataset,
+    attach_precomputed_label_metadata,
+    collect_raw_records,
     read_raw_group,
     seed_everything,
     spad_time_first_collate,
@@ -84,10 +87,12 @@ def build_histogram_max_label_from_group(
     *,
     active_point: int = 1,
     normalize_intensity: bool = False,
+    tof_window: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """基于逐像素 ToF 直方图的最大值法生成 ``[2, 64, 64]`` 图像。
 
     通道 0 为最大计数对应的 ToF bin，通道 1 为该 bin 的最大计数。
+    ``tof_window`` 非空时只在指定闭区间内找峰值, 用于目标窗口诊断。
     当 ``normalize_intensity=True`` 时，强度会额外除以 ``pages_per_group``，
     仅用于和模型输出的 ``[0, 1]`` 强度做量纲一致的误差统计。
     """
@@ -104,12 +109,21 @@ def build_histogram_max_label_from_group(
         return torch.from_numpy(label)
 
     group = data.astype(np.int32, copy=False)
-    max_bin = int(time_threshold)
+    if tof_window is None:
+        min_bin, max_bin = 1, int(time_threshold)
+    else:
+        min_bin = max(1, int(tof_window[0]))
+        max_bin = min(int(time_threshold), int(tof_window[1]))
+        if min_bin > max_bin:
+            raise ValueError(
+                f"tof_window must overlap valid range [1, {time_threshold}], "
+                f"got {tof_window}"
+            )
     intensity_scale = float(pages_per_group) if normalize_intensity else 1.0
 
     for pixel_index in range(group.shape[0]):
         values = group[pixel_index]
-        valid_values = values[(values >= 1) & (values <= max_bin)]
+        valid_values = values[(values >= min_bin) & (values <= max_bin)]
         if valid_values.size == 0:
             continue
 
@@ -126,6 +140,99 @@ def build_histogram_max_label_from_group(
         label[1, y_idx, x_idx] = float(best_count) / intensity_scale
 
     return torch.from_numpy(label)
+
+
+def _resolve_single_raw_metadata(
+    cfg: SNNConfig,
+    raw_path: Path,
+    *,
+    pages_per_group: int,
+) -> dict[str, Any]:
+    """从配置 CSV 中查找单个 raw 的 metadata, 供 ``label_prior`` 定位使用。"""
+    if not cfg.data_paths:
+        return {}
+
+    records = collect_raw_records(
+        cfg.data_paths,
+        csv_paths=cfg.csv_paths,
+        recursive=cfg.recursive,
+        skip_missing_csv_raw=cfg.skip_missing_csv_raw,
+    )
+    if cfg.use_precomputed_labels or cfg.require_precomputed_labels:
+        records = attach_precomputed_label_metadata(
+            records,
+            pages_per_group=pages_per_group,
+            total_pages=cfg.total_pages,
+            label_dir_name=cfg.precomputed_label_dir_name,
+        )
+
+    target = str(raw_path.resolve())
+    for record_path, metadata in records:
+        if str(Path(record_path).resolve()) == target:
+            return dict(metadata)
+    return {}
+
+
+def _label_mode_from_metadata(cfg: SNNConfig, metadata: Mapping[str, Any]) -> str:
+    """给 summary 写入当前 dataset label 的来源, 避免和 max-count baseline 混淆。"""
+    if not cfg.return_label:
+        return "disabled"
+    if cfg.use_precomputed_labels and metadata.get("precomputed_label_dir"):
+        return "precomputed_label_pool"
+    if cfg.use_precomputed_labels or cfg.require_precomputed_labels:
+        return "weak_label_fallback_no_metadata"
+    return "weak_label_from_current_group"
+
+
+def _masked_mean(array: np.ndarray, mask: np.ndarray) -> float | None:
+    """安全计算 mask 区域均值; mask 为空时返回 None 便于 JSON 表达。"""
+    if not np.any(mask):
+        return None
+    return float(array[mask].mean())
+
+
+def _masked_abs_mean(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float | None:
+    """安全计算 mask 区域 MAE。"""
+    if not np.any(mask):
+        return None
+    return float(np.abs(a[mask] - b[mask]).mean())
+
+
+def _array_summary(prefix: str, array: np.ndarray) -> dict[str, float]:
+    """生成一组稳定的全局分布统计。"""
+    data = np.asarray(array, dtype=np.float32)
+    return {
+        f"{prefix}_min": float(data.min()),
+        f"{prefix}_p05": float(np.percentile(data, 5)),
+        f"{prefix}_p50": float(np.percentile(data, 50)),
+        f"{prefix}_p95": float(np.percentile(data, 95)),
+        f"{prefix}_max": float(data.max()),
+        f"{prefix}_mean": float(data.mean()),
+        f"{prefix}_std": float(data.std()),
+    }
+
+
+def _positive_counts(prefix: str, array: np.ndarray) -> dict[str, int]:
+    """统计强度图在常用阈值下的非零/高响应像素数。"""
+    data = np.asarray(array, dtype=np.float32)
+    return {
+        f"{prefix}_positive_pixels": int((data > 0).sum()),
+        f"{prefix}_gt_0p01_pixels": int((data > 0.01).sum()),
+        f"{prefix}_gt_0p05_pixels": int((data > 0.05).sum()),
+        f"{prefix}_gt_0p10_pixels": int((data > 0.10).sum()),
+        f"{prefix}_gt_0p50_pixels": int((data > 0.50).sum()),
+    }
+
+
+def _top_depth_bins(depth_image: np.ndarray, limit: int = 12) -> list[dict[str, int]]:
+    """统计全局 max-count depth 图中出现最多的 ToF bin。"""
+    depth = np.asarray(depth_image, dtype=np.int32)
+    values, counts = np.unique(depth, return_counts=True)
+    pairs = sorted(zip(values.tolist(), counts.tolist()), key=lambda item: item[1], reverse=True)
+    return [
+        {"bin": int(bin_value), "pixels": int(pixel_count)}
+        for bin_value, pixel_count in pairs[:limit]
+    ]
 
 
 def _save_single_image(
@@ -257,6 +364,116 @@ def save_prediction_images(
     return saved_paths
 
 
+def _pick_diagnostic_pixel(
+    *,
+    target_mask_np: np.ndarray | None,
+    selectivity_np: np.ndarray | None,
+    output_intensity_np: np.ndarray,
+) -> tuple[int, int] | None:
+    """为 gate 直方图诊断挑一个代表性目标像素。
+
+    优先级: 目标窗口内 selectivity 最高 → 目标 mask 内强度最高 → 全图强度最高。
+    返回 ``(y_idx, x_idx)``; 全图无正值时返回 None。
+    """
+    if target_mask_np is not None and np.any(target_mask_np):
+        if selectivity_np is not None:
+            scored = np.where(target_mask_np, selectivity_np, -1.0)
+        else:
+            scored = np.where(target_mask_np, output_intensity_np, -1.0)
+        flat_index = int(np.argmax(scored))
+        return flat_index // 64, flat_index % 64
+
+    if np.any(output_intensity_np > 0):
+        flat_index = int(np.argmax(output_intensity_np))
+        return flat_index // 64, flat_index % 64
+
+    return None
+
+
+def save_diagnostic_images(
+    coarse_depth_np: np.ndarray,
+    refined_depth_np: np.ndarray,
+    depth_residual_np: np.ndarray,
+    confidence_np: np.ndarray,
+    selectivity_np: np.ndarray | None,
+    gate_hist: torch.Tensor | None,
+    run_dir: Path,
+    *,
+    depth_vmin: float,
+    depth_vmax: float,
+    target_mask_np: np.ndarray | None,
+    peak_pixel: tuple[int, int] | None,
+) -> dict[str, str]:
+    """保存第 0 层诊断面板: 分离 coarse vs refined, 看深度高估来自哪一级。
+
+    第 6 格画一个代表性目标像素的 gate 加权 ToF 直方图, 直接看 gate 把权重
+    压在了哪个 bin (真实回波 vs 雾)。
+    """
+    image_dir = run_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    diag_path = str(image_dir / "diagnostics.png")
+
+    resid_abs = float(np.percentile(np.abs(depth_residual_np), 98))
+    resid_lim = max(resid_abs, 1.0)
+
+    fig, axes = plt.subplots(2, 3, figsize=(13, 8))
+
+    # (0,0) coarse depth: refine 前的原始深度估计
+    im = axes[0, 0].imshow(coarse_depth_np, cmap="turbo", vmin=depth_vmin, vmax=depth_vmax)
+    axes[0, 0].set_title("Coarse Depth (pre-refine)")
+    fig.colorbar(im, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+    # (0,1) refined depth: refine 后的最终输出
+    im = axes[0, 1].imshow(refined_depth_np, cmap="turbo", vmin=depth_vmin, vmax=depth_vmax)
+    axes[0, 1].set_title("Refined Depth (output)")
+    fig.colorbar(im, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+    # (0,2) depth residual = refined - coarse: refine 净修正量 (正=推高)
+    im = axes[0, 2].imshow(depth_residual_np, cmap="coolwarm", vmin=-resid_lim, vmax=resid_lim)
+    axes[0, 2].set_title("Depth Residual (refined - coarse)")
+    fig.colorbar(im, ax=axes[0, 2], fraction=0.046, pad=0.04)
+
+    # (1,0) confidence: refine 残差被它缩放
+    im = axes[1, 0].imshow(confidence_np, cmap="viridis", vmin=0.0, vmax=1.0)
+    axes[1, 0].set_title("Confidence")
+    fig.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    # (1,1) selectivity: peak_count / weight_sum, gate 选择性
+    if selectivity_np is not None:
+        im = axes[1, 1].imshow(selectivity_np, cmap="viridis", vmin=0.0, vmax=1.0)
+        axes[1, 1].set_title("Selectivity (peak/weight_sum)")
+        fig.colorbar(im, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    else:
+        axes[1, 1].set_title("Selectivity (n/a)")
+
+    for ax in axes.ravel()[:5]:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # (1,2) 目标像素的 gate 加权 ToF 直方图
+    ax_hist = axes[1, 2]
+    if gate_hist is not None and peak_pixel is not None:
+        y_idx, x_idx = peak_pixel
+        # gate_hist [B, t_max+1, H, W] → 取 batch0 该像素 → [t_max+1]
+        hist_curve = gate_hist[0, :, y_idx, x_idx].numpy()
+        bins = np.arange(hist_curve.shape[0])
+        # 跳过 bin0 (无效 ToF 占位)
+        ax_hist.bar(bins[1:], hist_curve[1:], width=1.0, color="#d6604d")
+        peak_bin = int(np.argmax(hist_curve[1:])) + 1
+        ax_hist.axvline(peak_bin, color="black", ls="--", lw=1.0, label=f"peak bin={peak_bin}")
+        ax_hist.set_title(f"Gate Hist @ pixel(y={y_idx},x={x_idx})")
+        ax_hist.set_xlabel("ToF bin")
+        ax_hist.set_ylabel("gate-weighted count")
+        ax_hist.legend(fontsize=8)
+    else:
+        ax_hist.set_title("Gate Hist (no target pixel)")
+
+    fig.tight_layout()
+    fig.savefig(diag_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return {"diagnostics_png": diag_path}
+
+
 def build_single_sample_dataset(
     cfg: SNNConfig,
     raw_path: str | Path,
@@ -271,6 +488,13 @@ def build_single_sample_dataset(
     if pages_per_group <= 0:
         raise ValueError("pages_per_group must be positive")
 
+    raw_metadata = _resolve_single_raw_metadata(
+        cfg,
+        raw_path,
+        pages_per_group=pages_per_group,
+    )
+    can_use_precomputed = bool(raw_metadata.get("precomputed_label_dir"))
+
     # 先让 Dataset 推断完整组列表, 再从中选出目标组, 避免重复实现 page 数推断逻辑。
     full_dataset = SpadRawGroupDataset(
         raw_paths=[raw_path],
@@ -282,6 +506,11 @@ def build_single_sample_dataset(
         shuffle_pages=False,
         active_point=cfg.active_point,
         cache_size=cfg.cache_size,
+        raw_load_mode=cfg.raw_load_mode,
+        raw_metadata=[raw_metadata],
+        use_precomputed_labels=cfg.use_precomputed_labels and can_use_precomputed,
+        require_precomputed_labels=cfg.require_precomputed_labels and can_use_precomputed,
+        precomputed_labels_per_class=cfg.precomputed_labels_per_class,
     )
     if group_index < 0 or group_index >= len(full_dataset.samples):
         raise IndexError(
@@ -305,7 +534,12 @@ def build_single_sample_dataset(
         shuffle_pages=False,
         active_point=cfg.active_point,
         cache_size=cfg.cache_size,
+        raw_load_mode=cfg.raw_load_mode,
+        raw_metadata=[raw_metadata],
         samples=[sample],
+        use_precomputed_labels=cfg.use_precomputed_labels and can_use_precomputed,
+        require_precomputed_labels=cfg.require_precomputed_labels and can_use_precomputed,
+        precomputed_labels_per_class=cfg.precomputed_labels_per_class,
     )
 
 
@@ -317,6 +551,8 @@ def run_single_test(
     pages_per_group: int | None = None,
     group_index: int = 0,
     save_prediction: bool = False,
+    target_window: tuple[int, int] | None = None,
+    target_min_count: int | None = None,
 ) -> dict[str, object]:
     """把一个 raw 分组送入当前配置的模型并返回基本统计。"""
     seed_everything(cfg.seed)
@@ -332,7 +568,9 @@ def run_single_test(
         pages_per_group=resolved_pages_per_group,
         group_index=group_index,
     )
-    batch = spad_time_first_collate([dataset[0]])
+    item = dataset[0]
+    batch = spad_time_first_collate([item])
+    metadata = item.get("metadata", {})
 
     device = cfg.resolved_device()
     model = cfg.build_model().to(device)
@@ -345,6 +583,15 @@ def run_single_test(
     result = model(model_input, return_sequence=False)
 
     output = result["output"].detach().cpu()
+    coarse_depth = result["depth_coarse"].detach().cpu()
+    coarse_intensity = result["intensity_coarse"].detach().cpu()
+    confidence = result["confidence"].detach().cpu()
+    support = result.get("support")
+    selectivity = result.get("selectivity")
+    support = support.detach().cpu() if support is not None else None
+    selectivity = selectivity.detach().cpu() if selectivity is not None else None
+    gate_hist = result.get("gate_hist")
+    gate_hist = gate_hist.detach().cpu() if gate_hist is not None else None
     sample = dataset.samples[0]
     raw_group = read_raw_group(
         sample.raw_path,
@@ -363,19 +610,64 @@ def run_single_test(
         active_point=cfg.active_point,
         normalize_intensity=True,
     )
+    target_label_count = None
+    target_label_normalized = None
+    target_mask_np = None
+    if target_window is not None:
+        target_active_point = int(target_min_count) if target_min_count is not None else cfg.active_point
+        target_label_count = build_histogram_max_label_from_group(
+            raw_group,
+            cfg.time_threshold,
+            active_point=target_active_point,
+            tof_window=target_window,
+        )
+        target_label_normalized = build_histogram_max_label_from_group(
+            raw_group,
+            cfg.time_threshold,
+            active_point=target_active_point,
+            normalize_intensity=True,
+            tof_window=target_window,
+        )
+        target_mask_np = _to_image_2d(target_label_count[1]) > 0
+
     depth_diff = torch.abs(output[:, 0:1] - max_label_count[0:1].unsqueeze(0))
     intensity_diff = torch.abs(output[:, 1:2] - max_label_normalized[1:2].unsqueeze(0))
+    output_depth_np = _to_image_2d(output[0, 0])
+    output_intensity_np = _to_image_2d(output[0, 1])
+    coarse_depth_np = _to_image_2d(coarse_depth[0, 0])
+    coarse_intensity_np = _to_image_2d(coarse_intensity[0, 0])
+    confidence_np = _to_image_2d(confidence[0, 0])
+    support_np = _to_image_2d(support[0, 0]) if support is not None else None
+    selectivity_np = _to_image_2d(selectivity[0, 0]) if selectivity is not None else None
+    max_depth_np = _to_image_2d(max_label_count[0])
+    max_intensity_np = _to_image_2d(max_label_normalized[1])
+    depth_residual_np = output_depth_np - coarse_depth_np
+    intensity_residual_np = output_intensity_np - coarse_intensity_np
     info: dict[str, object] = {
         "raw_path": str(Path(raw_path).resolve()),
         "pages_per_group": int(resolved_pages_per_group),
         "group_index": int(group_index),
+        "target_class": metadata.get("target_class"),
+        "fog_level": metadata.get("fog_level"),
+        "dataset_label_mode": _label_mode_from_metadata(cfg, metadata),
         "frames_shape": list(batch["frames"].shape),
         "model_input_shape": list(model_input.shape),
         "output_shape": list(output.shape),
         "depth_min": float(output[:, 0:1].min().item()),
         "depth_max": float(output[:, 0:1].max().item()),
+        "depth_mean": float(output[:, 0:1].mean().item()),
         "intensity_min": float(output[:, 1:2].min().item()),
         "intensity_max": float(output[:, 1:2].max().item()),
+        "intensity_mean": float(output[:, 1:2].mean().item()),
+        "coarse_depth_min": float(coarse_depth.min().item()),
+        "coarse_depth_max": float(coarse_depth.max().item()),
+        "coarse_depth_mean": float(coarse_depth.mean().item()),
+        "coarse_intensity_min": float(coarse_intensity.min().item()),
+        "coarse_intensity_max": float(coarse_intensity.max().item()),
+        "coarse_intensity_mean": float(coarse_intensity.mean().item()),
+        "confidence_min": float(confidence.min().item()),
+        "confidence_max": float(confidence.max().item()),
+        "confidence_mean": float(confidence.mean().item()),
         "max_method_depth_max": float(max_label_count[0:1].max().item()),
         "max_method_intensity_max": float(max_label_count[1:2].max().item()),
         "max_method_intensity_normalized_max": float(max_label_normalized[1:2].max().item()),
@@ -385,12 +677,87 @@ def run_single_test(
         "intensity_abs_diff_max": float(intensity_diff.max().item()),
         "checkpoint": cfg.checkpoint_path,
     }
+    if support is not None:
+        info.update(
+            {
+                "support_min": float(support.min().item()),
+                "support_max": float(support.max().item()),
+                "support_mean": float(support.mean().item()),
+            }
+        )
+    if selectivity is not None:
+        info.update(
+            {
+                "selectivity_min": float(selectivity.min().item()),
+                "selectivity_max": float(selectivity.max().item()),
+                "selectivity_mean": float(selectivity.mean().item()),
+            }
+        )
+    info["max_method_depth_top_bins"] = _top_depth_bins(max_depth_np)
+    info.update(_positive_counts("max_method_intensity", max_intensity_np))
+    info.update(_positive_counts("model_intensity", output_intensity_np))
+    info.update(_positive_counts("coarse_intensity", coarse_intensity_np))
+    info.update(_array_summary("refine_depth_residual", depth_residual_np))
+    info.update(_array_summary("refine_intensity_residual", intensity_residual_np))
+    if target_window is not None and target_label_count is not None and target_label_normalized is not None:
+        target_depth_np = _to_image_2d(target_label_count[0])
+        target_intensity_np = _to_image_2d(target_label_normalized[1])
+        assert target_mask_np is not None
+        info.update(
+            {
+                "target_window": [int(target_window[0]), int(target_window[1])],
+                "target_window_min_count": int(
+                    target_min_count if target_min_count is not None else cfg.active_point
+                ),
+                "target_window_pixels": int(target_mask_np.sum()),
+                "target_window_depth_max": float(target_label_count[0:1].max().item()),
+                "target_window_intensity_max": float(target_label_count[1:2].max().item()),
+                "target_window_intensity_normalized_max": float(
+                    target_label_normalized[1:2].max().item()
+                ),
+                "target_window_depth_mean_on_target": _masked_mean(target_depth_np, target_mask_np),
+                "target_window_model_depth_mean_on_target": _masked_mean(output_depth_np, target_mask_np),
+                "target_window_coarse_depth_mean_on_target": _masked_mean(coarse_depth_np, target_mask_np),
+                "target_window_model_intensity_mean_on_target": _masked_mean(
+                    output_intensity_np,
+                    target_mask_np,
+                ),
+                "target_window_coarse_intensity_mean_on_target": _masked_mean(
+                    coarse_intensity_np,
+                    target_mask_np,
+                ),
+                "target_window_confidence_mean_on_target": _masked_mean(confidence_np, target_mask_np),
+                "target_window_support_mean_on_target": (
+                    _masked_mean(support_np, target_mask_np) if support_np is not None else None
+                ),
+                "target_window_selectivity_mean_on_target": (
+                    _masked_mean(selectivity_np, target_mask_np) if selectivity_np is not None else None
+                ),
+                "target_window_depth_abs_diff_mean_on_target": _masked_abs_mean(
+                    output_depth_np,
+                    target_depth_np,
+                    target_mask_np,
+                ),
+                "target_window_coarse_depth_abs_diff_mean_on_target": _masked_abs_mean(
+                    coarse_depth_np,
+                    target_depth_np,
+                    target_mask_np,
+                ),
+                "target_window_intensity_abs_diff_mean_on_target": _masked_abs_mean(
+                    output_intensity_np,
+                    target_intensity_np,
+                    target_mask_np,
+                ),
+            }
+        )
 
     if "label" in batch:
         label = batch["label"]
         info["label_shape"] = list(label.shape)
         info["label_depth_max"] = float(label[:, 0:1].max().item())
         info["label_intensity_max"] = float(label[:, 1:2].max().item())
+        label_intensity_np = _to_image_2d(label[0, 1])
+        info.update(_positive_counts("label_intensity", label_intensity_np))
 
     if save_prediction:
         run_dir = make_log_run_dir(cfg, "test1")
@@ -403,6 +770,37 @@ def run_single_test(
             time_threshold=cfg.time_threshold,
         )
         info.update(saved_images)
+
+        # 第 0 层诊断面板: 分离 coarse vs refined 深度, 定位高估来自哪一级。
+        # 深度色阶与 save_prediction_images 一致, 便于跨图对照。
+        diag_depth_vmin, diag_depth_vmax = _valid_percentile_range(
+            np.concatenate([output_depth_np, max_depth_np], axis=0),
+            fallback_max=float(cfg.time_threshold),
+        )
+        # peak_pixel: 优先选目标窗口内 selectivity 最高的像素 (最代表"成功选中目标"),
+        # 无窗口或无 selectivity 时退回到目标 mask 质心, 再退回全图最高强度像素。
+        peak_pixel = _pick_diagnostic_pixel(
+            target_mask_np=target_mask_np,
+            selectivity_np=selectivity_np,
+            output_intensity_np=output_intensity_np,
+        )
+        if peak_pixel is not None:
+            info["diagnostic_pixel"] = [int(peak_pixel[0]), int(peak_pixel[1])]
+        diag_images = save_diagnostic_images(
+            coarse_depth_np,
+            output_depth_np,
+            depth_residual_np,
+            confidence_np,
+            selectivity_np,
+            gate_hist,
+            run_dir,
+            depth_vmin=diag_depth_vmin,
+            depth_vmax=diag_depth_vmax,
+            target_mask_np=target_mask_np,
+            peak_pixel=peak_pixel,
+        )
+        info.update(diag_images)
+
         with (run_dir / "summary.json").open("w", encoding="utf-8") as file_obj:
             json.dump(info, file_obj, indent=2, ensure_ascii=False)
         info["run_dir"] = str(run_dir)
@@ -417,6 +815,20 @@ def build_argparser() -> argparse.ArgumentParser:
     add_config_arguments(parser)
     parser.add_argument("--raw-path", required=True, help="单个 .raw 文件路径")
     parser.add_argument("--group-index", type=int, default=0, help="从 0 开始的分组索引")
+    parser.add_argument(
+        "--target-window",
+        type=int,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=None,
+        help="可选目标 ToF 闭区间, 仅用于额外 masked 诊断; 不改变全局 max-count baseline",
+    )
+    parser.add_argument(
+        "--target-min-count",
+        type=int,
+        default=None,
+        help="目标窗口诊断的最小峰值计数, 含等号; 与 i>15 对齐时传 16",
+    )
     parser.add_argument(
         "--save-prediction",
         action="store_true",
@@ -435,6 +847,8 @@ def main() -> None:
         pages_per_group=args.pages_per_group,
         group_index=args.group_index,
         save_prediction=args.save_prediction,
+        target_window=tuple(args.target_window) if args.target_window else None,
+        target_min_count=args.target_min_count,
     )
 
 
@@ -442,10 +856,13 @@ def main_without_cli() -> None:
     """无 CLI 直接运行入口; 在这里显式修改单样本测试参数。"""
     # ===== Editable parameters =====
     # checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260604_113734\\last.pth"
-    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\lif_to_plif_20260608_005836_P640_plif\\plif_stage\\best.pth"
-    raw_path = r"D:\\PYproject\\SPADdata\\0917\\2025-09-17_17-33-29_Delay-0_Width-2000.raw"  # 
-    pages_per_group = 960*2
-    group_index = 4
+    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260610_005820\\best.pth"  # 005820 154437
+    raw_path = r"D:\\PYproject\\SPADdata\\0917\\2025-09-17_17-33-26_Delay-0_Width-2000.raw"  # M
+    # raw_path = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_17-26-44_Delay-0_Width-2000.raw"  # 5
+    pages_per_group = 640
+    group_index = 71
+    target_window = None
+    target_min_count = None
     save_prediction = True
 
     # 测试输入参数显式在这里指定, 不从 checkpoint/config 继承。
@@ -526,6 +943,8 @@ def main_without_cli() -> None:
         pages_per_group=pages_per_group,
         group_index=group_index,
         save_prediction=save_prediction,
+        target_window=target_window,
+        target_min_count=target_min_count,
     )
 
 
