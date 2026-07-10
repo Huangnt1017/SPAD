@@ -112,10 +112,16 @@ class SegmentationCentroidHead(nn.Module):
         point_feats (B, C, N) + points_xyz (B, 3, N)
             ↓ seg_mlp (1x1 Conv): C → C/4 → 1
         logits (B, 1, N)
-            ↓ softmax over N (排除 padding 点可选)
+            ↓ softmax(logits / τ) over N (排除 padding 点可选)
         weights (B, 1, N)        # Σ_N w = 1, 每点目标性概率
             ↓ 加权求和: Σ_N w_i · xyz_i
         centroid (B, 3)          # 凸组合质心, 落在 [0,1]
+
+    温度 τ (可学习):
+        τ = exp(log_tau), log_tau 初始 0 (τ=1), forward 内 clamp 到 τ ∈ [0.1, 10]。
+        τ < 1 → 权重向高分点集中 (质心更锐利); τ > 1 → 权重摊平 (质心更平滑)。
+        温度只作用于 softmax 权重; 返回的 seg_logits 保持原始值,
+        供辅助分割 BCE 监督使用 (监督信号不受 τ 缩放影响)。
 
     轻量化:
         seg_mlp 为两层 1x1 Conv (C→C/4→1), C=512 时约 66K 参数,
@@ -152,6 +158,10 @@ class SegmentationCentroidHead(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Conv1d(mid_channels, 1, 1),
         )
+
+        # 可学习 softmax 温度: τ = exp(log_tau), 初始 τ = 1
+        # 让网络自适应控制权重集中程度 (锐利质心 vs 平滑质心)
+        self.log_tau = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -195,8 +205,10 @@ class SegmentationCentroidHead(nn.Module):
         if valid_mask is not None:
             seg_logits = seg_logits.masked_fill(~valid_mask.bool(), float("-inf"))
 
-        # softmax over N: 每点目标性概率, Σ_N w = 1
-        seg_weights = torch.softmax(seg_logits, dim=-1)          # (B, N)
+        # 温度缩放 softmax: τ = exp(clamp(log_tau)) ∈ [0.1, 10], 防止训练早期发散
+        # 注意 BCE 监督用原始 seg_logits, 温度只影响质心权重的集中程度
+        tau = torch.exp(self.log_tau.clamp(-2.3, 2.3))
+        seg_weights = torch.softmax(seg_logits / tau, dim=-1)    # (B, N)
 
         # 加权质心: Σ_N w_i · xyz_i
         # xyz: (B, coord_dim, N), weights: (B, 1, N) → 广播相乘 → 对 N 求和 → (B, coord_dim)

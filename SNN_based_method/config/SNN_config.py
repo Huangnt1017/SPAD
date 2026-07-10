@@ -57,7 +57,7 @@ class SNNConfig:
     skip_missing_csv_raw: bool = False
     """CSV 中 raw 文件缺失时是否跳过; 默认严格报错, 避免静默丢样本。"""
 
-    pages_per_group: int = 500
+    pages_per_group: int = 480
     """单个训练样本包含的 raw page 数, 即 ``P``。最好整除48000，例如：128，384，480，640，960，1000，1200，2400等"""
 
     total_pages: Optional[int] = None
@@ -105,7 +105,7 @@ class SNNConfig:
     tof_shift_max: int = 25
     """训练增强的最大整数 ToF 偏移; 增强后小于 1 或大于 time_threshold 的值置 0。"""
 
-    tof_shift_prob: float = 0.9
+    tof_shift_prob: float = 0.95
     """训练增强中每个样本执行 ToF 偏移的概率。"""
 
     page_dropout: bool = False
@@ -155,14 +155,23 @@ class SNNConfig:
     lut_max_norm: Optional[float] = None
 
     # ---- 网络 ----
-    model_backend: str = "frame_photon"
-    """模型后端: ``new`` 为 SNN, ``ann``/``ann_gate`` 为非脉冲 ANN gate baseline, ``frame_photon`` 为全量时间压缩 ANN, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
+    model_backend: str = "flow"
+    """模型后端: ``new`` 为 SNN, ``flow`` 为跨帧流式因果 SNN (GroupNorm, 严格因果), ``ann``/``ann_gate`` 为非脉冲 ANN gate baseline, ``frame_photon`` 为全量时间压缩 ANN, ``rnn``/``lstm``/``gru`` 为显式时序递推版本。"""
 
-    C: int = 32  # 隐含层通道数,STEM的输出
+    C: int = 16  # 隐含层通道数,STEM的输出
     chunk_size: int = 128  # 分页处理时的页数
     spike_mode: str = "plif"
+    """脉冲神经元类型: ``if`` / ``lif`` / ``plif`` / ``plif_mt``。
+
+    ``plif_mt`` 为 per-channel 多时间尺度 PLIF (死结 1 修复之一): 各通道 tau 在
+    [spike_tau, spike_tau_max] 上对数均匀初始化, 让部分通道能积累数百页的样本级
+    统计 (标量 tau=1.5 的膜电位记忆只有 1-2 页)。仅支持 torch 后端。"""
+
     spike_tau: float = 1.5
-    """LIF/PLIF 膜时间常数; IF 模式下忽略。"""
+    """LIF/PLIF 膜时间常数; IF 模式下忽略; plif_mt 模式下作为 tau 下界。"""
+
+    spike_tau_max: float = 128.0
+    """仅 spike_mode=plif_mt 生效: per-channel tau 初始化的上界 (页数量级)。"""
 
     spike_v_threshold: float = 0.8
     """脉冲发放阈值。"""
@@ -171,15 +180,54 @@ class SNNConfig:
     """脉冲重置电位; ``None`` 表示 soft reset。"""
 
     spike_backend: str = "cupy"
-    """spikingjelly 神经元后端: ``auto`` 优先 cupy, 也可显式 ``cupy``/``torch``。"""
+    """spikingjelly 神经元后端: ``auto`` 优先 cupy, 也可显式 ``cupy``/``torch``。
+    spike_mode=plif_mt 时节点内部强制 torch (cupy kernel 不支持 per-channel tau)。"""
 
     num_blocks: int = 1
     refine_mid: int = 8
     depth_peak_half_width: int = 2
+    depth_softargmax_sharpness: float = 8.0
+    """gated-moment 深度路径的温度 softargmax 锐度 (死结 2 修复)。
+
+    >0 时深度质心对**全部** bin 可微, 梯度不再只流进当前 argmax 峰 ±half_width
+    邻域 (浓雾下=雾峰, 目标 bin 光子拿不到梯度 → loss 平在退化解)。
+    0 表示回退旧 hard argmax + 局部质心口径 (仅用于复现旧实验)。"""
+
     refine_max_depth_delta: float = 0.10
     refine_max_intensity_blend: float = 1.0
+    flow_state_detach_interval: int = 0
+    """仅 model_backend=flow 生效。流式累积量每隔多少个 chunk 截断一次梯度 (TBPTT)。
+    0 表示与父类 forward 等价 (仅 detach 膜电位, 保留累积量加法链)。"""
+
+    flow_use_stream_context: bool = True
+    """仅 flow 生效 (死结 1 修复之一): 把 raw 直方图 running 统计 (雾峰位置/密度/
+    谷后占比/集中度) 作为 4 个额外输入通道逐 chunk 注入 stem。严格因果 (只用当前
+    chunk 之前的页), 无梯度 (不延长 BPTT 链)。"""
+
+    flow_use_valley_hump: bool = True
+    """仅 flow 生效: 用谷后 hump 物理检测头替代 gated-moment 输出口径。"""
+
+    flow_valley_spatial_pool: int = 5
+    """谷后 hump 头的空间聚合核 (奇数); 目标成片、雾随机, 池化提目标 SNR。"""
+
+    flow_valley_offset_min: float = 3.0
+    """谷偏移下界 (bin), 防止谷位塌缩回雾峰 (P1)。"""
+
+    flow_valley_offset_max: float = 40.0
+    """谷偏移上界 (bin), 防止谷位越过目标窗 (P1)。"""
+
+    flow_valley_offset_init: float = 11.0
+    """谷偏移初值 (bin), 探针实测的物理初始化: 谷 ≈ 雾峰 + 11。"""
+
+    flow_valley_gate_beta_init: float = 2.0
+    """软谷门陡度初值 (可学习, softplus 保正)。v1 的 1.0 太软: 谷后 5 bin 内
+    雾尾还有 0.5+ 权重, 雾尾高于 hump 时会抢质心 (P1)。"""
+
+    flow_valley_hump_window: float = 48.0
+    """谷后搜峰窗口长度 (bin): 窗外远尾不参与质心, 消除平坦尾部拉偏 (P1)。"""
+
     return_sequence: bool = True
-    """是否返回完整 gate/tof/valid 时间序列; 训练 var/sparse loss 时需要开启。"""
+    """是否返回完整 gate/tof/valid 时间序列; 训练 var/sparse/gate_bce loss 时需要开启。"""
 
     # ---- 损失权重 ----
     w_gt: float = 0.55
@@ -190,18 +238,34 @@ class SNNConfig:
     小约一个量级, 绝对深度精度几乎不进梯度预算, 导致深度图整体偏高且发平。"""
 
     w_ssim: float = 0.25
-    w_var: float = 0.5
-    """提高到 0.5 (原 0.2): 配合 GatedMomentVarianceLoss 改用 GT 深度作中心后,
-    强化 gate 围绕真实回波峰值收窄的压力, 逼出 gate 选择性 (压制雾光子)。"""
-    w_sparse: float = 0.03
+    w_var: float = 0.0
+    """关到 0 (原 0.5): valley_hump 头改在累积后的直方图上做"雾峰→软谷→谷后质心"
+    选择, 逐光子 gate 退化为"全开粗加权"(gate_hist ≈ 原始直方图, 正是 valley_hump
+    的工作前提)。GatedMomentVarianceLoss 逼 gate 做单光子选择, 在 fog>=2 已证不可能
+    (目标每像素 1-2 光子 vs 雾 33), 且会把 gate 压乱、破坏粗加权, 与新头目标冲突。"""
+    w_sparse: float = 0.0
     w_smooth: float = 0.03
     w_coarse: float = 0.20
+    w_gate_bce: float = 0.5
+    """光子级 gate BCE 直接监督权重 (死结 1/P3-A)。
+
+    用 label depth 构造逐光子伪标签 (|tof − d_gt| ≤ gate_bce_bin_radius 的前景
+    光子为正类), 直接给 gate 稠密梯度 —— 不再依赖 30:1 雾/目标质量比下近乎为零
+    的矩比值梯度。gate 由此学会真选择性, 谷后 hump 的信噪比随之提升。
+    需要 return_sequence=True。"""
+
     w_lut_smooth: float = 0.01
     w_lut_norm: float = 0.005
 
     # ---- 损失超参数 ----
     sigma_target: float = 4.0
     rho_target: float = 0.08
+    gate_bce_bin_radius: float = 4.0
+    """光子伪标签正类窗口半径 (ToF bin); 目标回波 FWHM ~4 bin。"""
+
+    gate_bce_pos_weight: float = 0.0
+    """光子 BCE 正类权重; <=0 表示按 batch 内 neg/pos 自动配平 (clamp [1,50])。"""
+
     sparse_mode: str = "band"
     """gate 稀疏正则模式: upper=旧单边阈值, target=贴近目标率, band=保持在区间内。"""
 
@@ -300,6 +364,14 @@ class SNNConfig:
             self.model_backend = "lstm"
         elif backend in {"cgru", "convgru"}:
             self.model_backend = "gru"
+        elif backend in {"flow", "stream", "streaming", "snn_flow", "snn-flow"}:
+            self.model_backend = "flow"
+
+        # flow backend 的容量重心在 backbone (重分配后 blocks 占比最大),
+        # 故其有效默认 num_blocks=2。仅当仍为全局默认值 1 时提升, 不覆盖显式设置,
+        # 也不影响其它 backend。
+        if self.model_backend == "flow" and int(self.num_blocks) == 1:
+            self.num_blocks = 2
 
         self.raw_load_mode = str(self.raw_load_mode).lower()
         if self.raw_load_mode not in {"group", "file_cache"}:
@@ -319,17 +391,62 @@ class SNNConfig:
         if self.spike_backend not in {"auto", "cupy", "torch"}:
             raise ValueError("spike_backend must be 'auto', 'cupy' or 'torch'")
         self.spike_mode = str(self.spike_mode).lower()
-        if self.spike_mode not in {"plif", "lif", "if"}:
-            raise ValueError("spike_mode must be 'plif', 'lif' or 'if'")
+        if self.spike_mode not in {"plif", "plif_mt", "lif", "if"}:
+            raise ValueError("spike_mode must be 'plif', 'plif_mt', 'lif' or 'if'")
         if self.spike_tau <= 0:
             raise ValueError("spike_tau must be positive")
-        if self.spike_mode == "plif" and self.spike_tau <= 1.0:
+        if self.spike_mode in {"plif", "plif_mt"} and self.spike_tau <= 1.0:
             raise ValueError("PLIF 要求 spike_tau > 1.0")
+        self.spike_tau_max = float(self.spike_tau_max)
+        if self.spike_mode == "plif_mt" and self.spike_tau_max <= self.spike_tau:
+            raise ValueError(
+                "spike_mode='plif_mt' requires spike_tau_max > spike_tau, got "
+                f"spike_tau_max={self.spike_tau_max}, spike_tau={self.spike_tau}"
+            )
         self.spike_v_threshold = float(self.spike_v_threshold)
         if self.spike_v_threshold <= 0:
             raise ValueError("spike_v_threshold must be positive")
         if self.spike_v_reset is not None:
             self.spike_v_reset = float(self.spike_v_reset)
+
+        self.depth_softargmax_sharpness = float(self.depth_softargmax_sharpness)
+        if self.depth_softargmax_sharpness < 0:
+            raise ValueError("depth_softargmax_sharpness must be non-negative")
+
+        self.flow_valley_spatial_pool = int(self.flow_valley_spatial_pool)
+        if self.flow_valley_spatial_pool <= 0 or self.flow_valley_spatial_pool % 2 == 0:
+            raise ValueError(
+                "flow_valley_spatial_pool must be a positive odd integer, got "
+                f"{self.flow_valley_spatial_pool}"
+            )
+        self.flow_valley_offset_min = float(self.flow_valley_offset_min)
+        self.flow_valley_offset_max = float(self.flow_valley_offset_max)
+        self.flow_valley_offset_init = float(self.flow_valley_offset_init)
+        if not (
+            0
+            < self.flow_valley_offset_min
+            < self.flow_valley_offset_init
+            < self.flow_valley_offset_max
+        ):
+            raise ValueError(
+                "valley offset bounds must satisfy 0 < min < init < max, got "
+                f"min={self.flow_valley_offset_min}, "
+                f"init={self.flow_valley_offset_init}, "
+                f"max={self.flow_valley_offset_max}"
+            )
+        self.flow_valley_gate_beta_init = float(self.flow_valley_gate_beta_init)
+        if self.flow_valley_gate_beta_init <= 0:
+            raise ValueError("flow_valley_gate_beta_init must be positive")
+        self.flow_valley_hump_window = float(self.flow_valley_hump_window)
+        if self.flow_valley_hump_window <= 0:
+            raise ValueError("flow_valley_hump_window must be positive")
+
+        self.w_gate_bce = float(self.w_gate_bce)
+        if self.w_gate_bce < 0:
+            raise ValueError("w_gate_bce must be non-negative")
+        self.gate_bce_bin_radius = float(self.gate_bce_bin_radius)
+        if self.gate_bce_bin_radius <= 0:
+            raise ValueError("gate_bce_bin_radius must be positive")
 
         self.sparse_mode = str(self.sparse_mode).lower()
         if self.sparse_mode not in {"upper", "target", "band"}:
@@ -400,10 +517,12 @@ class SNNConfig:
             from SNN_based_method.model.ANN_gated_moment import ANNGatedMomentNet as SPADSpikeNet
         elif backend in {"frame_photon", "frame-photon", "framephoton"}:
             from SNN_based_method.model.frame_photon import FramePhotonNet as SPADSpikeNet
+        elif backend == "flow":
+            from SNN_based_method.model.SNN_flow import SNNFlowNet as SPADSpikeNet
         else:
-            raise ValueError("model_backend must be 'new'/'activation_based'/'ann'/'ann_gate'/'frame_photon'/'rnn'/'lstm'/'gru'")
+            raise ValueError("model_backend must be 'new'/'activation_based'/'ann'/'ann_gate'/'frame_photon'/'flow'/'rnn'/'lstm'/'gru'")
 
-        return SPADSpikeNet(
+        model_kwargs = dict(
             C=self.C,
             chunk_size=self.chunk_size,
             spike_mode=self.spike_mode,
@@ -423,6 +542,23 @@ class SNNConfig:
             refine_max_intensity_blend=self.refine_max_intensity_blend,
             return_sequence=self.return_sequence,
         )
+        # 新增参数只传给接受它们的后端 (rnn/lstm/gru/ann_gate/frame_photon 构造
+        # 函数没有这些形参, 传入会报错; 它们经 _finalize_gated_peak_maps 的默认值
+        # 一样获得 softargmax 修复)。
+        if backend in {"new", "legacy", "clock", "clock_driven", "activation", "activation_based", "flow"}:
+            model_kwargs["spike_tau_max"] = self.spike_tau_max
+            model_kwargs["depth_softargmax_sharpness"] = self.depth_softargmax_sharpness
+        if backend == "flow":
+            model_kwargs["state_detach_interval"] = self.flow_state_detach_interval
+            model_kwargs["use_stream_context"] = self.flow_use_stream_context
+            model_kwargs["use_valley_hump"] = self.flow_use_valley_hump
+            model_kwargs["valley_spatial_pool"] = self.flow_valley_spatial_pool
+            model_kwargs["valley_offset_min"] = self.flow_valley_offset_min
+            model_kwargs["valley_offset_max"] = self.flow_valley_offset_max
+            model_kwargs["valley_offset_init"] = self.flow_valley_offset_init
+            model_kwargs["valley_gate_beta_init"] = self.flow_valley_gate_beta_init
+            model_kwargs["valley_hump_window"] = self.flow_valley_hump_window
+        return SPADSpikeNet(**model_kwargs)
 
     def build_loss(self) -> torch.nn.Module:
         """构建标准 SNN 成像损失。"""
@@ -436,6 +572,7 @@ class SNNConfig:
             w_sparse=self.w_sparse,
             w_smooth=self.w_smooth,
             w_coarse=self.w_coarse,
+            w_gate_bce=self.w_gate_bce,
             w_lut_smooth=self.w_lut_smooth,
             w_lut_norm=self.w_lut_norm,
             sigma_target=self.sigma_target,
@@ -443,6 +580,8 @@ class SNNConfig:
             sparse_mode=self.sparse_mode,
             rho_min=self.rho_min,
             rho_max=self.rho_max,
+            gate_bce_bin_radius=self.gate_bce_bin_radius,
+            gate_bce_pos_weight=self.gate_bce_pos_weight,
             beta_smooth=self.beta_smooth,
             ssim_kernel_size=self.ssim_kernel_size,
             ssim_smooth_kernel_size=self.ssim_smooth_kernel_size,
@@ -616,22 +755,37 @@ class SNNConfig:
             f"  model_backend={self.model_backend}, encoding={self.encoding_mode}, "
             f"C_enc={self.C_enc}, C={self.C}, chunk_size={self.chunk_size}, "
             f"spike_mode={self.spike_mode}, spike_tau={self.spike_tau}, "
+            f"spike_tau_max={self.spike_tau_max}, "
             f"spike_v_threshold={self.spike_v_threshold}, spike_v_reset={self.spike_v_reset}, "
             f"spike_backend={self.spike_backend}, refine_mid={self.refine_mid}, "
             f"depth_peak_half_width={self.depth_peak_half_width}, "
+            f"depth_softargmax_sharpness={self.depth_softargmax_sharpness}, "
             f"refine_max_depth_delta={self.refine_max_depth_delta}, "
             f"refine_max_intensity_blend={self.refine_max_intensity_blend}, "
             f"return_sequence={self.return_sequence}"
         )
+        if self.model_backend == "flow":
+            lines.append(
+                f"  flow: use_stream_context={self.flow_use_stream_context}, "
+                f"use_valley_hump={self.flow_use_valley_hump}, "
+                f"valley_spatial_pool={self.flow_valley_spatial_pool}, "
+                f"valley_offset=[{self.flow_valley_offset_min}, "
+                f"{self.flow_valley_offset_init}, {self.flow_valley_offset_max}], "
+                f"valley_gate_beta_init={self.flow_valley_gate_beta_init}, "
+                f"valley_hump_window={self.flow_valley_hump_window}, "
+                f"state_detach_interval={self.flow_state_detach_interval}"
+            )
         lines.append(
             f"  loss_weights: gt={self.w_gt}, depth_reg={self.w_depth_reg}, ssim={self.w_ssim}, "
             f"var={self.w_var}, sparse={self.w_sparse}, smooth={self.w_smooth}, "
-            f"coarse={self.w_coarse}"
+            f"coarse={self.w_coarse}, gate_bce={self.w_gate_bce}"
         )
         lines.append(
             f"  loss_params: depth_reg_mode={self.depth_reg_mode}, "
             f"depth_reg_use_mask={self.depth_reg_use_mask}, sparse_mode={self.sparse_mode}, "
             f"rho_target={self.rho_target}, rho_min={self.rho_min}, rho_max={self.rho_max}, "
+            f"gate_bce_bin_radius={self.gate_bce_bin_radius}, "
+            f"gate_bce_pos_weight={self.gate_bce_pos_weight}, "
             f"intensity_use_mask={self.intensity_use_mask}, "
             f"intensity_pos_weight={self.intensity_pos_weight}, "
             f"intensity_bg_weight={self.intensity_bg_weight}"

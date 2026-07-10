@@ -30,6 +30,7 @@ def save_checkpoint(
     best_val_score: Optional[float] = None,
     best_val_metrics: Optional[Mapping[str, float]] = None,
     score_config: Optional[Mapping[str, float]] = None,
+    extra_state: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """保存完整训练状态到 checkpoint 文件。
 
@@ -49,6 +50,8 @@ def save_checkpoint(
         best_val_score: 可选。历史最佳组合评分；None 时兼容旧的 Top-1 选模口径。
         best_val_metrics: 可选。刷新最佳组合评分时对应的验证指标快照。
         score_config: 可选。组合评分配置，便于复现实验口径。
+        extra_state: 可选。额外状态字典 (如 EMA 权重), 逐键合并进 payload 顶层;
+            与内置键冲突时以内置键为准 (extra_state 不允许覆盖核心训练状态)。
 
     Returns:
         None
@@ -67,6 +70,10 @@ def save_checkpoint(
     }
     if criterion is not None:
         payload["criterion_state_dict"] = criterion.state_dict()
+    if extra_state:
+        for key, value in extra_state.items():
+            # 内置键优先: extra_state 只补充新键 (如 ema_state_dict), 不覆盖核心状态
+            payload.setdefault(str(key), value)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 

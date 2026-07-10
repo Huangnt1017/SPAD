@@ -856,7 +856,7 @@ def main_without_cli() -> None:
     """无 CLI 直接运行入口; 在这里显式修改单样本测试参数。"""
     # ===== Editable parameters =====
     # checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260604_113734\\last.pth"
-    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260610_005820\\best.pth"  # 005820 154437
+    checkpoint_path = r"D:\\PYproject\\SPAD\\checkpoints\\SNN\\train_20260611_011445\\best.pth"  # 005820 154437 
     raw_path = r"D:\\PYproject\\SPADdata\\0917\\2025-09-17_17-33-26_Delay-0_Width-2000.raw"  # M
     # raw_path = r"D:\\PYproject\\SPADdata\\0826\\2025-08-26_17-26-44_Delay-0_Width-2000.raw"  # 5
     pages_per_group = 640

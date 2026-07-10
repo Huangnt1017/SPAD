@@ -251,6 +251,89 @@ class GatedMomentVarianceLoss(nn.Module):
         return excess.mean()
 
 
+class GatePhotonSupervisionLoss(nn.Module):
+    """光子级 gate 直接监督 (死结 1/P3-A): 给每个光子一个可达成的二分类目标。
+
+    动机: gated-moment 路径里, gate 的梯度要经过 ``Σ(g·t)/Σ(g)`` 的比值估计器
+    间接传播 —— 浓雾下雾光子质量是目标的 ~30 倍, 均匀调 gate 不改变比值,
+    梯度近乎为零, gate 必然塌到"全开"平凡解。本 loss 用 label depth 构造
+    **逐光子伪标签**直接监督 gate:
+
+        正类: 前景像素 (d_gt > 0) 内 |tof − d_gt| ≤ bin_radius 的有效光子
+        负类: 其余全部有效光子 (前景远 bin + 背景全部)
+
+    这给出稠密、逐光子的 BCE 梯度, 不再依赖 30:1 的矩比值传播; 且伪标签随
+    ToF-shift 增强同步平移 (label depth 通道会同步 shift), 不破坏增强一致性。
+
+    类不平衡: 正类光子占比 ~1/30, ``pos_weight <= 0`` 时按 batch 内
+    neg/pos 计数自动配平 (clamp 到 [1, 50] 防极端 batch 爆权重)。
+
+    Args:
+        bin_radius: 伪标签正类窗口半径 (ToF bin)。目标回波 FWHM ~4 bin。
+        pos_weight: 正类 BCE 权重; <=0 表示按 batch 自动 neg/pos 配平。
+    """
+
+    def __init__(self, bin_radius: float = 4.0, pos_weight: float = 0.0):
+        super().__init__()
+        self.bin_radius = float(bin_radius)
+        if self.bin_radius <= 0:
+            raise ValueError(f"bin_radius must be positive, got {bin_radius}")
+        self.pos_weight = float(pos_weight)
+        self.eps = 1e-6
+
+    def forward(
+        self, result: dict, gt: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Args:
+            result: 模型输出 dict, 需含 gate [P,B,1,H,W] / tof [P,B,H,W] / valid [P,B,H,W]。
+            gt: [B, 2, H, W], ch0 = depth (ToF bin 量纲), 背景为 0。
+
+        Returns:
+            (loss 标量, 诊断 dict): 诊断含 pos_gate/neg_gate 平均激活与正类占比。
+        """
+        gate = result["gate"].squeeze(2)                 # [P, B, H, W]
+        tof = result["tof"]                              # [P, B, H, W]
+        valid = result["valid"]                          # [P, B, H, W]
+
+        d_gt = gt[:, 0:1]                                # [B, 1, H, W]
+        # [B, 1, H, W] → [1, B, H, W] 与光子序列广播
+        center = d_gt.squeeze(1).unsqueeze(0)
+        fg = (center > 0).to(gate.dtype)                 # 前景像素 mask
+
+        valid_mask = (valid > 0).to(gate.dtype)
+        pos_mask = (
+            ((tof - center).abs() <= self.bin_radius).to(gate.dtype) * fg * valid_mask
+        )
+        neg_mask = valid_mask * (1.0 - pos_mask)
+
+        pos_count = pos_mask.sum()
+        neg_count = neg_mask.sum()
+        if self.pos_weight > 0:
+            pos_weight = torch.as_tensor(
+                self.pos_weight, dtype=gate.dtype, device=gate.device
+            )
+        else:
+            # 自动配平: 正类稀缺 (浓雾 ~1:30), clamp 防极端 batch 爆权重。
+            pos_weight = (neg_count / pos_count.clamp(min=1.0)).clamp(1.0, 50.0)
+
+        gate_clamped = gate.clamp(self.eps, 1.0 - self.eps)
+        bce = -(
+            pos_weight * pos_mask * torch.log(gate_clamped)
+            + neg_mask * torch.log(1.0 - gate_clamped)
+        )
+        normalizer = (pos_weight * pos_count + neg_count).clamp(min=1.0)
+        loss = bce.sum() / normalizer
+
+        with torch.no_grad():
+            diagnostics = {
+                "gate_pos_rate": (gate * pos_mask).sum() / pos_count.clamp(min=1.0),
+                "gate_neg_rate": (gate * neg_mask).sum() / neg_count.clamp(min=1.0),
+                "gate_pos_frac": pos_count / (pos_count + neg_count).clamp(min=1.0),
+            }
+        return loss, diagnostics
+
+
 class SpikeSparsityLoss(nn.Module):
     """约束 gate 平均激活率, 避免单边阈值项过早失去梯度。"""
 
@@ -443,7 +526,7 @@ class SPADImagingLoss(nn.Module):
 
     L = w_gt * L_GT + w_depth_reg * L_depth_reg + w_ssim * L_SSIM
         + w_var * L_var + w_sparse * L_sparse + w_smooth * L_smooth
-        + w_coarse * L_coarse_aux
+        + w_coarse * L_coarse_aux + w_gate_bce * L_gate_bce
         [+ w_lut_smooth * L_lut_smooth + w_lut_norm * L_lut_norm]   (仅 LUT 编码模式)
 
     Args:
@@ -453,10 +536,13 @@ class SPADImagingLoss(nn.Module):
         w_var: gate 方差 loss 权重
         w_sparse: gate 稀疏性 loss 权重
         w_smooth: 平滑 loss 权重
+        w_gate_bce: 光子级 gate BCE 直接监督权重 (死结 1/P3-A)
         w_lut_smooth: LUT 相邻 bin 平滑正则权重 (仅 encoding_mode="lut" 时生效)
         w_lut_norm: LUT 范数一致性正则权重 (仅 encoding_mode="lut" 时生效)
         sigma_target: 方差 loss 中目标 sigma (bin 单位)
         rho_target: 稀疏 loss 中目标激活率
+        gate_bce_bin_radius: 光子伪标签正类窗口半径 (ToF bin)
+        gate_bce_pos_weight: 光子 BCE 正类权重; <=0 表示 batch 内自动配平
         beta_smooth: 平滑 loss 的边缘衰减系数
         ssim_kernel_size: SSIM 高斯窗口大小
         depth_range: depth 动态范围, 用于 SSIM 计算
@@ -472,6 +558,7 @@ class SPADImagingLoss(nn.Module):
         w_sparse=0.01,
         w_smooth=0.02,
         w_coarse=0.20,
+        w_gate_bce=0.0,
         w_lut_smooth=0.01,
         w_lut_norm=0.005,
         sigma_target=4.0,
@@ -479,6 +566,8 @@ class SPADImagingLoss(nn.Module):
         sparse_mode="band",
         rho_min=0.03,
         rho_max=0.12,
+        gate_bce_bin_radius=4.0,
+        gate_bce_pos_weight=0.0,
         beta_smooth=5.0,
         ssim_kernel_size=7,
         ssim_smooth_kernel_size=3,
@@ -503,6 +592,9 @@ class SPADImagingLoss(nn.Module):
         self.w_coarse = float(w_coarse)
         if self.w_coarse < 0:
             raise ValueError("w_coarse must be non-negative")
+        self.w_gate_bce = float(w_gate_bce)
+        if self.w_gate_bce < 0:
+            raise ValueError("w_gate_bce must be non-negative")
         self.w_lut_smooth = w_lut_smooth
         self.w_lut_norm = w_lut_norm
 
@@ -537,6 +629,10 @@ class SPADImagingLoss(nn.Module):
             mode=sparse_mode,
             rho_min=rho_min,
             rho_max=rho_max,
+        )
+        self.gate_bce_loss = GatePhotonSupervisionLoss(
+            bin_radius=gate_bce_bin_radius,
+            pos_weight=gate_bce_pos_weight,
         )
         self.smooth_loss = IntensityAwareSmoothnessLoss(
             beta=beta_smooth,
@@ -623,6 +719,26 @@ class SPADImagingLoss(nn.Module):
             total = total + self.w_sparse * l_sparse
         elif self.w_sparse > 0:
             losses["sparse_skipped"] = 1.0
+
+        # 光子级 gate 直接监督 (死结 1/P3-A): 需要完整 gate/tof/valid 序列和 GT。
+        if self.w_gate_bce > 0 and has_sequence and gt is not None:
+            l_gate_bce, gate_bce_stats = self.gate_bce_loss(result, gt)
+            losses["gate_bce"] = l_gate_bce.detach()
+            losses["weighted_gate_bce"] = (self.w_gate_bce * l_gate_bce).detach()
+            for stat_name, stat_value in gate_bce_stats.items():
+                losses[stat_name] = stat_value.detach()
+            total = total + self.w_gate_bce * l_gate_bce
+        elif self.w_gate_bce > 0:
+            losses["gate_bce_skipped"] = 1.0
+
+        # valley_hump 诊断统计透出 (P1): 不参与梯度, 仅进训练日志观察谷位漂移。
+        valley_stats = result.get("valley_stats")
+        if isinstance(valley_stats, dict):
+            for stat_name, stat_value in valley_stats.items():
+                if isinstance(stat_value, torch.Tensor):
+                    losses[f"vh_{stat_name}"] = stat_value.detach()
+                else:
+                    losses[f"vh_{stat_name}"] = float(stat_value)
 
         if self.w_smooth > 0:
             l_smooth = self.smooth_loss(result)

@@ -1,4 +1,5 @@
 import argparse
+import copy
 import importlib.util
 import json
 import logging
@@ -78,6 +79,57 @@ def reset_spikingjelly_state(model: nn.Module) -> None:
 			reset = getattr(module, "reset", None)
 			if callable(reset):
 				reset()
+
+
+class ModelEma:
+	"""模型权重指数滑动平均 (EMA), 用于压制 best-checkpoint 选点噪声。
+
+	维护一份影子权重: shadow = d · shadow + (1-d) · param。
+	验证时评估影子模型, val 指标逐 epoch 波动显著减小, 综合分选点更稳。
+
+	实现要点:
+	- 前 ~10/(1-d) 步用 timm 风格暖启动 d_t = min(decay, (1+t)/(10+t)),
+	  避免初始随机权重长期拖累影子模型。
+	- 浮点 tensor (参数 + BN running_mean/var) 做 EMA;
+	  整型 buffer (如 num_batches_tracked) 直接拷贝。
+
+	Args:
+		model: 被跟踪的训练模型。
+		decay: EMA 衰减系数 (0 < decay < 1), 典型 0.999。
+	"""
+
+	def __init__(self, model: nn.Module, decay: float = 0.999):
+		if not (0.0 < decay < 1.0):
+			raise ValueError(f"ema decay must be in (0, 1), got {decay}")
+		self.decay = float(decay)
+		self.updates = 0
+		# 深拷贝一份影子模型: 不参与反传, 常驻 eval 模式
+		self.module = copy.deepcopy(model)
+		self.module.eval()
+		for param in self.module.parameters():
+			param.requires_grad_(False)
+
+	@torch.no_grad()
+	def update(self, model: nn.Module) -> None:
+		"""每个 optimizer step 后调用, 按暖启动衰减更新影子权重。"""
+		self.updates += 1
+		decay = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
+		ema_state = self.module.state_dict()
+		for key, value in model.state_dict().items():
+			ema_value = ema_state[key]
+			if ema_value.dtype.is_floating_point:
+				ema_value.mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+			else:
+				ema_value.copy_(value)
+
+	def state_dict(self) -> Dict[str, Any]:
+		"""导出影子权重与步数计数, 用于断点续训。"""
+		return {"module": self.module.state_dict(), "updates": self.updates}
+
+	def load_state_dict(self, state: Mapping[str, Any]) -> None:
+		"""从 checkpoint 恢复影子权重与步数计数。"""
+		self.module.load_state_dict(state["module"])
+		self.updates = int(state.get("updates", 0))
 
 
 def resolve_path(path_str: str, base_dir: Path) -> Path:
@@ -163,7 +215,7 @@ def build_model(model_name: str, num_classes: int, project_root: Path, args: Opt
 	"""按名称构建分类+框回归模型。
 
 	Args:
-		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointmlpelite/spt/3detr/pointrwkv/pointbert/pointmae/upp/graph_residual/graph_residual_gcn。
+		model_name: 模型名称，支持 dgcnn/pointnet/pointnet2/pointnet2msg/pointtransformer/pointtransv2/pointtransv3/pointmlp/pointmlpelite/spt/3detr/pointrwkv/pointbert/pointmae/upp/graph_residual/graph_residual_gcn/graph_residual_gcn_lite。
 		num_classes: 分类类别数。
 		project_root: 项目根目录。
 
@@ -260,18 +312,33 @@ def build_model(model_name: str, num_classes: int, project_root: Path, args: Opt
 
 	# === Graph Residual (本课题自研, model/readme.md 任务 1) ===
 	# 模型文件不在 baseline/ 而在 model/, 走 load_module_from_file 同样加载。
+	# box 头二选一 (args.box_head): centroid=分割引导质心头 (默认, 自研创新点);
+	# mlp=统一 MLP 回归头 (与 baseline 一致, 用于消融定位 head vs backbone 贡献)。
+	use_centroid_head = getattr(args, "box_head", "centroid") == "centroid"
 	if name == "graph_residual":
 		model_module = load_module_from_file(
 			project_root / "model" / "graph_residual.py", "model_graph_residual"
 		)
-		return model_module.GraphResidualMultiTaskNet(num_classes=num_classes)
+		return model_module.GraphResidualMultiTaskNet(
+			num_classes=num_classes, seg_centroid_box=use_centroid_head,
+		)
 
 	# === Graph Residual GCN (PyG SAGEConv 版, model/graph_res_GCN.py) ===
 	if name == "graph_residual_gcn":
 		model_module = load_module_from_file(
 			project_root / "model" / "graph_res_GCN.py", "model_graph_res_gcn"
 		)
-		return model_module.GraphResidualMultiTaskNetGCN(num_classes=num_classes)
+		return model_module.GraphResidualMultiTaskNetGCN(
+			num_classes=num_classes, seg_centroid_box=use_centroid_head,
+		)
+
+	if name == "graph_residual_gcn_lite":
+		model_module = load_module_from_file(
+			project_root / "model" / "graph_res_GCN.py", "model_graph_res_gcn"
+		)
+		return model_module.GraphResidualMultiTaskNetGCNLite(
+			num_classes=num_classes, seg_centroid_box=use_centroid_head,
+		)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -284,7 +351,7 @@ def merge_resume_model_args(args: argparse.Namespace, checkpoint: Mapping[str, A
 
 	merged = vars(args).copy()
 	for key, value in ckpt_args.items():
-		if key == "model" or key == "num_points" or key.startswith("spt_"):
+		if key == "model" or key == "num_points" or key == "box_head" or key.startswith("spt_"):
 			merged[key] = value
 	if merged.get("model") == "spt" and "spt_use_moe_lif" not in ckpt_args:
 		state_dict = checkpoint.get("model_state_dict", {})
@@ -441,6 +508,7 @@ def run_epoch(
 	optimizer: Optional[optim.Optimizer] = None,
 	scaler: Optional[torch.amp.GradScaler] = None,
 	use_amp: bool = False,
+	ema: Optional[ModelEma] = None,
 ) -> Dict[str, float]:
 	"""执行单个 epoch 的训练或验证。
 
@@ -452,6 +520,7 @@ def run_epoch(
 		epoch: 当前 epoch 序号。
 		phase: 阶段名（Train/Val）。
 		optimizer: 训练时提供；验证时为 None。
+		ema: 可选。EMA 跟踪器；训练阶段每个 optimizer step 后更新影子权重。
 
 	Returns:
 		包含 loss/top1/top3 与 box 指标的聚合字典。
@@ -467,6 +536,7 @@ def run_epoch(
 	total_loss = torch.zeros((), device=device)
 	total_box_depth = torch.zeros((), device=device)
 	total_box_z_mae = torch.zeros((), device=device)
+	total_seg_loss = torch.zeros((), device=device)
 	correct_top1 = torch.zeros((), device=device, dtype=torch.long)
 	correct_top3 = torch.zeros((), device=device, dtype=torch.long)
 	total_samples = 0
@@ -543,11 +613,13 @@ def run_epoch(
 				model_outputs = model(inputs)
 				logits, box_preds = split_cls_and_box_predictions(model_outputs)
 
-				# 多任务损失内部会分别计算分类损失、box L1 损失和 z-MAE 深度误差，并汇总成 total_loss。
+				# 多任务损失内部会分别计算分类损失、Soft-histogram 深度损失和可选的
+				# 辅助分割 BCE (points 用于计算逐点 in-box 标签)，并汇总成 total_loss。
 				loss_dict = criterion(
 					model_outputs=model_outputs,
 					cls_targets=labels,
 					box_targets=box_targets,
+					points=inputs,
 				)
 			loss = loss_dict["total_loss"]
 
@@ -563,6 +635,9 @@ def run_epoch(
 				else:
 					loss.backward()
 					optimizer.step()
+				if ema is not None:
+					# EMA 在每个 optimizer step 后更新影子权重
+					ema.update(model)
 
 			batch_size = labels.size(0)
 			# 所有指标都按样本数加权累计，最后再除以总样本数，得到 epoch 级平均值。
@@ -580,6 +655,7 @@ def run_epoch(
 				# box 指标只有在预测框和目标框都能成功构造时才累计，避免缺失元信息污染统计。
 				total_box_depth += loss_dict["box_depth_loss"].detach() * batch_size
 				total_box_z_mae += loss_dict["box_z_mae"].detach() * batch_size
+				total_seg_loss += loss_dict["seg_loss"].detach() * batch_size
 				box_metric_samples += batch_size
 
 			if reset_snn_state:
@@ -606,21 +682,23 @@ def run_epoch(
 				else:
 					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}")
 
-	# epoch 末单次同步: 把 6 个累加器 stack 到一起搬到 CPU, 减少多次 .item() 的开销。
+	# epoch 末单次同步: 把全部累加器 stack 到一起搬到 CPU, 减少多次 .item() 的开销。
 	final_snap = torch.stack([
 		total_loss,
 		correct_top1.to(total_loss.dtype),
 		correct_top3.to(total_loss.dtype),
 		total_box_depth,
 		total_box_z_mae,
+		total_seg_loss,
 	]).cpu().tolist()
-	f_loss, f_c1, f_c3, f_bd, f_bz = final_snap
+	f_loss, f_c1, f_c3, f_bd, f_bz, f_seg = final_snap
 	metrics = {
 		"loss": f_loss / max(total_samples, 1),
 		"top1": f_c1 / max(total_samples, 1),
 		"top3": f_c3 / max(total_samples, 1),
 		"box_depth": f_bd / max(box_metric_samples, 1),
 		"box_z_mae": f_bz / max(box_metric_samples, 1),
+		"seg_loss": f_seg / max(box_metric_samples, 1),
 		"box_samples": float(box_metric_samples),
 		"samples": float(total_samples),
 	}
@@ -696,11 +774,14 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	num_classes = len(class_to_idx)
 	model = build_model(args.model, num_classes=num_classes, project_root=project_root, args=args).to(device)
 	# 当前多任务损失包含 CrossEntropy 与 Soft-histogram 深度回归两项；默认用固定权重 λ_cls · L_cls + λ_depth · L_depth。
+	# seg_loss_weight > 0 时对分割引导质心头的 seg_logits 追加逐点 in-box BCE 辅助监督
+	# (仅当模型输出含 seg_logits 时生效, baseline 不受影响)。
 	criterion = PointCloudMultiTaskLoss(
 		cls_weight=args.cls_loss_weight,
 		box_weight=args.box_loss_weight,
 		label_smoothing=args.label_smoothing,
 		auto_balance=args.auto_balance,
+		seg_weight=args.seg_loss_weight,
 	)
 	# 将 loss 中的可学习参数 (Kendall 不确定性权重) 一并加入 optimizer
 	optimizer = optim.AdamW(
@@ -710,6 +791,10 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 	use_amp = bool(args.amp and device.type == "cuda")
 	scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+	# EMA 权重滑动平均 (ema_decay > 0 启用): 验证/选点/最佳权重均用影子模型,
+	# 压制单 epoch val 指标波动导致的 best-checkpoint 选点噪声。
+	ema = ModelEma(model, decay=args.ema_decay) if args.ema_decay > 0 else None
 
 	save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -726,6 +811,12 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("augment_train=%s augment_eval=%s num_aug=%d", args.augment_train, args.augment_eval, args.num_aug)
 	logger.info("amp=%s tf32=%s", use_amp, args.tf32)
 	logger.info("loss_auto_balance=%s", args.auto_balance)
+	logger.info(
+		"box_head=%s seg_loss_weight=%.4f ema_decay=%.4f",
+		getattr(args, "box_head", "centroid"),
+		args.seg_loss_weight,
+		args.ema_decay,
+	)
 	logger.info(
 		"best_score_weights cls=%.4f z_mae=%.4f depth=%.4f depth_scale=%.6f",
 		args.best_score_cls_weight,
@@ -752,6 +843,13 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 		if "scheduler_state_dict" in checkpoint:
 			scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+		if ema is not None:
+			if "ema_state_dict" in checkpoint:
+				ema.load_state_dict(checkpoint["ema_state_dict"])
+			else:
+				# 旧 checkpoint 无 EMA 状态: 用刚加载的模型权重重新初始化影子模型
+				ema = ModelEma(model, decay=args.ema_decay)
+				logger.info("Checkpoint has no ema_state_dict; EMA re-initialized from loaded weights.")
 		start_epoch = int(checkpoint.get("epoch", 0)) + 1
 		best_val_top1 = float(checkpoint.get("best_val_top1", 0.0))
 		if "best_val_score" in checkpoint:
@@ -784,6 +882,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			optimizer=optimizer,
 			scaler=scaler,
 			use_amp=use_amp,
+			ema=ema,
 		)
 
 		val_metrics = run_epoch(
@@ -797,6 +896,21 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			scaler=None,
 			use_amp=use_amp,
 		)
+
+		# EMA 影子模型单独过一遍验证集: 选点与最佳权重均以 EMA 指标为准
+		ema_val_metrics: Optional[Dict[str, float]] = None
+		if ema is not None:
+			ema_val_metrics = run_epoch(
+				loader=val_loader,
+				model=ema.module,
+				criterion=criterion,
+				device=device,
+				epoch=epoch,
+				phase="ValEMA",
+				optimizer=None,
+				scaler=None,
+				use_amp=use_amp,
+			)
 
 		scheduler.step()
 
@@ -824,6 +938,22 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 				val_metrics["box_z_mae"],
 				val_metrics["box_depth"],
 			)
+			# 分割引导质心头诊断: 辅助分割 BCE + softmax 温度 τ (仅质心头模型有值)
+			log_tau = getattr(getattr(model, "box_head", None), "log_tau", None)
+			if args.seg_loss_weight > 0 and (train_metrics["seg_loss"] > 0 or val_metrics["seg_loss"] > 0):
+				if log_tau is not None:
+					tau_value = float(torch.exp(log_tau.detach().clamp(-2.3, 2.3)).item())
+					logger.info(
+						"Epoch [%d/%d] | train_seg_loss=%.4f val_seg_loss=%.4f | centroid_tau=%.4f",
+						epoch, args.epochs,
+						train_metrics["seg_loss"], val_metrics["seg_loss"], tau_value,
+					)
+				else:
+					logger.info(
+						"Epoch [%d/%d] | train_seg_loss=%.4f val_seg_loss=%.4f",
+						epoch, args.epochs,
+						train_metrics["seg_loss"], val_metrics["seg_loss"],
+					)
 
 		val_score, score_components, score_weights = compute_composite_score(val_metrics, args)
 		logger.info(
@@ -840,19 +970,42 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			score_weights.get("box_depth", 0.0),
 		)
 
-		if val_score >= best_val_score:
+		# EMA 启用时: 选点与最佳权重以 EMA 验证指标为准 (波动更小, 选点更稳);
+		# 原始模型的 val 曲线仍照常打印, 便于对比 EMA 是否有效。
+		select_metrics = val_metrics
+		select_score = val_score
+		if ema_val_metrics is not None:
+			ema_val_score, ema_components, _ = compute_composite_score(ema_val_metrics, args)
+			logger.info(
+				"Epoch [%d/%d] | EMA val_top1=%.4f val_z_mae=%.4f val_box_depth=%.4f | "
+				"ema_val_score=%.4f | components cls=%.4f z_mae=%.4f depth=%.4f",
+				epoch,
+				args.epochs,
+				ema_val_metrics["top1"],
+				ema_val_metrics["box_z_mae"],
+				ema_val_metrics["box_depth"],
+				ema_val_score,
+				ema_components.get("cls_top1", 0.0),
+				ema_components.get("box_z_mae", 0.0),
+				ema_components.get("box_depth", 0.0),
+			)
+			select_metrics = ema_val_metrics
+			select_score = ema_val_score
+
+		if select_score >= best_val_score:
 			# 用统一尺度的组合评分选 best，避免分类、z-MAE 或 depth 任一任务因数值范围主导选模。
-			best_val_score = val_score
-			best_val_top1 = val_metrics["top1"]
+			best_val_score = select_score
+			best_val_top1 = select_metrics["top1"]
 			best_val_metrics = {
 				key: float(value)
-				for key, value in val_metrics.items()
+				for key, value in select_metrics.items()
 				if isinstance(value, (int, float))
 			}
 			best_val_metrics["score"] = best_val_score
 			save_checkpoint(
 				path=best_ckpt,
-				model=model,
+				# EMA 启用时 best 权重存影子模型 (test.py 直接可用), 否则存原始模型
+				model=ema.module if ema is not None else model,
 				optimizer=optimizer,
 				scheduler=scheduler,
 				epoch=epoch,
@@ -880,6 +1033,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			best_val_score=best_val_score,
 			best_val_metrics=best_val_metrics,
 			score_config=current_score_config,
+			extra_state={"ema_state_dict": ema.state_dict()} if ema is not None else None,
 		)
 		logger.info("Saved last checkpoint to %s", last_ckpt)
 
@@ -900,7 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--model",
 		type=str,
-		default="dgcnn",
+		default="graph_residual_gcn",
 		choices=[
 			"dgcnn",
 			"pointnet",
@@ -918,6 +1072,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"upp",
 			"graph_residual",
 			"graph_residual_gcn",
+			"graph_residual_gcn_lite",
 			"3detr",
 		],
 		help="Backbone 模型名称",
@@ -944,6 +1099,21 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--auto-balance", dest="auto_balance", action="store_true", help="启用 Kendall log-variance 自适应任务平衡")
 	parser.add_argument("--no-auto-balance", dest="auto_balance", action="store_false", help="使用固定 cls/box loss 权重")
 	parser.add_argument("--label-smoothing", type=float, default=0.1, help="分类 loss 的标签平滑系数")
+	parser.add_argument(
+		"--box-head", type=str, default="centroid", choices=["centroid", "mlp"],
+		help="自研 graph 系列模型的 box 头: centroid=分割引导质心头 (创新点, 默认); "
+		"mlp=统一 MLP 回归头 (与 baseline 一致, 消融对照)。对 baseline 模型无效。",
+	)
+	parser.add_argument(
+		"--seg-loss-weight", type=float, default=0.5,
+		help="分割引导质心头辅助 BCE 权重 λ_seg (0=关闭); "
+		"仅当模型输出含 seg_logits 时生效, baseline 不受影响。",
+	)
+	parser.add_argument(
+		"--ema-decay", type=float, default=0.0,
+		help="模型权重 EMA 衰减系数 (0=关闭, 典型 0.999); "
+		"启用后验证/选点/best 权重均用 EMA 影子模型, 压制选点噪声。",
+	)
 	parser.add_argument("--best-score-cls-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 Top-1 的权重")
 	parser.add_argument("--best-score-z-mae-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 box z-MAE (深度误差) 的权重")
 	parser.add_argument("--best-score-depth-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 depth score 的权重")
@@ -986,7 +1156,7 @@ if __name__ == "__main__":
 	#   --model <name>          模型, 支持: dgcnn / pointnet / pointnet2 / pointnet2msg /
 	#                           pointtransformer / pointtransv2 / pointtransv3 / pointmlp / pointmlpelite /
 	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr /
-	#                           graph_residual / graph_residual_gcn
+	#                           graph_residual / graph_residual_gcn / graph_residual_gcn_lite
 	#   --batch-size 32         batch 大小
 	#   --epochs 100            训练轮数
 	#   --num-points 1024       每样本固定点数 (随机采样/补齐到该数)

@@ -231,10 +231,22 @@ class GraphResidualBlockGCN(nn.Module):
         out_channels: int,
         k: int = 20,
         downsample: bool = True,
+        se_ratio: int = 4,
+        fuse_bottleneck_ratio: int = 1,
+        coord_mid_ratio: int = 1,
     ):
         super().__init__()
         self.k = k
         self.downsample = downsample
+        self.se_ratio = int(se_ratio)
+        self.fuse_bottleneck_ratio = int(fuse_bottleneck_ratio)
+        self.coord_mid_ratio = int(coord_mid_ratio)
+        if self.se_ratio <= 0:
+            raise ValueError(f"se_ratio must be positive, got {se_ratio}")
+        if self.fuse_bottleneck_ratio <= 0:
+            raise ValueError(f"fuse_bottleneck_ratio must be positive, got {fuse_bottleneck_ratio}")
+        if self.coord_mid_ratio <= 0:
+            raise ValueError(f"coord_mid_ratio must be positive, got {coord_mid_ratio}")
 
         # ── GCN_f: 特征流 SAGEConv ──
         # 对特征空间动态 KNN 图做消息传递 (DGCNN "动态图" 范式, 卷积核换为真 GNN)
@@ -250,22 +262,32 @@ class GraphResidualBlockGCN(nn.Module):
         # ── SE-style channel gate (替代原版全局注意力) ──
         # SAGEConv 已将邻域聚合为单向量, 全局 (B,N,N) 注意力既嘈杂又过拟合;
         # SE 模块通过通道注意力自适应加权 f_gcn, 计算量可忽略。
-        # 结构: GAP → Linear(C→C/4) → ReLU → Linear(C/4→C) → Sigmoid
-        se_ratio = 4
+        # 结构: GAP → Linear(C→C/se_ratio) → ReLU → Linear(C/se_ratio→C) → Sigmoid
+        se_hidden = max(out_channels // self.se_ratio, 1)
         self.se_gate = nn.Sequential(
-            nn.Linear(out_channels, out_channels // se_ratio, bias=False),
+            nn.Linear(out_channels, se_hidden, bias=False),
             nn.ReLU(inplace=True),
-            nn.Linear(out_channels // se_ratio, out_channels, bias=False),
+            nn.Linear(se_hidden, out_channels, bias=False),
             nn.Sigmoid(),
         )
 
         # ── 双流融合 Conv1d ──
         # 将 SE 加权后的 f_gcn 与 p_gcn 拼接后, 用 Conv1d 融合回 out_channels。
         # 替代原版的 Q/K/V 投影 + 注意力 + out_conv, 参数量大幅缩减。
-        self.fuse_conv = nn.Sequential(
-            nn.Conv1d(2 * out_channels, out_channels, 1, bias=False),
-            nn.BatchNorm1d(out_channels),
-        )
+        if self.fuse_bottleneck_ratio == 1:
+            self.fuse_conv = nn.Sequential(
+                nn.Conv1d(2 * out_channels, out_channels, 1, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+        else:
+            fuse_mid = max(out_channels // self.fuse_bottleneck_ratio, 16)
+            self.fuse_conv = nn.Sequential(
+                nn.Conv1d(2 * out_channels, fuse_mid, 1, bias=False),
+                nn.BatchNorm1d(fuse_mid),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv1d(fuse_mid, out_channels, 1, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
 
         # 坐标门控 + 坐标残差 (4D: x,y,z,i)
         self.coord_gate = nn.Sequential(
@@ -280,11 +302,12 @@ class GraphResidualBlockGCN(nn.Module):
         # 坐标编码器 (2 层 MLP): 对原始 4D 坐标提取更丰富的位置特征
         # 通过残差加法注入到最终特征中, 使每个点特征显式包含其空间位置编码
         # 全局池化后, 位置统计量仍被保留, 改善深度回归 (避免 "盲猜" 中心点)
+        coord_mid = out_channels if self.coord_mid_ratio == 1 else max(out_channels // self.coord_mid_ratio, 16)
         self.coord_encoder = nn.Sequential(
-            nn.Conv1d(4, out_channels, 1, bias=False),
-            nn.BatchNorm1d(out_channels),
+            nn.Conv1d(4, coord_mid, 1, bias=False),
+            nn.BatchNorm1d(coord_mid),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv1d(out_channels, out_channels, 1, bias=False),
+            nn.Conv1d(coord_mid, out_channels, 1, bias=False),
             nn.BatchNorm1d(out_channels),
         )
 
@@ -390,12 +413,26 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         dropout: float = 0.3,
         box_dim: int = 3,
         seg_centroid_box: bool = True,
+        block_channels: Tuple[int, int, int, int] = (64, 64, 128, 256),
+        agg_channels: int = 512,
+        block_se_ratio: int = 4,
+        fuse_bottleneck_ratio: int = 1,
+        coord_mid_ratio: int = 1,
     ):
         super().__init__()
         self.k = k
         self.box_dim = box_dim
         self.use_checkpoint = use_checkpoint
         self.seg_centroid_box = bool(seg_centroid_box)
+        self.block_channels = tuple(int(c) for c in block_channels)
+        self.agg_channels = int(agg_channels)
+        if len(self.block_channels) != 4:
+            raise ValueError(f"block_channels must contain 4 values, got {self.block_channels}")
+        if any(c <= 0 for c in self.block_channels):
+            raise ValueError(f"block_channels must be positive, got {self.block_channels}")
+        if self.agg_channels <= 0:
+            raise ValueError(f"agg_channels must be positive, got {agg_channels}")
+        c1, c2, c3, c4 = self.block_channels
 
         # Stem: (B, 4, N) → (B, 32, N)
         self.stem = nn.Sequential(
@@ -408,21 +445,27 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         )
 
         # 无下采样: 全部 1024 点贯穿 4 层, p 不变只升维 f
-        block_cfg = dict(k=k, downsample=False)
-        self.block1 = GraphResidualBlockGCN(32, 64, **block_cfg)
-        self.block2 = GraphResidualBlockGCN(64, 64, **block_cfg)
-        self.block3 = GraphResidualBlockGCN(64, 128, **block_cfg)
-        self.block4 = GraphResidualBlockGCN(128, 256, **block_cfg)
+        block_cfg = dict(
+            k=k,
+            downsample=False,
+            se_ratio=block_se_ratio,
+            fuse_bottleneck_ratio=fuse_bottleneck_ratio,
+            coord_mid_ratio=coord_mid_ratio,
+        )
+        self.block1 = GraphResidualBlockGCN(32, c1, **block_cfg)
+        self.block2 = GraphResidualBlockGCN(c1, c2, **block_cfg)
+        self.block3 = GraphResidualBlockGCN(c2, c3, **block_cfg)
+        self.block4 = GraphResidualBlockGCN(c3, c4, **block_cfg)
 
         # 多尺度拼接: cat(b1, b2, b3, b4) → Conv1d 聚合
-        cat_dim = 64 + 64 + 128 + 256  # 512
+        cat_dim = sum(self.block_channels)
         self.agg_conv = nn.Sequential(
-            nn.Conv1d(cat_dim, 512, 1, bias=False),
-            nn.BatchNorm1d(512),
+            nn.Conv1d(cat_dim, self.agg_channels, 1, bias=False),
+            nn.BatchNorm1d(self.agg_channels),
             nn.LeakyReLU(0.2),
         )
 
-        pooled_dim = 1024  # 512 * 2 (max + avg)
+        pooled_dim = self.agg_channels * 2  # max + avg
 
         # 统一分类头: 3 层 MLP (1024 → 256 → 128 → num_classes)
         self.cls_head = build_standard_cls_head(pooled_dim, num_classes, dropout=dropout)
@@ -431,8 +474,8 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         #   seg_centroid_box=True  → 分割引导质心头 (自研创新点, 逐点打分 → 加权质心)
         #   seg_centroid_box=False → 统一 MLP 回归头 (与 baseline 一致, 消融对照)
         if self.seg_centroid_box:
-            # 逐点特征通道 = agg_conv 输出 512 (非池化维度)
-            self.box_head = SegmentationCentroidHead(in_channels=512, coord_dim=box_dim)
+            # 逐点特征通道 = agg_conv 输出通道 (非池化维度)
+            self.box_head = SegmentationCentroidHead(in_channels=self.agg_channels, coord_dim=box_dim)
         else:
             self.box_head = build_standard_box_head(pooled_dim, box_dim=box_dim, dropout=dropout)
 
@@ -498,6 +541,43 @@ class GraphResidualMultiTaskNetGCN(nn.Module):
         # 退回统一 MLP 回归头 (消融用, 与 baseline 一致)
         box_preds = self.box_head(f_pooled)                       # (B, 3)
         return {"logits": logits, "box_pred": box_preds}
+
+
+class GraphResidualMultiTaskNetGCNLite(GraphResidualMultiTaskNetGCN):
+    """轻量版 GraphResidual GCN。
+
+    设计目标是压缩 block4、聚合通道和图邻域计算, 同时保留四层多尺度结构与
+    分割引导质心头。默认配置:
+        - k: 20 → 16, 减少消息传递边数
+        - block_channels: (64, 64, 128, 256) → (64, 64, 128, 192)
+        - agg_channels: 512 → 384
+        - SE ratio: 4 → 8
+        - fuse_conv: 2C→C 改为 2C→C/4→C bottleneck
+        - coord_encoder: 4→C→C 改为 4→C/2→C
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 26,
+        k: int = 16,
+        use_checkpoint: bool = True,
+        dropout: float = 0.3,
+        box_dim: int = 3,
+        seg_centroid_box: bool = True,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            k=k,
+            use_checkpoint=use_checkpoint,
+            dropout=dropout,
+            box_dim=box_dim,
+            seg_centroid_box=seg_centroid_box,
+            block_channels=(64, 64, 128, 192),
+            agg_channels=384,
+            block_se_ratio=8,
+            fuse_bottleneck_ratio=4,
+            coord_mid_ratio=2,
+        )
 
 
 # ══════════════════════════════════════════════════

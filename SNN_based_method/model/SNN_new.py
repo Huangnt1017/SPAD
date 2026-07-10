@@ -214,11 +214,19 @@ def _finalize_gated_peak_maps(
     gate_hist: torch.Tensor,
     num_pages: int,
     depth_peak_half_width: int,
+    softargmax_sharpness: float = 8.0,
 ) -> dict[str, torch.Tensor]:
     """把累计量转换为 coarse 图和选择性诊断图。
 
     该函数是 SNN/RNN/LSTM/GRU/ANN gate-moment 后端共用的输出口径。
     ``gate_hist`` 形状为 ``[t_max + 1, B*H*W]``，第 0 个 bin 保留给无效 ToF。
+
+    depth 路径 (死结 2 修复):
+        ``softargmax_sharpness > 0`` 时用温度 softargmax 求峰质心 —— 梯度流向
+        **全部** bin 的 gate，而不是只流进当前 argmax 峰 ±half_width 邻域。
+        旧 hard argmax + 局部质心只给当前峰 (浓雾下=雾峰) 附近光子梯度，
+        目标 bin 的光子永远拿不到梯度，loss 会平在退化解上。
+        ``softargmax_sharpness <= 0`` 回退旧 hard argmax 口径 (兼容旧实验)。
     """
     if weight_sum.dim() != 4 or weight_sum.shape[1] != 1:
         raise ValueError("weight_sum must have shape [B, 1, H, W]")
@@ -234,11 +242,24 @@ def _finalize_gated_peak_maps(
     gate_hist_valid = gate_hist[1:]
     peak_count, peak_index = gate_hist_valid.max(dim=0)
     peak_bin = peak_index + 1
-    depth_peak = _local_peak_centroid(
-        gate_hist_valid,
-        peak_bin,
-        int(depth_peak_half_width),
-    )
+    if softargmax_sharpness > 0:
+        # 温度 softargmax: 逐像素归一化到 [0,1] 后按锐度加权全 bin 质心。
+        t_max = gate_hist_valid.shape[0]
+        # [t_max] → [t_max, 1] 便于与 [t_max, B*H*W] 直方图广播
+        bins = torch.arange(
+            1, t_max + 1, device=gate_hist_valid.device, dtype=gate_hist_valid.dtype
+        ).unsqueeze(1)
+        hist_norm = gate_hist_valid / (
+            gate_hist_valid.amax(dim=0, keepdim=True) + 1e-6
+        )
+        soft_weight = torch.softmax(hist_norm * float(softargmax_sharpness), dim=0)
+        depth_peak = (soft_weight * bins).sum(dim=0)
+    else:
+        depth_peak = _local_peak_centroid(
+            gate_hist_valid,
+            peak_bin,
+            int(depth_peak_half_width),
+        )
     depth_flat = torch.where(peak_count > 0, depth_peak, depth_mean)
     depth = depth_flat.reshape(batch_size, 1, height, width)
 
@@ -421,6 +442,56 @@ class _CompatPLIFNode(_SpikeActivityMixin, neuron.ParametricLIFNode):
     """为 PLIF 节点补充统一放电统计接口。"""
 
 
+class _MultiTauPLIFNode(_CompatPLIFNode):
+    """多时间尺度 PLIF: 把每层标量 tau 扩展为 per-channel 可学习 tau (死结 1 修复之一)。
+
+    官方 ``ParametricLIFNode`` 的 ``self.w`` 是全层共享的标量, 单一时间尺度无法
+    同时做"逐光子瞬时判别"(小 tau) 和"样本级直方图统计积累"(大 tau, 数百页)。
+    本类把 ``w`` 替换为 ``[C, 1, 1]`` 张量, 各通道 tau 在 ``[tau_min, tau_max]``
+    上对数均匀初始化; ``neuronal_charge`` 里 ``self.w.sigmoid()`` 与膜电位
+    ``[B, C, H, W]`` 自动广播, 因此单步动力学无需重写。
+
+    仅支持 ``backend='torch'``: cupy/triton 多步 kernel 假定标量 tau,
+    无法接收 per-channel 张量。构造时会强制改写 backend。
+
+    Args:
+        channels: 通道数 C (决定 per-channel tau 的数量)。
+        tau_min:  最小初始 tau (须 > 1)。
+        tau_max:  最大初始 tau (须 > tau_min)。
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        tau_min: float = 1.5,
+        tau_max: float = 128.0,
+        **kwargs,
+    ) -> None:
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        if tau_min <= 1.0:
+            raise ValueError(f"tau_min must be > 1.0 for PLIF, got {tau_min}")
+        if tau_max <= tau_min:
+            raise ValueError(
+                f"tau_max must be > tau_min, got tau_max={tau_max}, tau_min={tau_min}"
+            )
+        kwargs["backend"] = "torch"
+        super().__init__(init_tau=tau_min, **kwargs)
+        # tau_c 在 [tau_min, tau_max] 上对数均匀分布; sigmoid(w) = 1/tau → w = -log(tau-1)
+        taus = torch.logspace(
+            math.log10(tau_min), math.log10(tau_max), steps=channels
+        )
+        init_w = -torch.log(taus - 1.0)
+        # [C] → [C, 1, 1] 与单步膜电位 [B, C, H, W] 广播
+        self.w = nn.Parameter(init_w.view(channels, 1, 1))
+
+    def extra_repr(self) -> str:
+        with torch.no_grad():
+            tau = 1.0 / self.w.sigmoid()
+            tau_span = f"tau=[{tau.min():.2f}, {tau.max():.2f}] x{tau.numel()}"
+        return f"{tau_span}, v_threshold={self.v_threshold}, v_reset={self.v_reset}"
+
+
 # ─── 神经元工厂 ───────────────────────────────────────────
 
 def build_node(
@@ -429,6 +500,8 @@ def build_node(
     v_threshold: float = 0.5,
     v_reset: float | None = 0.0,
     spike_backend: str = "auto",
+    channels: int | None = None,
+    tau_max: float | None = None,
 ) -> nn.Module:
     """构造 activation_based 脉冲神经元节点.
 
@@ -441,11 +514,13 @@ def build_node(
     对比 cupy kernel 开销。
 
     Args:
-        spike_mode:   神经元类型 ("plif" / "lif" / "if")
-        tau:          膜时间常数 (lif/plif 有效)
+        spike_mode:   神经元类型 ("plif" / "plif_mt" / "lif" / "if")
+        tau:          膜时间常数 (lif/plif 有效; plif_mt 时作为 tau_min)
         v_threshold:  发放阈值
         v_reset:      重置电位, ``None`` 表示 soft reset
-        spike_backend: "auto" / "cupy" / "torch"
+        spike_backend: "auto" / "cupy" / "torch" (plif_mt 强制 torch)
+        channels:     通道数, 仅 plif_mt 需要 (per-channel tau 数量)
+        tau_max:      plif_mt 的最大初始 tau, 默认 128.0
 
     Returns:
         配置好 step_mode='m' 的神经元模块
@@ -473,12 +548,21 @@ def build_node(
     )
     if spike_mode == "plif":
         return _CompatPLIFNode(init_tau=tau, **common)
+    elif spike_mode == "plif_mt":
+        if channels is None:
+            raise ValueError("spike_mode='plif_mt' requires channels (per-channel tau)")
+        return _MultiTauPLIFNode(
+            channels=int(channels),
+            tau_min=float(tau),
+            tau_max=float(tau_max) if tau_max is not None else 128.0,
+            **common,
+        )
     elif spike_mode == "lif":
         return _CompatLIFNode(tau=tau, **common)
     elif spike_mode == "if":
         return _CompatIFNode(**common)
     else:
-        raise ValueError(f"不支持的 spike_mode: {spike_mode}, 可选 plif/lif/if")
+        raise ValueError(f"不支持的 spike_mode: {spike_mode}, 可选 plif/plif_mt/lif/if")
 
 
 # ─── 编码 ─────────────────────────────────────────────────
@@ -708,6 +792,7 @@ class SpikeBlock(nn.Module):
         spike_v_threshold: float = 0.5,
         spike_v_reset: float | None = 0.0,
         spike_backend: str = "auto",
+        spike_tau_max: float | None = None,
     ):
         super().__init__()
         self.spike_in = build_node(
@@ -716,6 +801,8 @@ class SpikeBlock(nn.Module):
             v_threshold=spike_v_threshold,
             v_reset=spike_v_reset,
             spike_backend=spike_backend,
+            channels=C,
+            tau_max=spike_tau_max,
         )
         self.ms_dsconv = MultiScaleDSConv(C)
         self.spike_mid = build_node(
@@ -724,6 +811,8 @@ class SpikeBlock(nn.Module):
             v_threshold=spike_v_threshold,
             v_reset=spike_v_reset,
             spike_backend=spike_backend,
+            channels=C,
+            tau_max=spike_tau_max,
         )
         self.pw = nn.Conv2d(C, C, 1, bias=False)
         self.bn = nn.BatchNorm2d(C)
@@ -851,6 +940,7 @@ class _Stem(nn.Module):
         spike_v_threshold: float = 0.5,
         spike_v_reset: float | None = 0.0,
         spike_backend: str = "auto",
+        spike_tau_max: float | None = None,
     ):
         super().__init__()
         self.conv1 = nn.Conv2d(C_enc, C, 1, bias=False)
@@ -861,6 +951,8 @@ class _Stem(nn.Module):
             v_threshold=spike_v_threshold,
             v_reset=spike_v_reset,
             spike_backend=spike_backend,
+            channels=C,
+            tau_max=spike_tau_max,
         )                                               # step_mode='m', 需要 [T,B,C,H,W]
         self.conv2 = nn.Conv2d(C, C, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(C)
@@ -900,6 +992,7 @@ class _GateHead(nn.Module):
         spike_v_threshold: float = 0.5,
         spike_v_reset: float | None = 0.0,
         spike_backend: str = "auto",
+        spike_tau_max: float | None = None,
     ):
         super().__init__()
         self.spike1 = build_node(
@@ -908,6 +1001,8 @@ class _GateHead(nn.Module):
             v_threshold=spike_v_threshold,
             v_reset=spike_v_reset,
             spike_backend=spike_backend,
+            channels=C,
+            tau_max=spike_tau_max,
         )
         self.conv1 = nn.Conv2d(C, C // 2, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(C // 2)
@@ -917,6 +1012,8 @@ class _GateHead(nn.Module):
             v_threshold=spike_v_threshold,
             v_reset=spike_v_reset,
             spike_backend=spike_backend,
+            channels=C // 2,
+            tau_max=spike_tau_max,
         )
         self.conv2 = nn.Conv2d(C // 2, 1, 1, bias=True)
 
@@ -980,6 +1077,8 @@ class SPADSpikeNet(nn.Module):
         refine_max_intensity_blend: float = 1.0,
         return_sequence: bool = True,
         spike_backend: str = "auto",
+        spike_tau_max: float | None = None,
+        depth_softargmax_sharpness: float = 8.0,
     ):
         super().__init__()
         self.C = C
@@ -991,9 +1090,11 @@ class SPADSpikeNet(nn.Module):
         self.depth_peak_half_width = int(depth_peak_half_width)
         if self.depth_peak_half_width < 0:
             raise ValueError("depth_peak_half_width must be non-negative")
+        self.depth_softargmax_sharpness = float(depth_softargmax_sharpness)
         self.spike_mode = str(spike_mode).lower()
         self.spike_backend = str(spike_backend).lower()
         self.spike_tau = float(spike_tau)
+        self.spike_tau_max = None if spike_tau_max is None else float(spike_tau_max)
         self.spike_v_threshold = float(spike_v_threshold)
         self.spike_v_reset = None if spike_v_reset is None else float(spike_v_reset)
 
@@ -1015,6 +1116,7 @@ class SPADSpikeNet(nn.Module):
             spike_v_threshold=self.spike_v_threshold,
             spike_v_reset=self.spike_v_reset,
             spike_backend=self.spike_backend,
+            spike_tau_max=self.spike_tau_max,
         )
         self.blocks = nn.ModuleList(
             [
@@ -1025,6 +1127,7 @@ class SPADSpikeNet(nn.Module):
                     spike_v_threshold=self.spike_v_threshold,
                     spike_v_reset=self.spike_v_reset,
                     spike_backend=self.spike_backend,
+                    spike_tau_max=self.spike_tau_max,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1036,6 +1139,7 @@ class SPADSpikeNet(nn.Module):
             spike_v_threshold=self.spike_v_threshold,
             spike_v_reset=self.spike_v_reset,
             spike_backend=self.spike_backend,
+            spike_tau_max=self.spike_tau_max,
         )
         self.refine = SpatialRefineHead(
             mid=refine_mid,
@@ -1171,6 +1275,7 @@ class SPADSpikeNet(nn.Module):
             gate_hist=gate_hist,
             num_pages=P,
             depth_peak_half_width=self.depth_peak_half_width,
+            softargmax_sharpness=self.depth_softargmax_sharpness,
         )
         depth = maps["depth"]
         intensity = maps["intensity"]

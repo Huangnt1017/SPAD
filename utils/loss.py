@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ────────────────────────────────────────────────────────────
@@ -454,18 +455,24 @@ class PointCloudMultiTaskLoss(nn.Module):
 	测试/可视化时再用固定半宽重建 6 维 bbox。
 
 	损失构成:
-	  total = λ_cls · L_cls + λ_depth · L_depth          (auto_balance=False, 默认)
+	  total = λ_cls · L_cls + λ_depth · L_depth + λ_seg · L_seg   (auto_balance=False, 默认)
 	  total = exp(-s_cls) · L_cls + s_cls
-	        + exp(-s_box) · L_depth + s_box               (auto_balance=True, Kendall)
+	        + exp(-s_box) · L_depth + s_box + λ_seg · L_seg        (auto_balance=True, Kendall)
 
 	其中 L_cls 为 CrossEntropyLoss, L_depth 为 SPAD Soft-histogram depth loss:
 	  L_depth = Σ_d Σ_k w_k · (ĉ_d - (c_d^gt + k · δ_d))²
 	直接建模 SPAD 物理过程: 时间 bin 量化 (δ_d) + 高斯脉冲展宽 (w_k)。
 	w_k = exp(-k² / (2σ²)) / Z 为高斯权重, Z 为归一化常数。
 
+	L_seg 为分割引导质心头的辅助监督 (seg_weight > 0 且模型输出含 seg_logits 时启用):
+	  以 "点是否落在 GT box 内" 为逐点二值标签, 对 seg_logits 做 BCEWithLogits,
+	  类别不平衡用批内动态 pos_weight = clamp(neg/pos, 1, 20) 校正。
+	  直接监督 "哪些点属于目标", 解决质心头仅靠加权和间接梯度学不出目标性的问题。
+
 	输入约定:
 	- model_outputs 第二项: [B, 3] 中心点 [cx, cy, cz]
 	- box_targets: [B, 6] 角点框 (内部转中心)
+	- points: [B, N, 4] 归一化点云 (仅辅助分割监督需要, 可选)
 	"""
 
 	def __init__(
@@ -477,6 +484,7 @@ class PointCloudMultiTaskLoss(nn.Module):
 		auto_balance: bool = False,
 		sh_k: int = 2,
 		sh_sigma: float = 1.5,
+		seg_weight: float = 0.0,
 	):
 		"""
 		Args:
@@ -487,10 +495,15 @@ class PointCloudMultiTaskLoss(nn.Module):
 			auto_balance: 是否启用 Kendall 自适应权重 (默认 False, 使用固定权重)。
 			sh_k: Soft-histogram 窗口半径 K (总窗口 2K+1 个 bin)。
 			sh_sigma: Soft-histogram 高斯宽度 σ (单位: bin 数, 控制回波展宽程度)。
+			seg_weight: 分割引导质心头辅助 BCE 权重 λ_seg (0 = 关闭;
+				仅当模型输出含 seg_logits 且 forward 传入 points 时生效)。
 		"""
 		super().__init__()
 		self.cls_weight = float(cls_weight)
 		self.box_weight = float(box_weight)
+		self.seg_weight = float(seg_weight)
+		if self.seg_weight < 0:
+			raise ValueError(f"seg_weight must be non-negative, got {seg_weight}")
 		self.auto_balance = auto_balance
 		self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
 		self.register_buffer(
@@ -522,6 +535,7 @@ class PointCloudMultiTaskLoss(nn.Module):
 		cls_targets: torch.Tensor,
 		box_targets: Optional[TensorLike] = None,
 		box_valid_mask: Optional[torch.Tensor] = None,
+		points: Optional[torch.Tensor] = None,
 	) -> Dict[str, torch.Tensor]:
 		"""计算多任务损失并返回分项指标。
 
@@ -530,12 +544,16 @@ class PointCloudMultiTaskLoss(nn.Module):
 		  box_targets [B, 6] → corners_to_center → gt_centers [B, 3]
 		  Soft-histogram: Σ_k w_k · ‖pred - (gt + k·δ)‖²
 		  深度误差 (no_grad): z 轴 MAE + 3D 中心点 MAE
+		  辅助分割 (可选): points 落在 GT box 内 → 逐点二值标签 → BCE(seg_logits)
 
 		Args:
-			model_outputs: 模型输出, 第二项为 [B, 3] 中心点预测 (或 None)。
+			model_outputs: 模型输出, 第二项为 [B, 3] 中心点预测 (或 None);
+				若为 dict 且含 seg_logits [B, N], 配合 points 可启用辅助分割监督。
 			cls_targets: 分类标签 [B]。
 			box_targets: GT 框, 按 [B, 6] 角点形式传入 (内部转中心)。
 			box_valid_mask: 有效样本掩码 [B]。
+			points: 归一化点云 [B, N, 4] (x,y,z,i ∈ [0,1]), 与 model_outputs
+				批次逐行对齐; 仅辅助分割监督需要, 缺省时跳过该项。
 
 		Returns:
 			字典:
@@ -544,6 +562,8 @@ class PointCloudMultiTaskLoss(nn.Module):
 			- box_depth_loss: Soft-histogram 深度损失
 			- box_z_mae: z 轴深度误差 MAE (归一化空间, 仅监控, 不参与反传)
 			- box_center_mae: 3D 中心点 MAE (仅监控, 不参与反传)
+			- seg_loss: 辅助分割 BCE (启用时才有意义, 否则为 0)
+			- seg_pos_ratio: box 内点占比 (仅监控, 不参与反传)
 		"""
 		logits, center_preds = split_cls_and_box_predictions(model_outputs)
 		cls_targets = cls_targets.long().to(logits.device)
@@ -560,6 +580,7 @@ class PointCloudMultiTaskLoss(nn.Module):
 			"cls_loss": cls_loss,
 			"box_depth_loss": torch.zeros((), device=logits.device),
 			"box_iou_mean": torch.zeros((), device=logits.device),
+			"seg_loss": torch.zeros((), device=logits.device),
 		}
 
 		if box_targets is None or center_preds is None:
@@ -673,6 +694,58 @@ class PointCloudMultiTaskLoss(nn.Module):
 			out["box_depth_loss"] = box_depth_loss
 			out["box_z_mae"] = z_mae
 			out["box_center_mae"] = center_mae
+
+			# ── 辅助分割监督 (分割引导质心头专用, seg_weight > 0 时启用) ──
+			# 逐点二值标签: 点是否落在 GT box 内 (含半个 bin 容差, 覆盖 box 边界点)。
+			# 直接监督 "目标 vs 背景/雾" 的逐点判别, 补上质心头缺失的分割梯度。
+			seg_logits = (
+				model_outputs.get("seg_logits")
+				if isinstance(model_outputs, Mapping) else None
+			)
+			if self.seg_weight > 0 and seg_logits is not None and points is not None:
+				if points.dim() != 3 or points.shape[-1] < 3:
+					raise ValueError(
+						f"points must be (B, N, >=3) for seg supervision, "
+						f"got {tuple(points.shape)}"
+					)
+				if seg_logits.shape != points.shape[:2]:
+					raise ValueError(
+						f"seg_logits shape {tuple(seg_logits.shape)} 与 points "
+						f"批次/点数 {tuple(points.shape[:2])} 不一致"
+					)
+
+				# 有效样本切片: (B, N) → (B_valid, N), (B, N, 3)
+				seg_logits_valid = seg_logits[valid_mask]
+				xyz_valid = points[valid_mask][..., :3].to(
+					device=logits.device, dtype=logits.dtype,
+				)
+				corners_valid = gt_corners[valid_mask]           # (B_valid, 6)
+
+				# in-box 判定容差: 半个 bin, 避免落在 box 面上的点被判负
+				margin = 0.5 * torch.tensor(
+					[1.0 / 63.0, 1.0 / 63.0, 1.0 / 108.0],
+					device=logits.device, dtype=logits.dtype,
+				)
+				# (B_valid, 6) → 每轴 [min, max]: (B_valid, 1) 广播到 (B_valid, N)
+				box_min = corners_valid[:, 0::2].unsqueeze(1) - margin  # (B_valid, 1, 3)
+				box_max = corners_valid[:, 1::2].unsqueeze(1) + margin  # (B_valid, 1, 3)
+				# 三轴同时在界内 → in-box: (B_valid, N, 3) → all → (B_valid, N)
+				inbox_labels = (
+					(xyz_valid >= box_min) & (xyz_valid <= box_max)
+				).all(dim=-1).to(logits.dtype)
+
+				pos_count = inbox_labels.sum()
+				if pos_count > 0:
+					# 批内动态 pos_weight 校正正负不平衡, clamp 防止极端批次爆炸
+					neg_count = inbox_labels.numel() - pos_count
+					pos_weight = (neg_count / pos_count).clamp(1.0, 20.0).detach()
+					seg_loss = F.binary_cross_entropy_with_logits(
+						seg_logits_valid, inbox_labels, pos_weight=pos_weight,
+					)
+					total_loss = total_loss + self.seg_weight * seg_loss
+					out["seg_loss"] = seg_loss
+					with torch.no_grad():
+						out["seg_pos_ratio"] = pos_count / inbox_labels.numel()
 
 		out["total_loss"] = total_loss
 		return out

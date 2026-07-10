@@ -86,9 +86,11 @@ raw ToF [B, 4096, P]
 ### Loss
 
 ```
-L = 0.55·L_GT + 0.5·L_depth_reg + 0.25·L_SSIM + 0.2·L_var + 0.03·L_sparse + 0.03·L_smooth + LUT 正则项
+L = 0.55·L_GT + 2.0·L_depth_reg + 0.25·L_SSIM + 0.03·L_smooth + 0.2·L_coarse + 0.5·L_gate_bce + LUT 正则项
 ```
 
+- `w_var` 与 `w_sparse` 已停用（默认 0）：浓雾下逼 gate 做单光子选择不可行，且与 valley_hump 头冲突
+- `L_gate_bce`（`GatePhotonSupervisionLoss`）：用 label depth 造逐光子伪标签（前景 `|tof−d_gt|≤4` 为正类）直接监督 gate，绕开 30:1 雾/目标质量比下近乎为零的矩比值梯度；需要 `return_sequence=True`
 - `SSIMLoss`：7×7 高斯窗口，输入通过 `depth_range=128` 归一化到 `[0,1]`
 - `ImageMetrics`（MAE/RMSE/SSIM/PSNR）：仅用于评估，不参与梯度
 - `w_gt` 与 `w_ssim` 默认**开启 mask**（`gt_use_mask=True` / `ssim_use_mask=True`），因为新 label（`label_prior`）的非目标区域为 0
@@ -109,18 +111,26 @@ L = 0.55·L_GT + 0.5·L_depth_reg + 0.25·L_SSIM + 0.2·L_var + 0.03·L_sparse +
 | 参数 | 取值 | 说明 |
 |---|---|---|
 | `time_threshold` | 128 | 超过该值的 ToF 置 0 |
-| `pages_per_group` | 640 | 每个样本的 page 数 P；建议整除 48000（128/384/480/640/960/...） |
+| `pages_per_group` | 480 | 每个样本的 page 数 P；建议整除 48000（128/384/480/640/960/...） |
 | `batch_size` | 2 | |
-| `grad_accum_steps` | 8 | 等效 batch = 16 |
+| `grad_accum_steps` | 4 | 等效 batch = 8 |
 | `num_workers` | 4 | |
-| `C` | 32 | backbone 通道数 |
-| `chunk_size` | 64 | 显存旋钮；P=640 → 10 个 chunk |
-| `num_blocks` | 1 | |
-| `encoding_mode` | `sinusoidal` | `n_freq=8` → 17 通道 |
-| `spike_mode` | `plif` | 默认使用可学习膜时间常数 |
-| `spike_tau` | 1.5 | LIF/PLIF 膜时间常数初值（PLIF 要求 >1.0） |
+| `C` | 16 | backbone 通道数 |
+| `chunk_size` | 128 | 显存旋钮；P=480 → 4 个 chunk（末块补零） |
+| `num_blocks` | 1 | flow 后端自动提升为 2 |
+| `encoding_mode` | `sinusoidal` | `n_freq=8` → 17 通道；flow 开流式上下文时 stem 输入 +4 |
+| `spike_mode` | `plif` | 可选 `plif_mt`（per-channel 多时间尺度 tau，强制 torch 后端） |
+| `spike_tau` | 1.5 | LIF/PLIF 膜时间常数初值（PLIF 要求 >1.0）；`plif_mt` 时为 tau 下界 |
+| `spike_tau_max` | 128.0 | 仅 `plif_mt`：per-channel tau 对数初始化上界 |
 | `spike_backend` | `cupy` | 可显式改为 `auto` 或 `torch` |
-| `model_backend` | `new` | 可选 `new`/`ann_gate`/`rnn`/`lstm`/`gru` |
+| `model_backend` | `flow` | 可选 `flow`/`new`/`ann_gate`/`frame_photon`/`rnn`/`lstm`/`gru` |
+| `depth_softargmax_sharpness` | 8.0 | gated-moment 深度 softargmax 锐度；0 回退旧 hard argmax |
+| `w_gate_bce` | 0.5 | 光子级 gate BCE 监督权重（`gate_bce_bin_radius=4`，pos_weight 自动配平） |
+
+flow 后端专属旋钮见 `reademe.md` 第 6.7/10 节：`flow_use_stream_context`、
+`flow_use_valley_hump`、`flow_valley_offset_min/init/max`（3/11/40 bin）、
+`flow_valley_gate_beta_init`（2.0）、`flow_valley_hump_window`（48 bin）。
+旧 flow checkpoint 与新结构不兼容（stem 输入通道 +4、valley_hump 参数新增），需重训。
 
 ## 数据布局
 

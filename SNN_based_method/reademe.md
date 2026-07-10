@@ -352,6 +352,57 @@ functional.reset_net(self)
 本次 forward 的局部 `state` 变量中，chunk 间通过递归 `detach` 截断 BPTT，forward 结束后
 自然释放，不会跨 batch 残留。
 
+### 6.7 浓雾三死结与 flow 后端的修复 (2026-07)
+
+浓雾下 (fog_level>=2, 目标每像素 1-2 光子 vs 雾 ~33) 旧结构存在三个互相锁死的问题，
+0611 flow run 的表现为: loss 从 epoch 5 起平在 1.19、gate 激活率 0.89 (全开)、
+深度锁死雾峰 (bin~40, 与目标 bin~60 差恰好等于 depth MAE 21 bin)。
+
+```text
+死结 1  逐光子 gate 在决策时刻看不到直方图形状 (唯一能区分雾/目标的统计量);
+        标量 tau=1.5 的膜电位只有 1-2 页记忆, ToF-shift 增强又抹掉绝对 bin 位置
+        → gate 唯一稳定解是全开。
+死结 2  gated-moment 深度用 hard argmax + 局部质心, 梯度只流进当前峰 (=雾峰)
+        ±half_width 邻域, 目标 bin 光子永远拿不到梯度。
+死结 3  coarse intensity = peak/P 在浓雾下物理上限 ~0.02-0.2, 够不着 label 的
+        0-1 置信量纲 → 识别图糊平。
+```
+
+对应修复 (模型侧 `SNN_flow.py`/`SNN_new.py`, 训练侧 `loss.py`):
+
+```text
+死结 1a  光子级 gate 直接监督 GatePhotonSupervisionLoss (w_gate_bce, P3-A):
+         |tof − d_gt| ≤ radius 的前景光子为正类, 稠密 BCE 梯度直达 gate。
+死结 1b  流式上下文注入 (flow_use_stream_context, P3-B): raw 直方图 running
+         统计 (雾峰位置/密度/谷后占比/集中度) 4 通道逐 chunk 进 stem;
+         只用当前 chunk 之前的页, 严格因果, 无梯度。
+死结 1c  plif_mt 多时间尺度 PLIF (spike_mode=plif_mt, P3-C): per-channel tau
+         在 [spike_tau, spike_tau_max] 对数均匀初始化, 部分通道可积累数百页
+         统计。仅 torch 后端 (cupy kernel 不支持 per-channel tau)。
+死结 2   _finalize_gated_peak_maps 改温度 softargmax
+         (depth_softargmax_sharpness, 默认 8.0; 0 回退旧口径), 所有后端共享。
+死结 3   _ValleyHumpHead v2 的 intensity 改为谷后 hump prominence 与雾峰高度
+         的 log 对比度 + 可学习仿射标定, 对 P 和雾级近似不变 (P2)。
+```
+
+`_ValleyHumpHead` v2 相对 v1 的鲁棒性修正 (P1):
+
+```text
+1. 雾峰/谷位从 raw 直方图估计 (不乘 gate), 与 gate 学选择性彻底解耦;
+   hump 质心/峰高仍从 gate 直方图读出 (gate 学好后信噪比更高)。
+2. 谷偏移有界化: offset = min + (max-min)·sigmoid(·), 界 [3, 40] bin,
+   防塌缩回雾峰/越过目标窗; 物理初始化 offset≈11。
+3. 软谷门陡度 beta 可学习 (softplus 保正), 初值 2.0 (v1 的 1.0 太软)。
+4. 谷后有限窗口 [valley, valley+hump_window] + 窗内均值基线扣除 →
+   prominence, 平坦雾尾不再拉偏质心, 背景像素 prominence≈0。
+5. 谷位诊断量 (vh_fog_peak/offset/valley/gate_beta 等) 透出到训练日志。
+```
+
+注意: 上述改动使 flow 模型的 stem 输入通道数和 valley_hump 参数结构与旧
+checkpoint 不兼容 (0611 及更早的 flow ckpt 本就缺 valley_hump 权重), flow
+需要重新训练; `new` 后端权重不受影响, 但 `depth_softargmax_sharpness>0` 会
+改变旧 checkpoint 的评估输出, 复现旧实验时置 0。
+
 ## 7. 推荐训练命令
 
 直接点击或无参数运行 `train.py` 即可使用默认 0825/0826 训练数据。训练开始前会自动检查当前 `pages_per_group` 对应的 label 池，缺失时先生成，完整存在时直接训练：
@@ -598,18 +649,42 @@ D:\PYproject\SPAD\logs\SNN\test1_YYYYMMDD_HHMMSS\
 
 | 参数 | 默认 | 说明 |
 |---|---:|---|
-| `model_backend` | `new` | 可选 `new` / `ann_gate` / `rnn` / `lstm` / `gru` |
-| `spike_backend` | `cupy` | 仅 `new` 后端使用, 可选 `auto` / `cupy` / `torch` |
-| `spike_mode` | `plif` | 脉冲神经元类型, 可选 `if` / `lif` / `plif` |
-| `spike_tau` | `2.0` | LIF/PLIF 膜时间常数, PLIF 用它初始化可学习 tau |
+| `model_backend` | `flow` | 可选 `flow` / `new` / `ann_gate` / `frame_photon` / `rnn` / `lstm` / `gru` |
+| `spike_backend` | `cupy` | 仅脉冲后端使用, 可选 `auto` / `cupy` / `torch`; `plif_mt` 节点内部强制 torch |
+| `spike_mode` | `plif` | 脉冲神经元类型, 可选 `if` / `lif` / `plif` / `plif_mt` (per-channel 多时间尺度) |
+| `spike_tau` | `1.5` | LIF/PLIF 膜时间常数初值; `plif_mt` 模式下作为 tau 下界 |
+| `spike_tau_max` | `128.0` | 仅 `plif_mt`: per-channel tau 对数初始化上界 |
 | `spike_v_threshold` | `0.8` | 脉冲发放阈值 |
 | `spike_v_reset` | `0.0` | 脉冲重置电位, `None` 表示 soft reset |
 | `encoding_mode` | `sinusoidal` | ToF 编码, 可选 `lut` |
 | `C` | `16` | 主干通道数 |
-| `chunk_size` | `64` | 时间维分块大小, 影响显存和长序列 BPTT |
-| `num_blocks` | `1` | 时序主干块数量 |
+| `chunk_size` | `128` | 时间维分块大小, 影响显存和长序列 BPTT |
+| `num_blocks` | `1` | 时序主干块数量; flow 后端默认提升为 2 |
 | `refine_mid` | `8` | 深度/强度精修头中间通道 |
-| `return_sequence` | `True` | 训练 var/sparse loss 时需要 |
+| `depth_softargmax_sharpness` | `8.0` | gated-moment 深度的 softargmax 锐度; 0 回退 hard argmax |
+| `return_sequence` | `True` | 训练 var/sparse/gate_bce loss 时需要 |
+
+仅 flow 后端的参数：
+
+| 参数 | 默认 | 说明 |
+|---|---:|---|
+| `flow_use_stream_context` | `True` | raw 直方图 running 统计 4 通道注入 stem (严格因果) |
+| `flow_use_valley_hump` | `True` | 谷后 hump 物理检测头 |
+| `flow_valley_spatial_pool` | `5` | 直方图空间聚合核 (奇数) |
+| `flow_valley_offset_min` | `3.0` | 谷偏移下界 (bin) |
+| `flow_valley_offset_max` | `40.0` | 谷偏移上界 (bin) |
+| `flow_valley_offset_init` | `11.0` | 谷偏移物理初始化 (bin) |
+| `flow_valley_gate_beta_init` | `2.0` | 软谷门陡度初值 (可学习) |
+| `flow_valley_hump_window` | `48.0` | 谷后搜峰窗口长度 (bin) |
+| `flow_state_detach_interval` | `0` | 流式累积量 TBPTT 截断间隔 (chunk 数) |
+
+新增 loss 参数：
+
+| 参数 | 默认 | 说明 |
+|---|---:|---|
+| `w_gate_bce` | `0.5` | 光子级 gate BCE 直接监督权重 |
+| `gate_bce_bin_radius` | `4.0` | 光子伪标签正类窗口半径 (bin) |
+| `gate_bce_pos_weight` | `0.0` | 正类权重; <=0 表示 batch 内自动配平 (clamp [1,50]) |
 
 ## 11. 数据增强
 
@@ -664,25 +739,38 @@ L = w_gt * L_GT
   + w_var * L_var
   + w_sparse * L_sparse
   + w_smooth * L_smooth
+  + w_coarse * L_coarse
+  + w_gate_bce * L_gate_bce
   + LUT 正则项
 ```
 
 当前默认权重：
 
 ```text
-w_gt=0.6
-w_depth_reg=0.5
+w_gt=0.55
+w_depth_reg=2.0
 w_ssim=0.25
-w_var=0.2
-w_sparse=0.01
-w_smooth=0.02
+w_var=0.0        # 已停用: 浓雾下逼 gate 做单光子选择不可行, 且与 valley_hump 冲突
+w_sparse=0.0     # 已停用: 与 GT/intensity 项内耗, gate 稀疏性由 gate_bce 直接监督替代
+w_smooth=0.03
+w_coarse=0.20
+w_gate_bce=0.5   # 光子级 gate 直接监督 (死结 1/P3-A)
 w_lut_smooth=0.01
 w_lut_norm=0.005
 ```
 
+`L_gate_bce` (`GatePhotonSupervisionLoss`) 用 label depth 构造逐光子伪标签：
+前景像素内 `|tof − d_gt| ≤ gate_bce_bin_radius` 的有效光子为正类，其余有效光子
+为负类，带类不平衡自动配平的 BCE。它给 gate 稠密梯度，不再依赖浓雾下 30:1
+雾/目标质量比里近乎为零的矩比值梯度；伪标签随 ToF-shift 增强同步平移。
+需要 `return_sequence=True`。
+
 `GT L1` 和 `SSIM` 默认不使用 mask，因为标签来自较干净数据的弱监督图。loss 和指标内部会把 depth 除以 `depth_range` 归一化到 `[0,1]` 计算；输出图里的 depth 仍是 ToF bin。若要把验证日志中的 depth MAE 换算成 bin 误差，可近似乘以 `depth_range`，当前默认是 `128`。
 
-日志中 `train_items` 和 `val_items` 会记录各个 loss 分项，`val_metrics` 会记录 depth/intensity 的 MAE、RMSE、SSIM、PSNR。
+日志中 `train_items` 和 `val_items` 会记录各个 loss 分项，`val_metrics` 会记录 depth/intensity 的 MAE、RMSE、SSIM、PSNR。flow + valley_hump 模式下还会记录
+`vh_fog_peak_mean / vh_offset_mean / vh_valley_mean / vh_gate_beta /
+vh_hump_peak_mean / vh_fog_height_mean`（谷位诊断，观察偏移是否塌缩/漂移）和
+`gate_pos_rate / gate_neg_rate / gate_pos_frac`（光子级 gate 判别质量）。
 
 ## 13. 模型状态
 
@@ -989,3 +1077,113 @@ tau = 1 / sigmoid(w)
 
 `ann_gate` 没有 `*.w` 和 spike_rate, 这本身就是对照信息: 它说明非脉冲连续 gate 在相同
 Gated Moment 框架下的表现, 与 SNN/PLIF 的脉冲状态机制分开比较。
+
+## 16. 低空无人机探测：SPAD-可见光融合理论
+
+本章是面向后续工作的理论说明，记录把当前 SPAD ToF 成像方法应用到低空无人机探测、
+并与可见光相机融合的动机和可行性判断，不涉及具体实现。本章的结论与第 5 章一致：
+SNN 在本任务中的价值定位在流式低延迟与能效，而非在 GPU 上和 ANN/递推网络比单帧精度。
+
+### 16.1 应用动机
+
+低空无人机探测的难点不在算力，而在目标本身：尺寸小、对比度低、常贴着复杂地物背景，
+且实际场景里经常叠加雾、霾、扬尘或弱光。单一可见光相机在这些退化条件下同时受两重限制：
+没有距离信息，无法靠深度把小目标从背景里分离；在雾/弱光下纹理和对比度又会快速退化。
+
+SPAD ToF 与可见光在能力上几乎正交：
+
+```text
+SPAD ToF:
+  优势  主动照明 + 光子计时, 可在雾中做距离门控, 把目标按距离从背景剥离
+        直接输出深度, 对低对比度小目标的"存在性"判断更鲁棒
+  限制  空间分辨率低 (当前 64x64), 单帧光子稀疏, 纹理/语义信息弱
+
+可见光相机:
+  优势  高空间分辨率, 丰富纹理与外观, 利于目标分类和精细定位
+  限制  无深度; 雾/弱光下对比度退化; 小目标在复杂背景中易漏检
+```
+
+因此融合的目标是：用 SPAD 的雾穿透与测距能力解决"有没有、在多远"，用可见光的高分辨率
+解决"是什么、在哪儿的精细位置"，在退化大气条件下得到比任一单模态都更稳的小目标
+检测与测距。这是融合的高层动机，也是判断后续每一步是否值得做的标准。
+
+### 16.2 为什么是 SNN 流式
+
+第 5 章已经说明：在重复曝光的 P 轴上、用直方图化输入、在 GPU 上比单帧精度，SNN 没有
+结构性优势。融合场景重新定义了比较的轴，让 SNN 的长处第一次有了落点。
+
+```text
+1. SPAD 以 25000 frame/s 输出稀疏光子帧, 这是事件驱动 SNN 的原生输入形态,
+   不需要先攒满一个积分窗再处理。
+2. 流式模型 (model_backend=flow, SNNFlowNet) 的估计随光子累积逐步细化,
+   可在任意时刻读出当前深度/强度图, 不必等整段 P 帧到齐。
+3. 对运动目标和运动平台, 低延迟与"随时可读"比离线精度更重要。
+4. 价值定位是低延迟 + 恒定显存 + 神经形态硬件上的潜在能效, 而非 GPU 精度。
+```
+
+流式还有一个对融合不可或缺的正确性前提——因果性：第 t 帧的估计只能依赖第 1..t 帧。
+`SNNFlowNet` 已经把这一点做实（见 `model/SNN_flow.py`）：通过把时间相关的归一化层
+替换为对时间维和 batch 维都无依赖的归一化，训练和推理在任意分块粒度下都严格因果。
+没有这个前提，"实时融合"只是离线对齐的假象。
+
+### 16.3 跨模态时序对齐
+
+两个传感器的帧率差约两个数量级，这是融合时序设计的出发点：
+
+```text
+SPAD:    25000 frame/s
+可见光:  60 frame/s
+比值:    约 417 : 1, 即每个可见光帧的曝光窗口内约有 417 个 SPAD 帧
+```
+
+流式 SNN 与这个比值天然契合：把落在某个可见光帧曝光窗口内的 SPAD 帧持续喂入流式状态，
+在该可见光帧的时间戳处做一次 `stream_readout`，就得到一张与这一可见光帧时间对齐的
+SPAD 深度/强度图。换言之，流式读出的节奏可以直接对齐到可见光快门，而不需要把 SPAD
+当成离线批处理后再去和可见光硬凑时间。
+
+时序对齐之外还需要空间配准：两个传感器视场、分辨率、光轴都不同，需要标定外参并把
+一个模态投影到另一个模态的像平面。空间配准是工程前提，本章不展开。
+
+### 16.4 融合层次与可行性
+
+按融合发生的阶段，经典上分三层。结合当前两模态的分辨率与时序差异，对可行性做高层判断：
+
+```text
+数据级 / 早期融合:
+  直接拼原始像素或光子。受 64x64 与可见光高分辨率、模态量纲差异制约, 直接拼接代价高、
+  收益不确定。可行性: 低。
+
+特征级 / 中期融合:
+  各自抽特征后在对齐的空间/时间上融合。SPAD 侧用流式输出的深度/强度/置信度图,
+  可见光侧用其特征, 在配准后的网格上融合。最能利用两模态互补性, 且天然容纳分辨率与
+  时序差异 (用置信度和时间戳对齐加权)。可行性: 高, 推荐优先验证。
+
+决策级 / 后期融合:
+  各自独立出检测结果再合并。实现简单、鲁棒, 但丢失跨模态早期线索 (如"可见光弱响应区
+  恰好有 SPAD 近距离回波")。可作为基线或退化方案。可行性: 中。
+```
+
+初步判断是以特征级融合为主线：SPAD 流式分支按可见光帧节奏输出对齐的深度/强度/置信度，
+与可见光特征在配准网格上融合；置信度图为融合提供逐像素权重，在雾重区域自然提高 SPAD
+深度的话语权，在清晰区域让可见光纹理主导。这与现有模型已经输出 `confidence` 是一致的，
+不需要为融合另起一套不兼容的设计。以上为方向性判断，具体网络与融合算子留待后续实现。
+
+### 16.5 待验证问题
+
+本章是动机与可行性，不是已验证结论。落地前至少需要回答：
+
+```text
+1. 标定与配准: SPAD 与可见光的外参标定精度, 能否支撑特征级逐像素融合。
+2. 分辨率贡献: 64x64 的 SPAD 深度在可见光高分辨率之上是否带来可测量的检测增益,
+   还是仅在雾重区域有效。
+3. 时序一致性: 运动目标下, 曝光窗口内累积的 SPAD 估计与可见光帧的时间错配是否引入
+   拖影或配准漂移。
+4. 流式优势的真实性: 低延迟/恒定显存的优势是否在真实采集链路与硬件上成立,
+   而不只是离线仿真的结论。
+5. 能效论证: 神经形态硬件上的能效优势需实测 spike 数/SOPs, 不能只靠理论外推。
+6. 模态主导边界: 在不同雾浓度与光照下, 各模态贡献的切换点在哪里, 融合权重应如何随
+   置信度自适应。
+```
+
+这些问题的答案决定融合方案是否值得投入，也决定 SNN 流式这条路线在无人机探测里的
+真实价值边界。
