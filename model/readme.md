@@ -5,7 +5,7 @@
 | 模型 | 类型 | 参数量 (M) |
 |:-----|:----:|:----------:|
 | PointMLP-Elite | baseline | 0.644 |
-| Graph Residual GCN (PyG SAGEConv) | 自研 | 1.290 |
+| Graph Residual GCN (PyG SAGEConv) | 自研 | 1.101 (centroid) / 1.332 (MLP) |
 | Graph Residual (DGCNN EdgeConv) | 自研 | 1.288 |
 | PointNet++ SSG | baseline | 1.403 |
 | PointNet++ MSG | baseline | 1.675 |
@@ -194,47 +194,49 @@ $$\mathcal L_{depth} = \sum_{d \in \{x,y,z\}} \sum_{k=-K}^{K} w_k \cdot \left(\h
 | 维度 | 原版 (DGCNN EdgeConv) | GCN 变体 (PyG SAGEConv) |
 |:----:|:--------------------:|:----------------------:|
 | **卷积核** | `Conv2d` on `[x_j - x_i, x_i]` | `SAGEConv` (真消息传递) |
-| **聚合方式** | Max pool over edge features | Mean aggregation: $\mathbf h_i' = W_1 \mathbf h_i + W_2 \cdot \text{mean}_{j \in \mathcal N(i)} \mathbf h_j$ |
+| **聚合方式** | Max pool over edge features | 可配置 `max/mean`；默认 max：$\mathbf h_i' = W_1 \mathbf h_i + W_2 \cdot \operatorname{AGG}_{j \in \mathcal N(i)} \mathbf h_j$ |
 | **权重结构** | 单一 MLP (边特征 → 输出) | 中心-邻居分离权重 ($W_1$ vs $W_2$) |
 | **归纳性** | Transductive (依赖边特征拼接) | Inductive (可处理未见图拓扑) |
 | **缓存格式** | `p_graph` $(B,8,N,k)$ 边特征 | `p_edge_index` $(2, B{\cdot}N{\cdot}k)$ PyG 边索引 |
 | **双流融合** | Q/K/V 注意力 (k 邻居 softmax) | SE channel gate + Conv1d 融合 |
 | **分类 Pooling** | max+avg 全局池化 | max+avg 全局池化 (类别与位置无关) |
-| **Box Pooling** | max+avg 全局池化 | max+avg 全局池化 (backbone 内 coord_encoder 注入位置信息) |
-| **Block 改进** | Q/K/V 注意力 + EdgeConv | SE gate + SAGEConv + **坐标编码残差注入** |
+| **Box Pooling** | max+avg 全局池化 | max+avg 全局池化 (backbone 内受控坐标残差保留位置信息) |
+| **Block 改进** | Q/K/V 注意力 + EdgeConv | SE gate + SAGEConv + **feature residual + 小尺度坐标残差** |
 | **深度 Loss** | Soft-histogram (物理驱动) | Soft-histogram (物理驱动) |
 | **头架构** | `build_standard_cls_head/box_head` | `build_standard_cls_head/box_head` |
 
 **架构变化**：
 
-1. **GCN_f (特征流)**：SAGEConv on 特征空间动态 KNN 图 (DGCNN "动态图" 范式保留，卷积核换为真 GNN)
-2. **GCN_p (位置流)**：SAGEConv on 坐标空间静态 KNN 图 (预计算复用，同原版)
-3. **SE channel gate**：因 SAGEConv 已将邻域聚合为单向量，全局 $(B,N,N)$ softmax 注意力既嘈杂又过拟合；改为 SE-style channel gate 对 $f_{gcn}$ 做通道加权，再与 $p_{gcn}$ 通过 Conv1d 融合
-4. **坐标编码残差注入**：每个 Block 新增 `coord_encoder`（2 层 Conv1d MLP），对 4D 原始坐标提取位置特征，通过残差加法注入到最终特征。使每个点特征显式包含其空间位置编码，全局池化后位置统计量仍被保留，改善深度回归
-5. **统一头架构**：两个变体均使用 `utils/heads.py` 构建标准 cls_head (1024→256→128→C) 和 box_head (1024→256→128→3)，确保 backbone 为唯一变量
-6. **Soft-histogram depth loss**：直接建模 SPAD 物理过程 (时间 bin 量化 + 高斯脉冲展宽)，固定权重 $\lambda_{cls}=\lambda_{depth}=1.0$
+1. **正确消息方向**：PyG 默认 `source_to_target`，因此每条 KNN 边按“邻居 $j$ → 中心 $i$”构建，保证中心点聚合自己的邻居；旧 checkpoint 可通过 legacy 模式复现历史方向
+2. **去除重复自环**：默认 KNN 排除中心点自身，避免同一个中心特征既经过 `SAGEConv` root transform，又作为邻居消息重复计入
+3. **GCN_f / GCN_p 双流**：特征流使用每层重算的动态 KNN，位置流使用入口预计算并复用的坐标 KNN
+4. **Max GraphSAGE 聚合**：默认从 mean 改为 max，突出稀疏目标的局部强响应，减少大量烟雾背景点造成的均值稀释；可通过统一 config 切回 mean 做消融
+5. **SE channel gate**：对 $f_{gcn}$ 做通道加权，再与 $p_{gcn}$ 通过 Conv1d 融合，避免 $(B,N,N)$ 全局注意力的噪声和显存开销
+6. **双残差稳定优化**：新增显式 `feature_residual` 保留中心语义；坐标分支改为 `coord_scale` 控制的小尺度门控残差，默认初值 0.1，避免强制坐标注入压过分类特征
+7. **统一头架构**：两个变体均使用 `utils/heads.py` 构建标准 cls_head 和 box_head，确保 backbone 为主要变量
+8. **Soft-histogram depth loss**：直接建模 SPAD 物理过程，固定权重 $\lambda_{cls}=\lambda_{depth}=1.0$
 
-**坐标编码残差注入 — 改善深度回归的 Block 内改进**：
+**显式特征残差 + 受控坐标残差**：
 
-全局池化 (max+avg) 将 $(B, 512, N)$ 压成 $(B, 512)$，所有空间位置信息丢失，导致深度估计只能从统计量中"盲猜"中心点。改进方案在 Block 内部将位置信息注入到每个点特征中：
+新版不再把坐标编码无条件加到融合特征，而是同时保留输入特征捷径，并让坐标增量从较小权重开始学习：
 
-$$\mathbf{pos} = \text{coord\_encoder}(\mathbf P) \in \mathbb R^{B \times C_{out} \times N}$$
+$$\mathbf r_f = \operatorname{Proj}(\mathbf f), \qquad
+\Delta\mathbf p = \sigma(\text{coord\_gate}(\mathbf P)) \odot (\text{coord\_res}(\mathbf P)+\text{coord\_encoder}(\mathbf P))$$
 
-$$\text{coord\_encoder}: \text{Conv1d}(4 \to C_{out}) \to \text{BN} \to \text{LeakyReLU}(0.2) \to \text{Conv1d}(C_{out} \to C_{out}) \to \text{BN}$$
-
-$$\mathbf f_{out} = \text{act}(\mathbf{out} + \mathbf{pos})$$
+$$\mathbf f_{out} = \operatorname{act}(\mathbf f_{fused} + \mathbf r_f + s_p\Delta\mathbf p), \qquad s_p\text{ 初值}=0.1$$
 
 设计动机：
 - **不改变 head 架构**：backbone 内部改进，head 结构完全一致，对比公平性保持
 - **参数量极小**：4 个 Block 共新增 ~0.09M (原版 1.194M → 改进 1.29M)
-- **残差加法**：每个点 $\mathbf f_{out}[:, :, i]$ 显式包含 $\mathbf P[:, :, i]$ 的 2 层 MLP 编码
-- **池化后保留**：即使全局 max+avg 池化，池化结果也自然聚合了各点的位置统计信息
-- **与 coord_gate / coord_res 的区别**：后两者是门控混合（权重由 sigmoid 决定），coord_encoder 是残差加法（位置信息强制注入）
+- **分类更稳**：feature residual 为每层提供不经过邻域聚合的中心语义捷径
+- **定位可学**：坐标分支仍保留 4D 位置与 intensity 信息，但由可学习尺度决定注入强度
+- **初始化温和**：`coord_scale=0.1` 避免训练初期坐标特征支配 backbone，后续可按任务梯度自动调整
+- **旧权重兼容**：历史 checkpoint 自动启用 legacy 模式，复现 mean、自环、旧边方向和强制坐标融合
 
 **Block 数据流 (GCN 版)**：
 
 ```text
-[单 Block 数据流向 — PyG SAGEConv 版 (SE gate + 坐标编码注入)]
+[单 Block 数据流向 — PyG SAGEConv 版 (SE gate + 双残差)]
  f(B,C,N) + p(B,4,N) + p_edge_index(2,E) [预计算缓存]
   │
   ├── KNN from f (特征空间, 每层重算)   p_edge_index (坐标图边, 入口预计算复用)
@@ -256,20 +258,13 @@ $$\mathbf f_{out} = \text{act}(\mathbf{out} + \mathbf{pos})$$
   │     └──────────────────────────────────┘
   │                 │
   │                 ↓
-  │     ┌──────────────────────────────────┐
-  │     │    坐标门控跳跃                    │
-  │     │  gate = σ(coord_gate(p))         │
-  │     │  coord_info = coord_res(p)       │
-  │     │  out = gate·fused + (1-gate)·ci  │
-  │     └──────────────────────────────────┘
-  │                 │
-  │                 ↓
-  │     ┌──────────────────────────────────┐
-  │     │    坐标编码残差注入 ★ 新增         │
-  │     │  pos_feat = coord_encoder(p)     │
-  │     │    (Conv1d+BN+LReLU+Conv1d+BN)  │
-  │     │  f_out = act(out + pos_feat)     │
-  │     └──────────────────────────────────┘
+  │     ┌────────────────────────────────────────────────────┐
+  │     │  feature_skip = projection(f)                     │
+  │     │  coord_delta = σ(coord_gate(p))                    │
+  │     │      · (coord_res(p) + coord_encoder(p))           │
+  │     │  f_out = act(fused + feature_skip                  │
+  │     │      + coord_scale · coord_delta)                  │
+  │     └────────────────────────────────────────────────────┘
   │                 │
   │                 ↓
   └─────────────────> f_out (B,C_out,N)    p 不变
@@ -277,17 +272,17 @@ $$\mathbf f_{out} = \text{act}(\mathbf{out} + \mathbf{pos})$$
 
 **模型规模与显存**：
 
-- **参数量**：约 1.29 M (coord_encoder 新增 ~0.09M，相比原版 1.194M 增幅仅 ~8%)
+- **参数量**：默认 centroid 头约 1.101 M；用于 baseline 公平消融的统一 MLP 头约 1.332 M
 - **显存**：RTX 4070 SUPER 上 $B{=}32$ 训练峰值约 **908 MB** (原版 v7 约 7.4 GB) — SAGEConv 消息传递 + SE gate 比 Conv2d EdgeConv + 全局注意力更轻量
 - **对比公平性**：head 架构与所有 baseline 完全一致 (统一 max+avg pooling + 标准 cls/box head)，backbone 内部改进不影响对比公平
 - **训练命令**：默认使用固定权重 $\lambda_{cls} \cdot \mathcal L_{cls} + \lambda_{depth} \cdot \mathcal L_{depth}$
 
 ```powershell
 $env:PYTHONPATH = "D:\PYproject\SPAD"
-& "D:\anaconda3\envs\pytorch\python.exe" "D:\PYproject\SPAD\scripts\train.py" --model graph_residual_gcn --batch-size 32 --epochs 100
+& "D:\anaconda3\envs\torchnew\python.exe" "D:\PYproject\SPAD\scripts\train.py" --model graph_residual_gcn --batch-size 32 --epochs 100 --num-aug 3
 ```
 
-**设计动机**：SAGEConv 的 mean 聚合天然保留邻域分布统计信息，适合 SPAD 点云的噪声建模；中心-邻居分离权重 ($W_1, W_2$) 表达力更强；归纳式学习可处理未见过的图拓扑 (如不同噪声强度下的 KNN 图变化)。SE channel gate 替代全局注意力，消除 1024×1024 注意力矩阵的过拟合风险与显存开销。Block 内坐标编码残差注入 (coord_encoder) 改善深度回归，使每个点特征显式包含其空间位置编码，全局池化后位置统计量仍被保留。
+**设计动机**：SPAD 点云中的有效目标通常稀疏、背景噪声占比高，默认 max 聚合比 mean 更不容易稀释局部强响应；正确的邻居→中心边方向和去自环保证 GraphSAGE 聚合语义与 KNN 定义一致。SE channel gate 控制通道响应，feature residual 稳定语义学习，可学习小尺度坐标残差则在不压制分类特征的前提下保留定位信息。
 
 #### GCN 版优化路线 (v2)
 
@@ -303,13 +298,11 @@ $$\mathcal L_{depth} = \sum_{d \in \{x,y,z\}} \sum_{k=-K}^{K} w_k \cdot (\hat c_
 
 **固定权重 (已完成)**：原 Kendall 自适应权重导致训练 loss 变负 (log-variance 项无约束增长)，改为 $\lambda_{cls} \cdot \mathcal L_{cls} + \lambda_{depth} \cdot \mathcal L_{depth}$ (默认 $\lambda_{cls} = \lambda_{depth} = 1.0$)。
 
-**Block 内坐标编码残差注入 (已完成)**：原 GCN 变体使用 max+avg 全局池化后接 box_head，空间信息完全丢失导致深度估计效果差。在每个 Block 内新增 `coord_encoder`（2 层 Conv1d MLP），对 4D 原始坐标提取位置特征，通过残差加法注入到最终特征：
-$$\mathbf f_{out} = \text{act}(\mathbf{out} + \text{coord\_encoder}(\mathbf P))$$
-使每个点特征显式包含其空间位置编码，全局池化后位置统计量仍被保留。相比 head 端改进 (如 BoxQueryPool)，block 内改进参数量极小 (4 Block 共 ~0.09M)，head 架构与所有 baseline 完全一致，对比公平性保持。总参数量从 1.194M 增至 1.29M。
+**GCN 聚合与残差修复 (已完成)**：PyG 边方向已修正为邻居→中心，KNN 默认排除自身，聚合默认改为 max；每个 Block 新增 feature residual，并将原先无条件坐标相加改为 `coord_scale` 控制的门控坐标增量。统一训练 config 暴露 `gcn_*` 参数，旧 checkpoint 会自动推断 legacy 模式以保持严格加载兼容。
 
 **待优化**：
 
-**P1 — 通道缩减**：stem 4→16, block 通道减半，总参数目标 ~0.4–0.5M (当前 1.29M 的 ~30%)。
+**P1 — 消融与再训练**：固定数据划分分别验证 `max/mean`、是否排除自身、feature residual 与 `coord_scale_init`；以新版结构重新训练后再与 baseline 做公平比较，旧 checkpoint 仅用于结果复现。
 
 ### 任务 2：面向特定领域（输电杆塔）的数据模拟与算法验证
 **目标与动机**：为了验证所提算法（任务1）在真实工程场景中的可用性与泛化能力，将研究目标投射到电网巡检领域的具体应用上。
@@ -353,9 +346,9 @@ $$\mathbf f_{out} = \text{act}(\mathbf{out} + \text{coord\_encoder}(\mathbf P))$
 
 ---
 
-## 5. 完整模型代码 (graph_res_GCN.py)
+## 5. 历史模型代码快照 (graph_res_GCN.py)
 
-以下为 PyG SAGEConv 变体的完整实现代码 (截至 2026-06-02)，包含坐标编码残差注入：
+以下代码仅保留 2026-06-02 版本用于论文过程追溯，不代表当前训练实现。当前 source of truth 为 [model/graph_res_GCN.py](graph_res_GCN.py)，已包含正确边方向、去自环、默认 max 聚合、显式 feature residual、受控坐标残差和 legacy checkpoint 兼容。
 
 ```python
 """

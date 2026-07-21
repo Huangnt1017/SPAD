@@ -324,12 +324,48 @@ def build_model(model_name: str, num_classes: int, project_root: Path, args: Opt
 		)
 
 	# === Graph Residual GCN (PyG SAGEConv 版, model/graph_res_GCN.py) ===
+	gcn_k_arg = getattr(args, "gcn_k", None)
+	gcn_operator = str(getattr(args, "gcn_operator", "sage"))
+	if name != "graph_residual_gcn_ablation" and gcn_operator != "sage":
+		raise ValueError(
+			"--gcn-operator edge_cnn is only supported by graph_residual_gcn_ablation"
+		)
+	gcn_common = {
+		"use_checkpoint": bool(getattr(args, "gcn_use_checkpoint", True)),
+		"aggregation": str(getattr(args, "gcn_aggregation", "max")),
+		"exclude_self": bool(getattr(args, "gcn_exclude_self", True)),
+		"feature_residual": bool(getattr(args, "gcn_feature_residual", True)),
+		"coord_scale_init": float(getattr(args, "gcn_coord_scale_init", 0.1)),
+		"legacy_mode": bool(getattr(args, "gcn_legacy_mode", False)),
+	}
 	if name == "graph_residual_gcn":
 		model_module = load_module_from_file(
 			project_root / "model" / "graph_res_GCN.py", "model_graph_res_gcn"
 		)
 		return model_module.GraphResidualMultiTaskNetGCN(
-			num_classes=num_classes, seg_centroid_box=use_centroid_head,
+			num_classes=num_classes,
+			k=20 if gcn_k_arg is None else int(gcn_k_arg),
+			seg_centroid_box=use_centroid_head,
+			**gcn_common,
+		)
+
+	if name == "graph_residual_gcn_ablation":
+		model_module = load_module_from_file(
+			project_root / "model" / "graph_res_GCN_ablation.py", "model_graph_res_gcn_ablation"
+		)
+		return model_module.GraphResidualGCNAblationNet(
+			num_classes=num_classes,
+			k=20 if gcn_k_arg is None else int(gcn_k_arg),
+			seg_centroid_box=use_centroid_head,
+			use_checkpoint=gcn_common["use_checkpoint"],
+			aggregation=gcn_common["aggregation"],
+			operator=gcn_operator,
+			exclude_self=gcn_common["exclude_self"],
+			feature_residual=gcn_common["feature_residual"],
+			coord_scale_init=gcn_common["coord_scale_init"],
+			use_physical_branch=bool(getattr(args, "gcn_use_physical_branch", True)),
+			use_se_gate=bool(getattr(args, "gcn_use_se_gate", True)),
+			use_coord_residual=bool(getattr(args, "gcn_use_coord_residual", True)),
 		)
 
 	if name == "graph_residual_gcn_lite":
@@ -337,7 +373,10 @@ def build_model(model_name: str, num_classes: int, project_root: Path, args: Opt
 			project_root / "model" / "graph_res_GCN.py", "model_graph_res_gcn"
 		)
 		return model_module.GraphResidualMultiTaskNetGCNLite(
-			num_classes=num_classes, seg_centroid_box=use_centroid_head,
+			num_classes=num_classes,
+			k=16 if gcn_k_arg is None else int(gcn_k_arg),
+			seg_centroid_box=use_centroid_head,
+			**gcn_common,
 		)
 
 	raise ValueError(f"Unsupported model name: {model_name}")
@@ -351,10 +390,20 @@ def merge_resume_model_args(args: argparse.Namespace, checkpoint: Mapping[str, A
 
 	merged = vars(args).copy()
 	for key, value in ckpt_args.items():
-		if key == "model" or key == "num_points" or key == "box_head" or key.startswith("spt_"):
+		if key in {"model", "num_points", "box_head"} or key.startswith(("spt_", "gcn_")):
 			merged[key] = value
+	model_name = str(merged.get("model", ""))
+	state_dict = checkpoint.get("model_state_dict", {})
+	if model_name.startswith("graph_residual") and "box_head" not in ckpt_args and isinstance(state_dict, Mapping):
+		merged["box_head"] = "centroid" if any("box_head.seg_mlp." in key for key in state_dict) else "mlp"
+	if model_name.startswith("graph_residual_gcn") and not any(key.startswith("gcn_") for key in ckpt_args):
+		merged.update({
+			"gcn_aggregation": "mean",
+			"gcn_exclude_self": False,
+			"gcn_feature_residual": False,
+			"gcn_legacy_mode": True,
+		})
 	if merged.get("model") == "spt" and "spt_use_moe_lif" not in ckpt_args:
-		state_dict = checkpoint.get("model_state_dict", {})
 		if isinstance(state_dict, Mapping):
 			merged["spt_use_moe_lif"] = any(
 				".fc1.0.gate." in key or ".fc1.0.experts." in key
@@ -509,6 +558,7 @@ def run_epoch(
 	scaler: Optional[torch.amp.GradScaler] = None,
 	use_amp: bool = False,
 	ema: Optional[ModelEma] = None,
+	grad_accum_steps: int = 1,
 ) -> Dict[str, float]:
 	"""执行单个 epoch 的训练或验证。
 
@@ -521,6 +571,7 @@ def run_epoch(
 		phase: 阶段名（Train/Val）。
 		optimizer: 训练时提供；验证时为 None。
 		ema: 可选。EMA 跟踪器；训练阶段每个 optimizer step 后更新影子权重。
+		grad_accum_steps: 梯度累计的微批次数；仅训练阶段生效。
 
 	Returns:
 		包含 loss/top1/top3 与 box 指标的聚合字典。
@@ -541,6 +592,35 @@ def run_epoch(
 	correct_top3 = torch.zeros((), device=device, dtype=torch.long)
 	total_samples = 0
 	box_metric_samples = 0
+	processed_train_batches = 0
+	accumulated_train_samples = 0
+	grad_accum_steps = max(1, int(grad_accum_steps))
+
+	def apply_optimizer_step(gradient_correction: float = 1.0) -> None:
+		"""执行一次参数更新，并在尾部不完整累计组时修正梯度尺度。"""
+		if optimizer is None:
+			return
+		if amp_enabled:
+			if scaler is None:
+				raise ValueError("AMP training requires a GradScaler.")
+			if gradient_correction != 1.0:
+				scaler.unscale_(optimizer)
+				for group in optimizer.param_groups:
+					for parameter in group["params"]:
+						if parameter.grad is not None:
+							parameter.grad.mul_(gradient_correction)
+			scaler.step(optimizer)
+			scaler.update()
+		else:
+			if gradient_correction != 1.0:
+				for group in optimizer.param_groups:
+					for parameter in group["params"]:
+						if parameter.grad is not None:
+							parameter.grad.mul_(gradient_correction)
+			optimizer.step()
+		if ema is not None:
+			ema.update(model)
+		optimizer.zero_grad(set_to_none=True)
 
 	pbar = tqdm(loader, desc=f"{phase} Epoch {epoch}", leave=False)
 	context = torch.enable_grad() if is_train else torch.no_grad()
@@ -548,6 +628,8 @@ def run_epoch(
 	num_batches = len(loader) if hasattr(loader, "__len__") else None
 	log_every = max(1, (num_batches // 20)) if num_batches else 1
 	reset_snn_state = has_spikingjelly_state(model)
+	if is_train:
+		optimizer.zero_grad(set_to_none=True)
 
 	with context:
 		for batch_step, batch in enumerate(pbar):
@@ -622,24 +704,25 @@ def run_epoch(
 					points=inputs,
 				)
 			loss = loss_dict["total_loss"]
+			batch_size = labels.size(0)
 
 			if is_train:
-				# 训练阶段才反向传播；验证阶段只做前向统计，不更新参数。
-				optimizer.zero_grad(set_to_none=True)
+				# 累计模式先反传样本 loss 之和，更新前再除以该组真实样本数。
+				# 这样最后一个不足 batch_size 的微批次也与直接大 batch 的样本权重一致。
+				backward_loss = loss if grad_accum_steps == 1 else loss * batch_size
 				if amp_enabled:
 					if scaler is None:
 						raise ValueError("AMP training requires a GradScaler.")
-					scaler.scale(loss).backward()
-					scaler.step(optimizer)
-					scaler.update()
+					scaler.scale(backward_loss).backward()
 				else:
-					loss.backward()
-					optimizer.step()
-				if ema is not None:
-					# EMA 在每个 optimizer step 后更新影子权重
-					ema.update(model)
+					backward_loss.backward()
+				processed_train_batches += 1
+				accumulated_train_samples += batch_size
+				if processed_train_batches % grad_accum_steps == 0:
+					gradient_correction = 1.0 if grad_accum_steps == 1 else 1.0 / accumulated_train_samples
+					apply_optimizer_step(gradient_correction)
+					accumulated_train_samples = 0
 
-			batch_size = labels.size(0)
 			# 所有指标都按样本数加权累计，最后再除以总样本数，得到 epoch 级平均值。
 			# .detach() 切断与计算图的连接, 累加器只用其数值, 避免占用反传内存。
 			total_loss += loss.detach() * batch_size
@@ -681,6 +764,9 @@ def run_epoch(
 					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}", z_mae=f"{box_z_mae:.4f}")
 				else:
 					pbar.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{top1:.4f}", top3=f"{top3:.4f}")
+
+	if is_train and processed_train_batches % grad_accum_steps != 0:
+		apply_optimizer_step(1.0 / accumulated_train_samples)
 
 	# epoch 末单次同步: 把全部累加器 stack 到一起搬到 CPU, 减少多次 .item() 的开销。
 	final_snap = torch.stack([
@@ -755,6 +841,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	# 使用统一的多任务数据管线，训练集强制开启增强。
 	if args.train_ratio + args.val_ratio + args.test_ratio <= 0:
 		raise ValueError("train/val/test ratios must be positive.")
+	if args.grad_accum_steps <= 0:
+		raise ValueError("grad_accum_steps must be a positive integer.")
 
 	train_loader, val_loader, test_loader, class_to_idx = create_dataloaders(
 		data_root=str(data_root),
@@ -773,6 +861,16 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
 	num_classes = len(class_to_idx)
 	model = build_model(args.model, num_classes=num_classes, project_root=project_root, args=args).to(device)
+	# requested/effective 配置分离：baseline 或 MLP 头没有 seg_logits，辅助 BCE 必须硬置零。
+	args.requested_box_head = str(getattr(args, "box_head", "centroid"))
+	args.requested_seg_loss_weight = float(args.seg_loss_weight)
+	model_uses_centroid = bool(getattr(model, "seg_centroid_box", False))
+	args.effective_box_head = "centroid" if model_uses_centroid else "mlp"
+	args.effective_seg_loss_weight = (
+		args.requested_seg_loss_weight if model_uses_centroid else 0.0
+	)
+	if hasattr(model, "effective_config"):
+		args.effective_model_config = model.effective_config()
 	# 当前多任务损失包含 CrossEntropy 与 Soft-histogram 深度回归两项；默认用固定权重 λ_cls · L_cls + λ_depth · L_depth。
 	# seg_loss_weight > 0 时对分割引导质心头的 seg_logits 追加逐点 in-box BCE 辅助监督
 	# (仅当模型输出含 seg_logits 时生效, baseline 不受影响)。
@@ -781,7 +879,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 		box_weight=args.box_loss_weight,
 		label_smoothing=args.label_smoothing,
 		auto_balance=args.auto_balance,
-		seg_weight=args.seg_loss_weight,
+		seg_weight=args.effective_seg_loss_weight,
 	)
 	# 将 loss 中的可学习参数 (Kendall 不确定性权重) 一并加入 optimizer
 	optimizer = optim.AdamW(
@@ -810,13 +908,42 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("label_mode=%s", args.label_mode)
 	logger.info("augment_train=%s augment_eval=%s num_aug=%d", args.augment_train, args.augment_eval, args.num_aug)
 	logger.info("amp=%s tf32=%s", use_amp, args.tf32)
+	logger.info(
+		"optimization batch_size=%d grad_accum_steps=%d effective_batch_size=%d",
+		args.batch_size,
+		args.grad_accum_steps,
+		args.batch_size * args.grad_accum_steps,
+	)
 	logger.info("loss_auto_balance=%s", args.auto_balance)
 	logger.info(
-		"box_head=%s seg_loss_weight=%.4f ema_decay=%.4f",
-		getattr(args, "box_head", "centroid"),
-		args.seg_loss_weight,
+		"requested_box_head=%s effective_box_head=%s "
+		"requested_seg_loss_weight=%.4f effective_seg_loss_weight=%.4f ema_decay=%.4f",
+		args.requested_box_head,
+		args.effective_box_head,
+		args.requested_seg_loss_weight,
+		args.effective_seg_loss_weight,
 		args.ema_decay,
 	)
+	if args.model.startswith("graph_residual_gcn"):
+		logger.info(
+			"gcn_config k=%s operator=%s aggregation=%s exclude_self=%s feature_residual=%s "
+			"coord_scale_init=%.4f checkpoint=%s legacy=%s",
+			"model_default" if args.gcn_k is None else args.gcn_k,
+			args.gcn_operator,
+			args.gcn_aggregation,
+			args.gcn_exclude_self,
+			args.gcn_feature_residual,
+			args.gcn_coord_scale_init,
+			args.gcn_use_checkpoint,
+			args.gcn_legacy_mode,
+		)
+		if args.model == "graph_residual_gcn_ablation":
+			logger.info(
+				"gcn_ablation physical_branch=%s se_gate=%s coord_residual=%s",
+				args.gcn_use_physical_branch,
+				args.gcn_use_se_gate,
+				args.gcn_use_coord_residual,
+			)
 	logger.info(
 		"best_score_weights cls=%.4f z_mae=%.4f depth=%.4f depth_scale=%.6f",
 		args.best_score_cls_weight,
@@ -883,6 +1010,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 			scaler=scaler,
 			use_amp=use_amp,
 			ema=ema,
+			grad_accum_steps=args.grad_accum_steps,
 		)
 
 		val_metrics = run_epoch(
@@ -1072,6 +1200,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"upp",
 			"graph_residual",
 			"graph_residual_gcn",
+			"graph_residual_gcn_ablation",
 			"graph_residual_gcn_lite",
 			"3detr",
 		],
@@ -1079,7 +1208,11 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument("--epochs", type=int, default=100, help="训练总轮数")
 	parser.add_argument("--batch-size", type=int, default=32, help="批大小")
-	parser.add_argument("--num-aug", type=int, default=5, help="启用增强时, 每个原始训练样本生成的增强副本数")
+	parser.add_argument(
+		"--grad-accum-steps", type=int, default=1,
+		help="梯度累计微批次数；effective batch = batch_size × grad_accum_steps",
+	)
+	parser.add_argument("--num-aug", type=int, default=3, help="启用增强时, 每个原始训练样本生成的增强副本数")
 	parser.add_argument("--num-points", type=int, default=1024, help="每个样本的固定点数 (确定性采样/填充)")
 	parser.add_argument("--lr", type=float, default=1e-3, help="初始学习率")
 	parser.add_argument("--min-lr", type=float, default=1e-5, help="余弦退火最小学习率")
@@ -1114,6 +1247,30 @@ def build_parser() -> argparse.ArgumentParser:
 		help="模型权重 EMA 衰减系数 (0=关闭, 典型 0.999); "
 		"启用后验证/选点/best 权重均用 EMA 影子模型, 压制选点噪声。",
 	)
+	parser.add_argument("--gcn-k", type=int, default=None, help="GCN KNN 邻居数；默认 full=20、lite=16")
+	parser.add_argument(
+		"--gcn-operator", type=str, default="sage", choices=["sage", "edge_cnn"],
+		help="消融模型局部算子：GraphSAGE 或同参数量 EdgeCNN；正式 GCN 固定 sage",
+	)
+	parser.add_argument(
+		"--gcn-aggregation", type=str, default="max", choices=["mean", "max"],
+		help="GraphSAGE 邻域聚合；SPAD 稀疏目标默认使用 max",
+	)
+	parser.add_argument("--gcn-exclude-self", dest="gcn_exclude_self", action="store_true", help="GCN KNN 排除自身，避免与 SAGE 根节点重复")
+	parser.add_argument("--gcn-include-self", dest="gcn_exclude_self", action="store_false", help="GCN KNN 保留自身，仅用于消融或旧结构复现")
+	parser.add_argument("--gcn-feature-residual", dest="gcn_feature_residual", action="store_true", help="启用 GCN block 显式特征残差")
+	parser.add_argument("--gcn-no-feature-residual", dest="gcn_feature_residual", action="store_false", help="关闭 GCN block 显式特征残差")
+	parser.add_argument("--gcn-coord-scale-init", type=float, default=0.1, help="GCN 可学习坐标残差的初始缩放系数")
+	parser.add_argument("--gcn-use-checkpoint", dest="gcn_use_checkpoint", action="store_true", help="启用 GCN 梯度检查点以节省显存")
+	parser.add_argument("--gcn-no-checkpoint", dest="gcn_use_checkpoint", action="store_false", help="关闭 GCN 梯度检查点以提高训练速度")
+	parser.add_argument("--gcn-legacy-mode", dest="gcn_legacy_mode", action="store_true", help="复现旧 GCN 图方向与坐标融合，仅用于旧 checkpoint")
+	parser.add_argument("--gcn-no-legacy-mode", dest="gcn_legacy_mode", action="store_false", help="使用修复后的 GCN 结构")
+	parser.add_argument("--gcn-use-physical-branch", dest="gcn_use_physical_branch", action="store_true", help="消融模型启用坐标图 GraphSAGE 分支")
+	parser.add_argument("--gcn-no-physical-branch", dest="gcn_use_physical_branch", action="store_false", help="消融模型硬关闭坐标图 GraphSAGE 分支")
+	parser.add_argument("--gcn-use-se-gate", dest="gcn_use_se_gate", action="store_true", help="消融模型启用 SE 通道门控")
+	parser.add_argument("--gcn-no-se-gate", dest="gcn_use_se_gate", action="store_false", help="消融模型硬关闭 SE 通道门控")
+	parser.add_argument("--gcn-use-coord-residual", dest="gcn_use_coord_residual", action="store_true", help="消融模型启用坐标门控残差")
+	parser.add_argument("--gcn-no-coord-residual", dest="gcn_use_coord_residual", action="store_false", help="消融模型硬关闭全部坐标残差模块")
 	parser.add_argument("--best-score-cls-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 Top-1 的权重")
 	parser.add_argument("--best-score-z-mae-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 box z-MAE (深度误差) 的权重")
 	parser.add_argument("--best-score-depth-weight", type=float, default=1.0, help="最优 checkpoint 综合评分中, 验证 depth score 的权重")
@@ -1136,7 +1293,23 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--no-augment-train", dest="augment_train", action="store_false", help="禁用训练集数据增强")
 	parser.add_argument("--augment-eval", dest="augment_eval", action="store_true", help="对验证/测试集应用数据增强")
 	parser.add_argument("--no-augment-eval", dest="augment_eval", action="store_false", help="禁用验证/测试集数据增强")
-	parser.set_defaults(augment_train=True, augment_eval=True, amp=False, tf32=False, spt_use_encoder=True, spt_use_moe_lif=True, auto_balance=False)
+	parser.set_defaults(
+		augment_train=True,
+		augment_eval=True,
+		amp=False,
+		tf32=False,
+		spt_use_encoder=True,
+		spt_use_moe_lif=True,
+		auto_balance=False,
+		gcn_operator="sage",
+		gcn_exclude_self=True,
+		gcn_feature_residual=True,
+		gcn_use_checkpoint=True,
+		gcn_legacy_mode=False,
+		gcn_use_physical_branch=True,
+		gcn_use_se_gate=True,
+		gcn_use_coord_residual=True,
+	)
 	return parser
 #CUDA AMP 会在部分算子里使用半精度，通常是 FP16，比如：Conv / Linear / MatMul / 部分归一化相关算子，同时用 GradScaler 避免 FP16 梯度下溢。它的目标是加速和省显存，不保证和纯 FP32 完全一致。
 #TF32 是 NVIDIA Ampere/Ada GPU 上对 FP32 matmul/conv 的加速格式。它仍然用 FP32 存储和 FP32 输出，但乘法内部精度降低，mantissa 比标准 FP32 少。
@@ -1158,12 +1331,13 @@ if __name__ == "__main__":
 	#                           pointbert / pointmae / pointrwkv / spt / upp / 3detr /
 	#                           graph_residual / graph_residual_gcn / graph_residual_gcn_lite
 	#   --batch-size 32         batch 大小
+	#   --grad-accum-steps 1   梯度累计次数；例如 batch=16、accum=2 等效优化 batch=32
 	#   --epochs 100            训练轮数
 	#   --num-points 1024       每样本固定点数 (随机采样/补齐到该数)
 	#   --lr 1e-3 --min-lr 1e-5 余弦退火上下界
 	#   --weight-decay 1e-4     AdamW 权重衰减
 	#   --label-mode raw        raw=用文件夹/文件名标签; generated=用增强生成的标签
-	#   --num-aug 1             每个训练原始样本生成的增强样本份数；3 表示训练集扩为 3 倍
+	#   --num-aug 3             每个训练原始样本生成的增强样本份数；默认训练集扩为 3 倍
 	#   --amp / --no-amp        CUDA 混合精度 (默认开)
 	#   --tf32 / --no-tf32      Ampere/Ada GPU TF32 加速 (默认开)
 	#   --augment-eval          验证/测试时开启增强 (默认关)

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -28,10 +29,17 @@ from utils.loss import (
 	box_iou_3d_aligned,
 	canonicalize_boxes_3d,
 	center_to_corners,
-	decode_normalized_boxes_3d,
+	corners_to_center,
 	split_cls_and_box_predictions,
 )
-from scripts.train import build_model, compute_topk_hits, prepare_model_inputs, resolve_path, set_seed
+from scripts.train import (
+	build_model,
+	compute_topk_hits,
+	merge_resume_model_args,
+	prepare_model_inputs,
+	resolve_path,
+	set_seed,
+)
 
 """
 SPAD 测试与评估模块。
@@ -48,6 +56,41 @@ SPAD 测试与评估模块。
 # 测试脚本只负责从 checkpoint 读取模型，再把分类与 box 相关指标统一算出来并落盘。
 
 
+def sha256_file(path: Path) -> str:
+	"""返回文件 SHA256；文件不存在时返回空字符串。"""
+	if not path.is_file():
+		return ""
+	digest = hashlib.sha256()
+	with path.open("rb") as handle:
+		for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+			digest.update(chunk)
+	return digest.hexdigest().upper()
+
+
+def decode_unit_boxes_3d(
+	boxes: torch.Tensor,
+	bounds=DEFAULT_SPAD_BOX_BOUNDS,
+) -> torch.Tensor:
+	"""把数据管线使用的 ``[0,1]`` 框同时映射到物理坐标。"""
+	box_tensor = canonicalize_boxes_3d(boxes, device=boxes.device, dtype=boxes.dtype)
+	bounds_tensor = torch.as_tensor(bounds, device=box_tensor.device, dtype=box_tensor.dtype)
+	if bounds_tensor.shape != (3, 2):
+		raise ValueError(f"bounds must have shape (3, 2), got {tuple(bounds_tensor.shape)}")
+	mins = bounds_tensor[:, 0]
+	spans = bounds_tensor[:, 1] - bounds_tensor[:, 0]
+	return torch.stack(
+		(
+			box_tensor[..., 0] * spans[0] + mins[0],
+			box_tensor[..., 1] * spans[0] + mins[0],
+			box_tensor[..., 2] * spans[1] + mins[1],
+			box_tensor[..., 3] * spans[1] + mins[1],
+			box_tensor[..., 4] * spans[2] + mins[2],
+			box_tensor[..., 5] * spans[2] + mins[2],
+		),
+		dim=-1,
+	)
+
+
 def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgcnn") -> str:
 	"""Infer model name from checkpoint file stem.
 
@@ -58,7 +101,7 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 	Returns:
 		Model name in {dgcnn, pointnet, pointnet2, pointtransformer, pointtransv2, pointtransv3,
 		pointmlp, pointbert, pointmae, pointrwkv, pointnext, spt, tnpc, 3detr, dct, upp,
-		graph_residual, graph_residual_gcn}.
+		graph_residual, graph_residual_gcn, graph_residual_gcn_ablation}.
 		注意识别顺序: 更长 / 更具体的关键字必须在更短关键字之前 (例如 pointtransv3 在
 		pointtransformer 之前; pointnet2 / pointbert / pointmae 都在 pointnet 之前),
 		否则会误命中前缀。
@@ -90,7 +133,9 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 	if "pointnext" in name or "pointnxt" in name:
 		return "pointnext"
 	# 其它简单关键字
-	# 自研模型 (graph_residual_gcn 必须在 graph_residual 之前判定, 避免前缀误命中)
+	# 自研模型：消融模型与正式模型共享前缀，必须最先识别。
+	if "graph_residual_gcn_ablation" in name or "graph_res_gcn_ablation" in name:
+		return "graph_residual_gcn_ablation"
 	if "graph_residual_gcn" in name or "graph_res_gcn" in name:
 		return "graph_residual_gcn"
 	if "graph_residual" in name or "graph_res" in name:
@@ -115,15 +160,7 @@ def infer_model_name_from_checkpoint(checkpoint_path: Path, fallback: str = "dgc
 
 def merge_checkpoint_model_args(cli_args: argparse.Namespace, checkpoint: Mapping[str, Any]) -> argparse.Namespace:
 	"""用 checkpoint 中保存的训练参数重建模型结构，同时保留测试 CLI 参数。"""
-	ckpt_args = checkpoint.get("args") if isinstance(checkpoint, Mapping) else None
-	if not isinstance(ckpt_args, Mapping):
-		return cli_args
-
-	merged = vars(cli_args).copy()
-	for key, value in ckpt_args.items():
-		if key == "model" or key.startswith("spt_") or key == "num_points":
-			merged[key] = value
-	return argparse.Namespace(**merged)
+	return merge_resume_model_args(cli_args, checkpoint)
 
 
 def infer_spt_moe_lif_from_state_dict(model_args: argparse.Namespace, state_dict: Mapping[str, torch.Tensor]) -> None:
@@ -416,6 +453,8 @@ def evaluate(
 	top1_hits = torch.zeros((), device=device, dtype=torch.long)
 	top3_hits = torch.zeros((), device=device, dtype=torch.long)
 	total_samples = 0
+	total_box_z_abs = torch.zeros((), device=device)
+	total_box_center_abs = torch.zeros((), device=device)
 
 	all_preds: List[int] = []
 	all_labels: List[int] = []
@@ -502,12 +541,21 @@ def evaluate(
 					# 兼容老模型 [B,6] 角点输出 (3DETR 等仍用 6 维内部表示)。
 					box_preds_t = torch.as_tensor(box_preds, device=device, dtype=box_targets.dtype)
 					if box_preds_t.shape[-1] == 3:
+						pred_centers = box_preds_t
 						pred_boxes = center_to_corners(box_preds_t, device=device, dtype=box_targets.dtype)
 					else:
 						pred_boxes = canonicalize_boxes_3d(box_preds_t, device=device, dtype=box_targets.dtype)
+						pred_centers = corners_to_center(pred_boxes, device=device, dtype=box_targets.dtype)
 					gt_boxes = canonicalize_boxes_3d(box_targets, device=device, dtype=box_targets.dtype)
-					if box_space == "normalized":
-						pred_boxes = decode_normalized_boxes_3d(pred_boxes, bounds=box_bounds, device=device, dtype=gt_boxes.dtype)
+					gt_centers = corners_to_center(gt_boxes, device=device, dtype=box_targets.dtype)
+
+					center_abs = (pred_centers - gt_centers).abs()
+
+					# 数据集与模型都使用 [0,1] 坐标。若请求 absolute，必须同时解码
+					# 预测框与 GT；旧实现只解码预测框，会破坏 IoU 坐标一致性。
+					if box_space == "absolute":
+						pred_boxes = decode_unit_boxes_3d(pred_boxes, bounds=box_bounds)
+						gt_boxes = decode_unit_boxes_3d(gt_boxes, bounds=box_bounds)
 
 					if pred_boxes.shape != gt_boxes.shape:
 						raise ValueError(
@@ -515,6 +563,8 @@ def evaluate(
 						)
 
 					ious = box_iou_3d_aligned(pred_boxes, gt_boxes)
+					total_box_z_abs += center_abs[..., 2].sum()
+					total_box_center_abs += center_abs.mean(dim=-1).sum()
 					all_box_ious.extend(ious.detach().cpu().tolist())
 					all_box_scores.extend(pred_scores.detach().cpu().tolist())
 					all_box_pred_classes.extend(preds.detach().cpu().tolist())
@@ -561,6 +611,8 @@ def evaluate(
 		"box_pred_classes": np.array(all_box_pred_classes, dtype=np.int64),
 		"box_gt_classes": np.array(all_box_gt_classes, dtype=np.int64),
 		"box_eval_samples": int(box_eval_samples),
+		"box_z_mae": float(total_box_z_abs.detach().cpu()) / max(box_eval_samples, 1),
+		"box_center_mae": float(total_box_center_abs.detach().cpu()) / max(box_eval_samples, 1),
 		"box_eval_skipped": bool(box_eval_skipped),
 		"box_eval_error": box_eval_error,
 	}
@@ -678,8 +730,11 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 	logger.info("precision_macro=%.4f", metrics["precision_macro"])
 	logger.info("recall_macro=%.4f", metrics["recall_macro"])
 	logger.info("f1_macro=%.4f", metrics["f1_macro"])
+	logger.info("eval_seed=%d augment_eval=%s box_space=%s", args.seed, args.augment_eval, args.box_space)
 	if box_metrics is not None:
 		# AP50 和 AP@50:5:95 是 box 质量的核心指标，来自不同 IoU 阈值下的平均精度。
+		logger.info("box_z_mae=%.6f", eval_out["box_z_mae"])
+		logger.info("box_center_mae=%.6f", eval_out["box_center_mae"])
 		logger.info("mean_iou_matched_cls=%.4f", box_metrics["mean_iou_matched_cls"])
 		logger.info("AP50=%.4f", box_metrics["AP50"])
 		logger.info("AP@50:5:95=%.4f", box_metrics["AP@50:5:95"])
@@ -688,6 +743,30 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 
 	output_dir.mkdir(parents=True, exist_ok=True)
 	metrics_json_path = output_dir / f"metrics_{resolved_model}_{timestamp}.json"
+	checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, Mapping) else {}
+	if not isinstance(checkpoint_args, Mapping):
+		checkpoint_args = {}
+	has_seg_head = any("box_head.seg_mlp." in str(key) for key in state_dict)
+	requested_box_head = checkpoint_args.get("requested_box_head", checkpoint_args.get("box_head"))
+	requested_seg_weight = checkpoint_args.get(
+		"requested_seg_loss_weight",
+		checkpoint_args.get("seg_loss_weight", 0.0),
+	)
+	effective_box_head = checkpoint_args.get("effective_box_head") or (
+		"centroid" if has_seg_head else "mlp"
+	)
+	effective_seg_weight = checkpoint_args.get("effective_seg_loss_weight")
+	if effective_seg_weight is None:
+		effective_seg_weight = float(requested_seg_weight or 0.0) if has_seg_head else 0.0
+	logger.info(
+		"train_requested_box_head=%s train_effective_box_head=%s "
+		"train_requested_seg_loss_weight=%s train_effective_seg_loss_weight=%.4f",
+		requested_box_head,
+		effective_box_head,
+		requested_seg_weight,
+		float(effective_seg_weight),
+	)
+	split_cache_path = data_root / ".split_cache.json"
 	metrics_payload = {
 		# JSON 里同时保存分类、box AP 和路径信息，便于后续画图或对比实验直接读取。
 		"loss": eval_out["loss"],
@@ -698,6 +777,8 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 		"precision_macro": metrics["precision_macro"],
 		"recall_macro": metrics["recall_macro"],
 		"f1_macro": metrics["f1_macro"],
+		"box_z_mae": eval_out["box_z_mae"],
+		"box_center_mae": eval_out["box_center_mae"],
 		"per_class_accuracy": {class_names[k]: v for k, v in metrics["per_class_accuracy"].items()},
 		"mean_iou_matched_cls": (None if box_metrics is None else box_metrics["mean_iou_matched_cls"]),
 		"AP50": (None if box_metrics is None else box_metrics["AP50"]),
@@ -708,6 +789,17 @@ def run_test(args: argparse.Namespace) -> Dict[str, str]:
 		"class_names": class_names,
 		"checkpoint": str(checkpoint_path),
 		"resolved_model": resolved_model,
+		"eval_seed": int(args.seed),
+		"augment_eval": bool(args.augment_eval),
+		"box_space": str(args.box_space),
+		"split_cache_path": str(split_cache_path),
+		"split_cache_sha256": sha256_file(split_cache_path),
+		"train_seed": checkpoint_args.get("seed"),
+		"requested_box_head": requested_box_head,
+		"effective_box_head": effective_box_head,
+		"requested_seg_loss_weight": requested_seg_weight,
+		"effective_seg_loss_weight": float(effective_seg_weight),
+		"effective_model_config": checkpoint_args.get("effective_model_config"),
 		"confusion_matrix_path": str(cm_path),
 	}
 	with open(metrics_json_path, "w", encoding="utf-8") as f:
@@ -734,7 +826,8 @@ def build_parser() -> argparse.ArgumentParser:
 			"auto", "dgcnn", "pointnet", "pointnet2", "pointnet2msg",
 			"pointtransformer", "pointtransv2", "pointtransv3",
 			"pointmlp", "pointmlpelite", "pointbert", "pointmae", "pointrwkv", "spt", "upp",
-			"3detr", "graph_residual", "graph_residual_gcn",
+			"3detr", "graph_residual", "graph_residual_gcn", "graph_residual_gcn_lite",
+			"graph_residual_gcn_ablation",
 		],
 		help="Backbone 模型名称",
 	)
@@ -751,7 +844,13 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--device", type=str, default="cuda", help="计算设备: auto/cpu/cuda")
 	parser.add_argument("--log-dir", type=str, default="logs/CLS", help="日志输出目录")
 	parser.add_argument("--output-dir", type=str, default="logs/CLS", help="结果输出目录")
-	parser.add_argument("--box-space", type=str, default="absolute", choices=["absolute", "normalized"], help="box head 输出的解释方式")
+	parser.add_argument(
+		"--box-space",
+		type=str,
+		default="normalized",
+		choices=["absolute", "normalized"],
+		help="IoU 计算坐标：normalized 直接使用 [0,1]；absolute 同时解码预测框与 GT",
+	)
 	# 混淆矩阵默认归一化输出 (每行求和=1, 颜色直接反映 recall 强弱); 用 --no-normalize-cm 关闭。
 	# 与 --augment-eval / --no-augment-eval 同款双 dest 模式, 与 train.py 风格保持一致。
 	parser.add_argument("--normalize-cm", dest="normalize_cm", action="store_true", help="使用归一化混淆矩阵 (默认)")

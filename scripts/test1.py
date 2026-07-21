@@ -50,7 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.train import build_model, resolve_path, set_seed
+from scripts.train import build_model, merge_resume_model_args, resolve_path, set_seed
 from utils.data import SPAD_NORM_BOUNDS, load_point_cloud_auto, normalize_points
 from utils.data_augment import _draw_3d_box_wireframe  # 复用已有 3D wireframe 绘制
 from utils.loss import center_to_corners, split_cls_and_box_predictions
@@ -62,15 +62,7 @@ from utils.loss import center_to_corners, split_cls_and_box_predictions
 
 def merge_checkpoint_model_args(cli_args: argparse.Namespace, checkpoint: Mapping[str, Any]) -> argparse.Namespace:
 	"""用 checkpoint 训练参数重建模型结构，同时保留单样本测试参数。"""
-	ckpt_args = checkpoint.get("args") if isinstance(checkpoint, Mapping) else None
-	if not isinstance(ckpt_args, Mapping):
-		return cli_args
-
-	merged = vars(cli_args).copy()
-	for key, value in ckpt_args.items():
-		if key == "model" or key.startswith("spt_") or key == "num_points":
-			merged[key] = value
-	return argparse.Namespace(**merged)
+	return merge_resume_model_args(cli_args, checkpoint)
 
 
 def infer_spt_moe_lif_from_state_dict(model_args: argparse.Namespace, state_dict: Mapping[str, torch.Tensor]) -> None:
@@ -589,7 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
 			"pointtransformer", "pointtransv2", "pointtransv3",
 			"pointmlp", "pointbert", "pointmae", "pointrwkv",
 			"spt", "upp",
-			"graph_residual", "graph_residual_gcn",   # 自研模型
+			"graph_residual", "graph_residual_gcn", "graph_residual_gcn_lite",   # 自研模型
 		],
 		help="Backbone 模型名称",
 	)

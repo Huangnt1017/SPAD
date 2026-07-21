@@ -42,3 +42,6 @@ HMC/*.txt
 %SystemDrive%/
 
 # 项目说明
+temp/
+*.pdf
+outputs/

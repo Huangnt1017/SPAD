@@ -1,5 +1,7 @@
 import os
 import json
+import re
+from datetime import datetime
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -98,8 +100,55 @@ ALPHABET_CLASSES: List[str] = [chr(ord("A") + i) for i in range(26)]
 ALPHABET_CLASS_TO_IDX: Dict[str, int] = {name: idx for idx, name in enumerate(ALPHABET_CLASSES)}
 
 
+FORMAL_WINDOW_FILE_PATTERN = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})_"
+    r"(?P<time>\d{2}-\d{2}-\d{2})_"
+    r"Delay-0_Width-200-"
+    r"(?P<start>\d+)-(?P<end>\d+)\.txt$"
+)
+
+
+def parse_formal_window_filename(
+    file_name: str,
+) -> Optional[Tuple[str, int, int]]:
+    """解析正式三页滑窗点云文件名。
+
+    正式样本必须严格满足：
+
+    ``yyyy-mm-dd_hh-mm-ss_Delay-0_Width-200-i-(i+2).txt``。
+
+    Args:
+        file_name: 文件名或包含目录的路径文本。
+
+    Returns:
+        ``(acquisition_id, window_start, window_end)``；不符合正式规则时
+        返回 ``None``。``acquisition_id`` 不包含窗口编号和扩展名。
+    """
+
+    base_name = os.path.basename(str(file_name))
+    match = FORMAL_WINDOW_FILE_PATTERN.fullmatch(base_name)
+    if match is None:
+        return None
+
+    timestamp_text = f"{match.group('date')}_{match.group('time')}"
+    try:
+        datetime.strptime(timestamp_text, "%Y-%m-%d_%H-%M-%S")
+    except ValueError:
+        return None
+
+    window_start = int(match.group("start"))
+    window_end = int(match.group("end"))
+    if window_start < 1 or window_end != window_start + 2:
+        return None
+
+    acquisition_id = f"{timestamp_text}_Delay-0_Width-200"
+    return acquisition_id, window_start, window_end
+
+
 def _is_point_file(file_name: str) -> bool:
-    return file_name.lower().endswith((".txt", ".npy"))
+    """仅接受命名和窗口宽度均合法的正式点云文本。"""
+
+    return parse_formal_window_filename(file_name) is not None
 
 
 def _collect_point_files(folder: str) -> List[str]:
@@ -120,7 +169,6 @@ def _infer_symbol_from_text(text: str) -> Optional[str]:
     """
     s = str(text).strip().upper()
     # 提取所有连续大写字母段
-    import re
     candidates = re.findall(r'[A-Z]+', s)
     for cand in candidates:
         if len(cand) == 1:
